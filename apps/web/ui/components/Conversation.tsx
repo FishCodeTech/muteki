@@ -1,5 +1,6 @@
 "use client";
 
+import { FollowupWorkerSelect } from "./FollowupWorkerSelect";
 import { MotionIcon } from "@/components/MotionIcon";
 
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
@@ -62,6 +63,7 @@ export interface DispatchOpts {
 }
 
 export interface ControlCommandOpts {
+  workerId?: string;
   requestId?: string;
   commandId?: string;
 }
@@ -874,6 +876,7 @@ function CoordinatorThread({
 }
 
 function Composer({
+  runId,
   workspaceMode,
   started,
   solved,
@@ -897,6 +900,7 @@ function Composer({
   controlledText,
   onControlledTextChange,
 }: {
+  runId: string;
   workspaceMode: "ctf" | "pentest";
   started: boolean;
   solved: boolean;
@@ -923,6 +927,7 @@ function Composer({
 }) {
   const t = useT();
   const [internalText, setInternalText] = useState("");
+  const [followupWorkerId, setFollowupWorkerId] = useState("");
   const text = controlledText ?? internalText;
   const setText = useCallback((value: string) => {
     setInternalText(value);
@@ -1440,14 +1445,15 @@ function Composer({
   if (finished) {
     const ask = () => {
       const question = text.trim();
-      if (!question || followupPending) return;
-      void onCommand("global", "ask", question).then((ok) => {
+      if (!question || followupPending || !followupWorkerId) return;
+      void onCommand("global", "ask", question, { workerId: followupWorkerId }).then((ok) => {
         if (ok) setText("");
       });
     };
     return (
       <div className="composer2 command-composer t-page-slide">
         <div className="wrap command-wrap">
+          <FollowupWorkerSelect runId={runId} value={followupWorkerId} onChange={setFollowupWorkerId} disabled={followupPending} />
           <div className="command-row">
             <Input
               ref={commandRef}
@@ -1461,14 +1467,14 @@ function Composer({
               }}
               placeholder={mode === "pentest" ? "向测试 Worker 追问，或补充目标背景" : "输入要向解题 Worker 追问的问题"}
             />
-            <Button size="sm" variant="primary" isIconOnly className="send" isDisabled={!text.trim() || followupPending} onPress={ask} aria-label="Ask"><Icon name="send" size={15} /></Button>
+            <Button size="sm" variant="primary" isIconOnly className="send" isDisabled={!text.trim() || followupPending || !followupWorkerId} onPress={ask} aria-label="Ask"><Icon name="send" size={15} /></Button>
           </div>
           <div className="command-actionbar">
             <div className="quick">
               <Button size="sm" variant="primary" className="primary" isDisabled={followupPending} aria-label={mode === "pentest" ? "继续测试" : t("quick.resolveTitle")} onPress={() => onResolve()}><Icon name="refresh" size={13} />{mode === "pentest" ? "继续测试" : t("quick.resolve")}</Button>
-              <Button size="sm" variant="ghost" isDisabled={!text.trim() || followupPending} aria-label={t("quick.ask.tip")} onPress={ask}><Icon name="help" size={13} />{t("quick.ask")}</Button>
+              <Button size="sm" variant="ghost" isDisabled={!text.trim() || followupPending || !followupWorkerId} aria-label={t("quick.ask.tip")} onPress={ask}><Icon name="help" size={13} />{t("quick.ask")}</Button>
               {btwButton}
-              {mode === "ctf" && <Button size="sm" variant="ghost" isDisabled={followupPending} aria-label={t("quick.writeup.tip")} onPress={() => void onCommand("global", "writeup", "")}><Icon name="pencil" size={13} />{t("quick.writeup")}</Button>}
+              {mode === "ctf" && <Button size="sm" variant="ghost" isDisabled={followupPending || !followupWorkerId} aria-label={t("quick.writeup.tip")} onPress={() => void onCommand("global", "writeup", "", { workerId: followupWorkerId })}><Icon name="pencil" size={13} />{t("quick.writeup")}</Button>}
               {mode === "pentest" && onOpenReport && <Button size="sm" variant="ghost" onPress={onOpenReport}><Icon name="rows" size={13} />查看报告</Button>}
               {mode === "ctf" && solved ? (
                 <>
@@ -1806,7 +1812,7 @@ export function Conversation({
   // F: only blocking (external_blocker) hand-raises pause the swarm — the hero/flow
   // counts must reflect those, not auto-resolving informational cards.
   const blockingHitlCount = deck.hitlRequests.filter((r) => (r.pausesBehavior ?? true)).length;
-  const onWriteup = () => onCommand("global", "writeup", "");
+  const onWriteup = (workerId: string) => onCommand("global", "writeup", "", { workerId });
   const onMarkFalseFlag = (flag: string) => onCommand("global", "mark_false", flag);
   // Before a solve is dispatched the deck is a local draft with no backend run,
   // so useRun opens no SSE stream by design — that's "idle", not "disconnected".
@@ -1845,6 +1851,7 @@ export function Conversation({
   const pentestRuntimeOpen = workspaceMode === "pentest" && artifactOpen && !reportOpen;
   const inspectorToggleLabel = t(inspectorOpen ? "insp.run.hide" : "insp.run.show");
   const composerElement = <Composer
+    runId={deck.runId}
     workspaceMode={workspaceMode}
     started={deck.started}
     solved={deck.solved}

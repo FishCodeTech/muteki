@@ -4289,6 +4289,13 @@
           "title": "Cwd",
           "type": "string"
         },
+        "disabled_tools": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Disabled Tools",
+          "type": "array"
+        },
         "engine": {
           "default": "",
           "title": "Engine",

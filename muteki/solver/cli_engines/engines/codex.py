@@ -21,6 +21,15 @@ class CodexDriver(CliDriver):
     secure_prompt_transport = True
     offline_web_isolation = True
 
+    def build_observer_input(self, prompt: str) -> tuple[list[str], str]:
+        argv = self.build_execute_stdin(prompt, None, web_access=False, kb_access=False, stream=True)
+        argv.remove("--dangerously-bypass-approvals-and-sandbox")
+        flags = ["--sandbox", "read-only", "--skip-git-repo-check", "-c", 'approval_policy="never"',
+                 "-c", "project_doc_max_bytes=0", "-c", "features.hooks=false",
+                 "-c", "features.apply_patch_freeform=false"]
+        argv[argv.index("-"):argv.index("-")] = flags
+        return argv, prompt
+
     def native_permission_modes(self) -> tuple[str, ...]:
         return ("on-request", "never")
 

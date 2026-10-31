@@ -1,0 +1,114 @@
+/* Shared visual rhythm. Derive colors from the active user palette; do not
+   change task layout geometry, terminal typography, or component behaviour. */
+:root {
+  --wb-radius: 14px;
+  --wb-border: color-mix(in srgb, var(--bright) 11%, var(--panel));
+  --wb-shadow: 0 2px 8px color-mix(in srgb, var(--bright) 4%, transparent);
+  --wb-selected: color-mix(in srgb, var(--accent) 9%, var(--panel));
+}
+
+/* Workspace landing: quieter chrome, stronger section hierarchy. */
+.workspace-home { gap: 30px; }
+.workspace-home-hero h1 { font-weight: 650; letter-spacing: -.035em; text-wrap: balance; }
+.workspace-home-hero p { max-width: 62ch; line-height: 1.75; color: var(--muted); }
+.workspace-home-grid { gap: 18px; }
+.workspace-home-card {
+  border-radius: 18px;
+  border-color: var(--wb-border);
+  background: var(--panel);
+  box-shadow: var(--wb-shadow);
+  transition: border-color 160ms ease, box-shadow 160ms ease;
+}
+.workspace-home-card:hover {
+  border-color: color-mix(in srgb, var(--accent) 46%, var(--border));
+  box-shadow: 0 4px 18px color-mix(in srgb, var(--bright) 7%, transparent);
+  transform: none;
+}
+.workspace-home-card h2 { font-size: 19px; font-weight: 620; letter-spacing: -.02em; }
+.workspace-home-card p { line-height: 1.75; }
+.workspace-home-points { gap: 8px; }
+.workspace-home-action { font-weight: 600; }
+.workspace-home-recent-head { margin-bottom: 12px; }
+.workspace-home-recent-list { gap: 10px; }
+.workspace-home-recent-list > a {
+  border-radius: 12px;
+  border-color: var(--wb-border);
+  background: var(--panel);
+  transition: background-color 160ms ease, border-color 160ms ease;
+}
+.workspace-home-recent-list > a:hover { background: var(--panel2); border-color: var(--border2); }
+.workspace-home-recent-list strong { font-weight: 600; line-height: 1.5; }
+.workspace-home-recent-list small { line-height: 1.6; }
+.workspace-home-empty { border-radius: var(--wb-radius); padding: 24px; background: var(--panel2); }
+
+/* Navigation: selected destination stays distinct from a hover. */
+.settings-hub-group a { border-radius: 9px; min-height: 38px; transition: background-color 140ms ease, color 140ms ease; }
+.settings-hub-group a.on,
+.wsettings-nav nav button.on {
+  background: var(--wb-selected);
+  color: var(--accent);
+  box-shadow: inset 2px 0 0 var(--accent);
+  font-weight: 600;
+}
+.settings-hub-group h2 { font-size: 11px; letter-spacing: .04em; margin-top: 20px; }
+.settings-hub-search { border-radius: 10px; }
+.wsettings-nav nav button { border-radius: 9px; }
+.rail-search-input { min-height: 36px; border-radius: 10px; background: var(--panel); }
+.rail-search-input:focus-visible { outline: 2px solid var(--focus-ring, var(--accent)); outline-offset: 2px; }
+.newsolve { min-height: 38px; border-radius: 10px; font-weight: 600; }
+
+/* Settings pages and worker inspector share the same type/spacing rhythm. */
+.settings-hub-pagehead { gap: 12px; }
+.settings-hub-pagehead h1 { font-size: clamp(20px, 2vw, 26px); font-weight: 650; letter-spacing: -.025em; line-height: 1.3; }
+.settings-hub-pagehead p { max-width: 72ch; line-height: 1.7; }
+.wsettings-topbar h1 { font-size: 20px; font-weight: 650; letter-spacing: -.02em; }
+.wsettings-topbar { border-bottom-color: var(--wb-border); }
+.wset-form-section { padding-block: 17px; gap: 12px; }
+.wset-form-section h3 { margin-bottom: 3px; font-size: 13px; }
+.wset-form-section label > span { line-height: 1.5; }
+.wset-binding-help { line-height: 1.6; }
+.wset-switch-row small { line-height: 1.6; }
+.wroster-card, .wfollowup-card {
+  border-radius: var(--wb-radius);
+  border-color: var(--wb-border);
+  box-shadow: var(--wb-shadow);
+}
+.wroster-card.selected {
+  border-color: color-mix(in srgb, var(--accent) 65%, var(--border));
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 18%, transparent);
+}
+.wroster-card-foot { border-top-color: var(--wb-border); }
+.wfollowup-heading h2 { font-size: 15px; }
+.wfollowup-description { line-height: 1.7; }
+
+/* Task workbench: keep dense evidence and code intact, improve chrome. */
+.conv-header, .artifact-header { border-bottom-color: var(--wb-border); }
+.cx-composer-card { border-color: var(--wb-border); }
+.cx-composer-card:focus-within {
+  outline: 2px solid color-mix(in srgb, var(--accent) 35%, transparent);
+  outline-offset: 2px;
+}
+.workspace-route-state { line-height: 1.7; }
+.workspace-home-error { border-radius: 12px; padding: 12px 16px; line-height: 1.6; }
+
+/* Focus remains visible across native and shared navigation controls. */
+:is(.workspace-home, .settings-hub, .wsettings-editor) :is(a, button, input, select, textarea):focus-visible {
+  outline: 2px solid var(--focus-ring, var(--accent));
+  outline-offset: 3px;
+}
+@media (max-width: 768px) {
+  .workspace-home { padding-inline: 16px; gap: 24px; }
+  .workspace-home-grid { gap: 12px; }
+  .workspace-home-card { border-radius: 14px; padding: 18px; }
+  .settings-hub-pagehead h1 { font-size: 21px; }
+  .settings-hub-group a { min-height: 44px; }
+  .wset-form-section { padding-block: 14px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .workspace-home-card, .workspace-home-recent-list > a,
+  .settings-hub-group a { transition: none; }
+}
+@media (forced-colors: active) {
+  .settings-hub-group a.on, .wsettings-nav nav button.on,
+  .wroster-card.selected { outline: 2px solid Highlight; outline-offset: -2px; }
+}

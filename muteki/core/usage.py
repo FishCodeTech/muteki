@@ -586,7 +586,7 @@ class UsageStore:
                 delta = _cumulative_delta(current, previous)
                 self.record(delta, identity=uid, seq=index, at=stamp, _db=db, **json.loads(scope))
 
-    def run_totals(self, run_id: str) -> dict[str, int | float | None]:
+    def run_totals(self, run_id: str, *, exclude_followups: bool = False) -> dict[str, int | float | None]:
         """Read additive durable usage for Run recovery without loading records."""
         with self.connect() as db:
             row = db.execute(
@@ -612,7 +612,8 @@ class UsageStore:
                 "NOT IN ('model_price','driver_estimate') "
                 "AND json_type(data,'$.reported_cost') IS NOT NULL) "
                 "THEN 1 ELSE 0 END AS unverified "
-                "FROM usage WHERE json_extract(data,'$.run_id')=?) "
+                "FROM usage WHERE json_extract(data,'$.run_id')=? "
+                "AND (?=0 OR COALESCE(json_extract(data,'$.role'),'') NOT IN ('btw','standby'))) "
                 "SELECT count(*),sum(inp),sum(outp), "
                 "sum(CASE WHEN legacy_pi=1 OR (unverified=1 AND reported=0) "
                 "THEN NULL ELSE reported END), "
@@ -621,7 +622,7 @@ class UsageStore:
                 "OR (unverified=1 AND reported=0)) "
                 "AND (estimated IS NULL OR unverified=1) THEN 1 ELSE 0 END), "
                 "sum(unverified) FROM classified",
-                (json.dumps(sorted(PRICES)), run_id),
+                (json.dumps(sorted(PRICES)), run_id, int(exclude_followups)),
             ).fetchone()
         return {
             "records": int(row[0] or 0),

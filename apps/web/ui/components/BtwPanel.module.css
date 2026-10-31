@@ -88,3 +88,9 @@
   .suggestion { min-height: 53px; }
   .assistantTurn { padding-right: 0; }
 }
+
+.turnLabel { flex-wrap: wrap; }
+.turnLabel time { font-size: 10px; font-weight: 400; }
+.deleteTurn { display: inline-flex; padding: 3px; border: 0; border-radius: 4px; color: var(--dim); background: transparent; cursor: pointer; }
+.deleteTurn:hover { color: var(--red); background: var(--panel); }
+.deleteTurn:disabled { opacity: .4; cursor: default; }

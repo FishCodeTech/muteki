@@ -404,6 +404,10 @@ async def _post_control_serialized(
     wait_for_effect: bool = False,
 ) -> dict[str, Any]:
     """Compile and submit under the per-run idempotency/secret boundary."""
+    if (str(body.get("action") or "").strip().lower() == "ask"
+            and run.task is not None and not run.task.done()):
+        return {"ok": False, "status": "rejected", "code": "live_ask_use_btw",
+                "detail": "运行中的记录问答请使用 BTW；Ask 不会投递为解题指令"}
     if run.runtime_incomplete:
         return {
             "ok": False,
@@ -411,6 +415,23 @@ async def _post_control_serialized(
             "detail": "runtime shutdown is incomplete",
             "code": "runtime_shutdown_incomplete",
         }
+    if str(body.get("action") or "").strip().lower() in {"ask", "writeup"}:
+        from muteki.solver.followup_profiles import participating_workers, select_participant, participant_profile
+        from muteki.solver.followup_report import ObserverCapabilityError
+        from muteki.solver.cli_driver import driver_for
+        payload = body.get("payload") if isinstance(body.get("payload"), dict) else {}
+        try:
+            participant = select_participant(await participating_workers(run),
+                str(payload.get("worker_id") or body.get("worker_id") or ""),
+                self.load_winner_continuation(run_id))
+            profile = participant_profile(participant,
+                self.worker_config.resolve(run.category or "web").get("worker_profiles") or [])
+            driver_for(profile).build_observer_input("")
+            body = {**body, "worker_id": participant["worker_id"],
+                    "payload": {**payload, "worker_id": participant["worker_id"]}}
+        except (ValueError, ObserverCapabilityError) as exc:
+            return {"ok": False, "status": "rejected", "code": getattr(exc, "code", "followup.worker_unavailable"),
+                    "detail": str(exc)}
     actor, journal, secrets = await self._ensure_control_async(run)
     requested_id = str(body.get("command_id") or "").strip()
     existing = journal.get_command(requested_id) if requested_id else None

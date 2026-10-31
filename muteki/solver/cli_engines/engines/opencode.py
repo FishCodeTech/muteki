@@ -21,6 +21,16 @@ class OpenCodeDriver(CliDriver):
     secure_prompt_transport = False
     offline_web_isolation = True
 
+    def build_observer_input(self, prompt: str) -> tuple[list[str], str]:
+        from muteki.solver.cli_engines.types import LaunchPurpose
+        argv, body = self.build_execute_input(prompt, None, web_access=False, kb_access=False,
+            stream=True, launch=LaunchContext(purpose=LaunchPurpose.CONVERSATION))
+        config = json.loads(self._config(web_access=False))
+        config["permissions"] = [{"action": "*", "resource": "*", "effect": "deny"}] + [
+            {"action": tool, "resource": "*", "effect": "allow"} for tool in ("read", "glob", "grep", "list")]
+        argv[1] = "OPENCODE_CONFIG_CONTENT=" + json.dumps(config, separators=(",", ":"))
+        return argv, body
+
     def native_permission_modes(self) -> tuple[str, ...]:
         return ("auto",)
 

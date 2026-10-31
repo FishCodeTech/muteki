@@ -1420,6 +1420,38 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
 # server restart. Older runs without private continuation metadata recover only
 # non-sensitive identity from durable events and start a fresh session if needed.
 
+def _standby_identity_from_workers(
+    winner: dict[str, Any],
+    workers: dict[str, dict[str, str]],
+    winner_actor: str,
+) -> dict[str, Any]:
+    """Recover identity from coordinator events, never from workspace files.
+
+    A stopped run has no winner. Use its first recorded profiled Worker as a
+    deterministic representative of the original lineup, starting a fresh
+    conversation rather than borrowing another Worker's session.
+    """
+    recovered = dict(winner)
+    actor = str(winner.get("worker_id") or winner_actor or "")
+    if actor:
+        worker = workers.get(actor, {})
+        for key in ("engine", "profile_id", "session"):
+            if not recovered.get(key) and worker.get(key):
+                recovered[key] = worker[key]
+        recovered.setdefault("worker_id", actor)
+        return recovered
+    if winner.get("engine") or winner.get("profile_id"):
+        return recovered
+    for worker_id, worker in workers.items():
+        if worker_id.endswith("-standby"):
+            continue  # A previous failed follow-up must not select the engine.
+        if worker.get("engine") and worker.get("profile_id"):
+            recovered.update(worker_id=worker_id, engine=worker["engine"],
+                             profile_id=worker["profile_id"], session="")
+            return recovered
+    raise RuntimeError("Original Worker identity is unavailable; cannot select a standby Worker")
+
+
 def _standby_profile_for(
     engine: str,
     worker_profiles: list[dict[str, Any]],
@@ -1465,7 +1497,7 @@ def _standby_worker_env(
             if callable(mapper):
                 agent_state_container_path = mapper(str(agent_state_dir))
 
-    env = runtime_env_for_engine(
+    resolved = runtime_env_for_engine(
         engine,
         account_root=account_root,
         account_id=(profile.get("credential_account") if profile else None),
@@ -1473,7 +1505,16 @@ def _standby_worker_env(
         agent_state_dir=agent_state_dir,
         agent_state_container_path=agent_state_container_path,
         model=str((profile or {}).get("model") or ""),
-    ).env
+    )
+    env = resolved.env
+    if engine == "claude" and resolved.account_id and not any(
+        env.get(name + suffix)
+        for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN")
+        for suffix in ("", "_FILE")
+    ):
+        # Do not fall back to the operator's login for a missing bound account.
+        # Keep errors free of credential values and account file contents.
+        raise RuntimeError("Standby Claude credential account is unavailable; check the selected Worker's credentials")
     if profile:
         apply_worker_identity_env(env, profile)
         env["MUTEKI_WORKER_REASONING_EFFORT"] = str(
@@ -1588,7 +1629,7 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
                 for key in (
                     "action", "target", "command_id", "request_id",
                     "standing", "preempt_policy", "preemption", "flag",
-                    "followup_id",
+                    "followup_id", "worker_id",
                 )
                 if key in safe_cmd
             }
@@ -1656,15 +1697,13 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
 
             except Exception:
                 pass
-        if legacy_winner_actor:
-            legacy_worker = legacy_workers.get(legacy_winner_actor) or {}
-            winner.setdefault("worker_id", legacy_winner_actor)
-            if legacy_worker.get("engine"):
-                winner.setdefault("engine", legacy_worker["engine"])
-            if legacy_worker.get("profile_id"):
-                winner.setdefault("profile_id", legacy_worker["profile_id"])
-            if legacy_worker.get("session"):
-                winner.setdefault("session", legacy_worker["session"])
+        wc = mgr.worker_config.resolve(ch.get("category") or run.category or "web")
+        from muteki.solver.followup_profiles import configured_standby_identity, participating_workers
+        configured_identity = configured_standby_identity(winner, wc, action,
+            participants=await participating_workers(run) if action in {"ask", "writeup"} else [],
+            requested=str(runtime_cmd.get("worker_id") or ""))
+        winner = configured_identity if configured_identity is not None else _standby_identity_from_workers(
+            winner, legacy_workers, legacy_winner_actor)
         mode = ch.get("mode") or "ctf"
         if mode not in ("ctf", "pentest"):
             mode = "ctf"
@@ -1707,7 +1746,6 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
             expected_findings=(pentest_contract.expected_findings if pentest_contract else None),
         )
 
-        wc = mgr.worker_config.resolve(challenge.category) if mgr is not None else {}
         runtime_policy = mgr.load_run_launch_limits(run.run_id) if mgr is not None else {}
         worker_profiles = wc.get("worker_profiles") or []
         worker_network = str(wc.get("worker_network") or "bridge")
@@ -1733,15 +1771,25 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
             )
             if candidate.is_file():
                 worker_vpn_config = candidate
-        winner_engine = str(winner.get("engine") or "claude")
+        winner_engine = str(winner.get("engine") or "")
         winner_profile_ref = str(
             winner.get("profile_id") or winner_engine
         ).strip()
-        profile = _standby_profile_for(winner_profile_ref, worker_profiles)
+        if winner.get("profile_id"):
+            profile = next((p for p in worker_profiles
+                            if isinstance(p, dict) and p.get("enabled", True)
+                            and winner_profile_ref in {p.get("id"), p.get("name")}), None)
+        else:
+            profile = _standby_profile_for(winner_profile_ref, worker_profiles)
         if winner.get("profile_id") and profile is None:
             raise RuntimeError(
-                "winning Worker profile is unavailable in current configuration"
+                "Original Worker profile is unavailable in current configuration"
             )
+        if not profile and not winner_engine:
+            raise RuntimeError("Original Worker engine is unavailable")
+        if configured_identity is not None:
+            from muteki.solver.followup_profiles import participant_profile
+            profile = participant_profile(winner, worker_profiles)
         transport = base_engine_for_profile(profile or winner_engine)
         worker_backend = resolve_worker_backend(
             request_backend=runtime_policy.get("worker_backend"),
@@ -1913,9 +1961,11 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
         acquired_graphs: list[Any] = []
 
         def open_shared_graph():
-            graph = SQLiteSharedGraph.open(
-                db_path=graph_dir / "shared_graph.db", challenge=challenge,
-                artifacts=arts)
+            if action in {"ask", "writeup"}:
+                graph = SQLiteSharedGraph.open_readonly(db_path=graph_dir / "shared_graph.db", challenge=challenge)
+            else:
+                graph = SQLiteSharedGraph.open(
+                    db_path=graph_dir / "shared_graph.db", challenge=challenge, artifacts=arts)
             acquired_graphs.append(graph)
             return graph
 
@@ -1924,6 +1974,9 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
                 graph_dir.mkdir(parents=True, exist_ok=True)
                 shared_graph = await run_blocking(open_shared_graph)
             except Exception:
+                if action in {"ask", "writeup"} and (graph_dir / "shared_graph.db").exists():
+                    from muteki.solver.followup_report import EvidenceReadError
+                    raise EvidenceReadError("无法读取任务证据，报告未启动") from None
                 shared_graph = None
 
             canonical_graph_flags: list[str] = []
@@ -2028,10 +2081,12 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
             if container is not None:
                 from muteki.solver.container_exec import _chown_tree_to_worker
                 await run_blocking(_chown_tree_to_worker, workdir)
+            import uuid
             solver_label = f"cli-{transport}-standby"
-            home_label = ""
+            identity_tag = uuid.uuid5(uuid.NAMESPACE_URL, f"{winner.get('worker_id')}:{winner.get('account_id')}").hex[:16]
+            home_label = f"cli-{transport}-standby-{identity_tag}" if action in {"ask", "writeup"} else ""
             agent_state_rel = str(winner.get("agent_state_rel") or "").strip()
-            if agent_state_rel:
+            if agent_state_rel and action not in {"ask", "writeup"}:
                 try:
                     state_root = (root / ".muteki-agent-state").resolve()
                     state_dir = (root / agent_state_rel).resolve()
@@ -2057,10 +2112,12 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
                 run_id=run.run_id,
                 execution_generation=max(
                     1, int(getattr(run, "execution_generation", 1) or 1)),
-                shared_graph=shared_graph,
+                shared_graph=None if action in {"ask", "writeup"} else shared_graph,
             )
+            from muteki.solver.followup_budget import standby_cost_controller
+            worker_cost = standby_cost_controller(run.cost, action)
             worker = CliSolver(
-                None, challenge, bus=run.bus, cost=run.cost, artifacts=arts,
+                None, challenge, bus=run.bus, cost=worker_cost, artifacts=arts,
                 config=SolverConfig(), run_id=run.run_id, shared_graph=shared_graph,
                 engine=transport,
                 driver=driver_for(profile or transport),
@@ -2068,7 +2125,9 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
                 web_access=True, kb=False,
                 mode="respond",
                 resume_session=winner.get("session") or None,
-                hitl_cmd={**runtime_cmd, "flag": flag},
+                hitl_cmd={**runtime_cmd, "flag": flag,
+                          "task_status": {"solved": bool(run.solved),
+                                          "finished": bool(run.finished)}},
                 found_flags=prior_flags,
                 solver_label=solver_label,
                 container=container,
@@ -2235,6 +2294,7 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
                     payload={
                         "followup_id": runtime_cmd.get("followup_id") or "",
                         "kind": action,
+                        "source_worker_id": str(winner.get("worker_id") or ""),
                         "text": getattr(out, "reply", "") or "",
                         "artifact_path": artifact_path,
                     },

@@ -49,6 +49,13 @@ class PiLikeDriver(CliDriver):
     _OFFLINE_TOOLS: tuple[str, ...] = ()
     _ENV_EXTRA: dict[str, str] = {}
 
+    def build_observer_input(self, prompt: str) -> tuple[list[str], str]:
+        from muteki.solver.cli_engines.types import LaunchPurpose
+        argv = self.build_execute_stdin(prompt, None, web_access=False, kb_access=False,
+            stream=True, launch=LaunchContext(purpose=LaunchPurpose.CONVERSATION))
+        argv += ["--tools", "read,grep,find,ls", "--no-extensions", "--no-mcp"]
+        return argv, prompt
+
     def new_session(self) -> Optional[str]:
         # the engine assigns the session id itself; we scrape it from the
         # {"type":"session"} stream header so a resume/conclude turn can reconnect.

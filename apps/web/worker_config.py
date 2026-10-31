@@ -1422,6 +1422,10 @@ class WorkerConfigStore:
         }
         policy = config.get("stage_policy") or {}
         coordinator = policy.get("coordinator") or {}
+        from muteki.solver.followup_profiles import require_followup_profile
+        for key in ("standby_profile", "btw_profile"):
+            if coordinator.get(key):
+                require_followup_profile(coordinator[key], profiles)
         for channel in ("review", "verifier"):
             row = coordinator.get(channel) or {}
             if not row.get("enabled"):
@@ -1896,6 +1900,11 @@ class WorkerConfigStore:
     def _validate_stage_limits(cls, value: Any) -> None:
         if not isinstance(value, dict):
             raise ValueError("stage_policy must be an object")
+        coordinator = value.get("coordinator", {})
+        if isinstance(coordinator, dict):
+            for key in ("standby_profile", "btw_profile"):
+                if key in coordinator and not isinstance(coordinator[key], str):
+                    raise ValueError(f"stage_policy.coordinator.{key} must be a Profile ID string")
         limits = (
             (("race",), ("timeout",), (), ()),
             (("coordinator",), (), ("wall_clock_budget",), ()),
@@ -2087,6 +2096,8 @@ class WorkerConfigStore:
             "race": {"enabled": race_enabled, "timeout": race_timeout,
                      "engines": list(race_engines or [])},
             "coordinator": {"dispatch_mode": dispatch_mode,
+                            "standby_profile": str(coordinator.get("standby_profile") or "").strip(),
+                            "btw_profile": str(coordinator.get("btw_profile") or "").strip(),
                             "wall_clock_budget": wall, "review": review,
                             "verifier": verifier},
             "budgets": {"max_total_workers": max_workers,

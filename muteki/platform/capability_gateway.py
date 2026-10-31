@@ -43,6 +43,7 @@ from muteki.platform.contracts.capabilities import (
     CapabilityGrant,
     CapabilityInvocation,
     CapabilityResult,
+    ThreadMode,
 )
 from muteki.platform.contracts.commands import (
     ActorRef,
