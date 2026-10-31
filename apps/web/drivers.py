@@ -2072,9 +2072,9 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
                 from muteki.solver.container_exec import _chown_tree_to_worker
                 await run_blocking(_chown_tree_to_worker, workdir)
             solver_label = f"cli-{transport}-standby"
-            home_label = f"cli-{transport}-standby" if configured_identity is not None else ""
+            home_label = f"cli-{transport}-standby" if configured_identity is not None or action in {"ask", "writeup"} else ""
             agent_state_rel = str(winner.get("agent_state_rel") or "").strip()
-            if agent_state_rel:
+            if agent_state_rel and action not in {"ask", "writeup"}:
                 try:
                     state_root = (root / ".muteki-agent-state").resolve()
                     state_dir = (root / agent_state_rel).resolve()
@@ -2113,7 +2113,9 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
                 web_access=True, kb=False,
                 mode="respond",
                 resume_session=winner.get("session") or None,
-                hitl_cmd={**runtime_cmd, "flag": flag},
+                hitl_cmd={**runtime_cmd, "flag": flag,
+                          "task_status": {"solved": bool(run.solved),
+                                          "finished": bool(run.finished)}},
                 found_flags=prior_flags,
                 solver_label=solver_label,
                 container=container,

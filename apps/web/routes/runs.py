@@ -354,8 +354,8 @@ def register(app: FastAPI) -> None:
     # ── BTW side-query worker (separate one-shot process, no swarm slot) ──────
     # Independent route (not /hitl), no run.hitl queue, no InsightBus GUIDANCE,
     # no bus.emit, no CostController, no CliSolver, no scheduler/max_worker slot.
-    # Each turn cold-starts one CLI worker process, passes retained history
-    # for multi-turn context, streams its answer, and continues across browser navigation.
+    # Each turn gets host-read records and retained history over stdin, with
+    # restricted native tools. Browser navigation never owns its lifetime.
     # Only explicit stop, run deletion, or shutdown cancels the background job.
     @app.post("/api/runs/{run_id}/btw")
     async def btw(run_id: str, request: Request) -> Any:
@@ -364,8 +364,7 @@ def register(app: FastAPI) -> None:
         from muteki.core.runtime_env import is_web_container
         from muteki.solver.btw import (
             BtwLimiter,
-            BtwWorkerPaths,
-            build_btw_worker_prompt,
+            build_btw_context_sync,
             run_meta_dict,
             stream_btw_worker_deltas,
         )
@@ -394,9 +393,6 @@ def register(app: FastAPI) -> None:
         root = mgr.workspace_dir(run_id).resolve()
         graph_db = mgr.graph_dir(run_id) / "shared_graph.db"
         jsonl_path = (mgr.event_root / f"{safe}.jsonl").resolve()
-        board_path = root / ".muteki_board.md"
-        arts_path = root / "arts"
-        uploads_path = (mgr.sessions_root / safe / "uploads").resolve()
         challenge_name = run.name or run_id
         challenge_category = (run.category or "web") or "web"
         meta = run_meta_dict(run)
@@ -424,6 +420,8 @@ def register(app: FastAPI) -> None:
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
         transport = base_engine_for_profile(profile)
+        if transport not in {"codex", "claude"}:
+            return JSONResponse({"error": "BTW 只读问答目前支持 Codex / Claude，请选择对应 Profile"}, status_code=400)
 
         async def stream():
             worker_backend = resolve_worker_backend(
@@ -447,8 +445,6 @@ def register(app: FastAPI) -> None:
             account_root = account_store_root(mgr.state_root)
             worker_root = root / "workers" / "_btw"
             workdir = worker_root / f"{transport}-{request_id}"
-            visible_jsonl = jsonl_path
-            visible_graph = graph_db
             import logging
             diagnostic_id = request_id[:12]
             sent_chars = 0
@@ -485,14 +481,6 @@ def register(app: FastAPI) -> None:
                         ensure_container,
                     )
 
-                    # Event and graph authority remain outside the worker-mounted
-                    # sessions tree. Give the read-only side worker point-in-time
-                    # copies inside its own scratch directory instead of mounting
-                    # coordinator state or silently mapping an inaccessible path.
-                    from muteki.solver.btw_resources import snapshot_context
-                    visible_jsonl, visible_graph = await run_blocking(
-                        snapshot_context, workdir, jsonl_path, graph_db)
-
                     from muteki.solver.credential_accounts import engine_account_id
                     from muteki.solver.worker_resource_limits import resolve_worker_resource_limits
                     limits = resolve_worker_resource_limits(config=wc)
@@ -513,34 +501,13 @@ def register(app: FastAPI) -> None:
                     await run_blocking(acquire_container)
                     await run_blocking(_chown_tree_to_worker, str(workdir))
 
-                def _worker_path(p: Path) -> str:
-                    if container is not None:
-                        mapper = getattr(container, "to_container_path", None)
-                        if callable(mapper):
-                            return str(mapper(str(p)))
-                    return str(p)
-
-                prompt = await run_blocking(build_btw_worker_prompt,
-                    question=question,
-                    paths=BtwWorkerPaths(
-                        workspace=_worker_path(root),
-                        jsonl=_worker_path(visible_jsonl),
-                        graph_db=_worker_path(visible_graph),
-                        board=_worker_path(board_path),
-                        # The Worker-writable winner artifact is intentionally not
-                        # supplied as evidence to a side-query worker.
-                        winner="",
-                        arts=_worker_path(arts_path),
-                        uploads=_worker_path(uploads_path),
-                    ),
-                    challenge_id=run_id,
-                    challenge_name=challenge_name,
-                    challenge_category=challenge_category,
-                    run_state=str(meta.get("state") or ""),
-                    run_summary=meta,
-                    context_hint=context_hint,
-                    transcript=transcript,
-                )
+                from muteki.solver.followup_report import question_prompt
+                snapshot = await run_blocking(build_btw_context_sync,
+                    graph_db_path=str(graph_db), jsonl_path=str(jsonl_path),
+                    challenge_id=run_id, challenge_name=challenge_name,
+                    challenge_category=challenge_category, run_meta=meta)
+                prompt = question_prompt(question, snapshot,
+                    transcript=transcript, context_hint=context_hint)
                 worker_env = await run_blocking(_standby_worker_env,
                     root=root,
                     label=f"btw-{transport}-{request_id}",
@@ -550,7 +517,9 @@ def register(app: FastAPI) -> None:
                     container=container,
                 )
                 worker_env["MUTEKI_BTW_WORKER"] = "1"
-                worker_env["MUTEKI_BLACKBOARD_DB"] = ""
+                for name in ("MUTEKI_BLACKBOARD_DB", "MUTEKI_BLACKBOARD_SCRIPT",
+                             "MUTEKI_BLACKBOARD_INGRESS_DIR", "MUTEKI_BLACKBOARD_ROLE"):
+                    worker_env[name] = ""
                 from muteki.core.usage import cli_usage
                 usage_generation = run.execution_generation
                 def record_btw_usage(result):

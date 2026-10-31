@@ -1,30 +1,9 @@
-"""BTW side-query observer — worker-backed read-only Q&A over a run.
+"""BTW snapshot-only Q&A, independent from the solve scheduler and budget.
 
-This module powers `POST /api/runs/{run_id}/btw`: the operator asks a quick
-side question ("summarize progress", "which worker is on which line", ...) and
-gets a streamed answer from a short-lived CLI worker that reads the run's durable
-files directly.
-
-The current default path is **worker-backed but swarm-isolated**:
-
-  * starts the selected CLI agent through `run_cli_streaming`, not `CliSolver`;
-  * never attaches a run bus, cost ledger, HITL queue, InsightBus, or shared graph
-    writer, so the worker is not a swarm member;
-  * points the worker at JSONL / shared_graph.db / winner.json / artifacts and
-    asks it to inspect those files itself;
-  * forbids blackboard writes and provenance markers (`FOUND_FLAG=`,
-    `VERIFIED_FACT=`, etc.) in the prompt, so `/btw` cannot become a flag source.
-
-The older flash-model helpers remain below for tests and compatibility: they
-build a read-only context snapshot and LLM messages, but the web route no longer
-uses them by default.
-
-Multi-turn: retained completed turns come from coordinator-owned BTW history.
-Each request starts a fresh worker with that transcript and current run paths.
-
-The system prompt forbids asserting flag candidates or inventing facts not in
-the context: btw is an observer, never a flag source (the provenance gate is
-unchanged and never sees btw output anyway).
+The host reads existing JSONL/SQLite records without modifying them. Each turn
+receives a bounded snapshot and retained conversation history over stdin, using
+restricted Codex/Claude permissions. No solve session or task-writing tools are
+restored. Legacy message builders below remain for compatibility.
 """
 
 from __future__ import annotations
@@ -81,48 +60,6 @@ class BtwWorkerPaths:
     uploads: str = ""
 
 
-_BTWWORKER_RULES = """你是 Muteki `/btw` 的只读旁路 worker。你不是正在解题的 swarm worker,
-也不是 coordinator。你的唯一任务是回答操作员这个 side question。
-
-工作方法（优先快速回答）:
-- 先回答当前问题，不执行全面复盘；默认不超过 6 条要点，用户要求详细时再展开。
-- 已提供的元信息和对话足够时直接回答，不调用工具。
-- 需要证据时，优先一次工具调用读取相关摘要或日志末尾；必要的独立读取尽量合并。
-- 不递归遍历工作目录，不全量扫描事件日志或数据库。SQLite 查询限定相关字段及 LIMIT 20；日志默认只读末尾 80 行。
-- 默认最多两轮证据读取；仍不足就明确说明缺口，用户明确要求深入调查时才继续。
-- 对话历史可能已截短，不把历史推测当作已验证事实。
-- 如果要总结解题路径,优先使用 `flag_found` / `verified` evidence / worker 实际输出。
-- 明确区分 `intent_proposed`、open intent、dead_end、operator hint、候选证据、误报 flag。
-- 不要把计划、猜测、失败方向写成已经完成的步骤。
-- 信息不足就说不足;不要补剧情。
-
-绝对禁止:
-- 不要调用或写入 blackboard skill / blackboard.py / shared_graph 写接口。
-- 不要修改 `shared_graph.db`、JSONL、winner.json、artifacts 或 run workspace 里的共享状态。
-- 只允许在当前 cwd 下写临时 scratch 文件。
-- 不要继续攻击目标、不要提交 flag、不要 spawn/kill/pause/redirect worker。
-- 不要输出 `FOUND_FLAG=`, `VERIFIED_FACT=`, `BB_FACT=`, `BB_INTENT=`, `HITL_REQUEST=`
-  等任何 solver 协议标记。
-
-回答风格:
-- 用中文,简洁直接。
-- 若回答"整体解题路径",按已验证事实给出,并标出哪些只是尝试/失败方向。
-"""
-
-
-def _fmt_transcript(transcript: list[dict[str, str]]) -> str:
-    if not transcript:
-        return "(无历史 /btw 对话)"
-    labels = {"user": "操作员", "assistant": "btw", "summary": "历史摘要"}
-    lines: list[str] = []
-    for turn in transcript:
-        role = labels.get(str(turn.get("role") or ""), "btw")
-        content = (turn.get("content") or "").strip()
-        if content:
-            lines.append(f"{role}: {content}")
-    return "\n".join(lines) if lines else "(无历史 /btw 对话)"
-
-
 def build_btw_worker_prompt(
     *,
     question: str,
@@ -135,51 +72,15 @@ def build_btw_worker_prompt(
     context_hint: Optional[str] = "",
     transcript: Optional[list[dict[str, str]]] = None,
 ) -> str:
-    """Prompt for the short-lived `/btw` worker.
-
-    The prompt deliberately points at durable run artifacts instead of injecting
-    a lossy graph summary. This is the main anti-distortion change: the worker can
-    query SQLite/JSONL directly and decide which events are evidence versus leads.
-    """
-    q = (question or "").strip()
-    hint = (context_hint or "").strip()
-    transcript = sanitize_transcript(transcript or [])
-
-    path_lines = [
-        f"- workspace: {paths.workspace}",
-        f"- event log JSONL: {paths.jsonl}",
-        f"- shared graph SQLite DB: {paths.graph_db}",
-        f"- markdown board: {paths.board}",
-        f"- artifacts dir: {paths.arts}",
-    ]
-    if paths.winner:
-        path_lines.append(f"- winner snapshot: {paths.winner}")
-    if paths.uploads:
-        path_lines.append(f"- uploaded challenge files: {paths.uploads}")
-
-    meta_lines = [
-        f"- run_id / challenge_id: {challenge_id}",
-        f"- name: {challenge_name or challenge_id}",
-        f"- category: {challenge_category or 'web'}",
-    ]
-    if run_state:
-        meta_lines.append(f"- run state: {run_state}")
-    if run_summary is not None:
-        meta_lines.append(f"- 已解决: {bool(run_summary.get('solved'))}")
-        meta_lines.append(f"- 已记录 Flag 数: {len(run_summary.get('flags') or [])}")
-        meta_lines.append(f"- 等待人工协助: {bool(run_summary.get('awaiting_help'))}")
-        meta_lines.append("- 以上为请求开始时的状态快照，不代表完整证据或后续变化。")
-    if hint:
-        meta_lines.append(f"- operator focus: {hint}")
-
-    return "\n\n".join([
-        _BTWWORKER_RULES,
-        "=== Run metadata ===\n" + "\n".join(meta_lines),
-        "=== Files you may inspect ===\n" + "\n".join(path_lines),
-        "=== Previous /btw transcript ===\n" + _fmt_transcript(transcript),
-        "=== Current question ===\n" + q,
-        "请现在读取必要文件后回答。最终只输出给操作员看的答案,不要输出协议标记。",
-    ])
+    """Compatibility helper: collect records on the host, never ask CLI to read paths."""
+    from muteki.solver.followup_report import question_prompt
+    meta = {**(run_summary or {}), "state": run_state}
+    snapshot = build_btw_context_sync(
+        graph_db_path=paths.graph_db, jsonl_path=paths.jsonl,
+        challenge_id=challenge_id, challenge_name=challenge_name,
+        challenge_category=challenge_category, run_meta=meta)
+    return question_prompt(question, snapshot,
+        transcript=sanitize_transcript(transcript or []), context_hint=context_hint)
 
 
 async def _maybe_disconnected(fn: Callable[[], Any] | None) -> bool:
@@ -215,8 +116,8 @@ async def stream_btw_worker_deltas(
 
     This is intentionally lower-level than `CliSolver`: it has no EventBus, no
     CostController, no SharedGraph writer, and no flag provenance gate. The worker
-    subprocess may use its normal tools to inspect files, but only assistant prose
-    is forwarded to the HTTP caller.
+    subprocess receives an inline record snapshot via stdin and restricted
+    native permissions. It cannot use ordinary solve tools to gather context.
     """
     from muteki.solver.cli_driver import run_cli_streaming
 
@@ -289,21 +190,29 @@ async def stream_btw_worker_deltas(
 
     def _run() -> None:
         try:
-            session = driver.new_session()
-            argv = driver.build_execute(
-                prompt,
-                session,
-                web_access=web_access,
-                kb_access=kb_access,
-                stream=True,
-            )
+            from muteki.solver.followup_report import build_observer_input
+            argv, stdin_text = build_observer_input(driver, prompt)
+            # Reuse the normal Worker's host allowlist; never inherit web/control
+            # credentials or Node/shell startup hooks into this observer process.
+            import os
+            from muteki.solver.cli_process import _SAFE_HOST_ENV, _CONTROL_SECRET_ENV
+            from muteki.solver.cli_workspace import _stable_worker_path
+            sealed_env = {key: value for key, value in os.environ.items() if key in _SAFE_HOST_ENV}
+            sealed_env.update(env or {})
+            for key in _CONTROL_SECRET_ENV:
+                sealed_env.pop(key, None)
+            for key in ("MUTEKI_BLACKBOARD_DB", "MUTEKI_BLACKBOARD_SCRIPT", "MUTEKI_BLACKBOARD_INGRESS_DIR"):
+                sealed_env[key] = ""
+            sealed_env["PATH"] = _stable_worker_path(sealed_env.get("PATH") or os.environ.get("PATH", ""))
             res = run_cli_streaming(
                 driver,
                 argv,
                 cwd=cwd,
                 timeout=timeout,
                 on_step=_on_step,
-                env=env,
+                env=sealed_env,
+                inherit_env=False,
+                stdin_text=stdin_text,
                 cancel_event=cancel_event,
                 container=container,
                 on_proc=on_proc,
@@ -477,8 +386,13 @@ def build_btw_run_stats_sync(jsonl_path: str) -> str:
     type_counts: dict[str, int] = {}
 
     try:
-        with open(jsonl_path, "r", encoding="utf-8") as f:
-            for raw in f:
+        with open(jsonl_path, "rb") as f:
+            remaining = _os.fstat(f.fileno()).st_size
+            while remaining > 0:
+                raw = f.readline(remaining)
+                if not raw:
+                    break
+                remaining -= len(raw)
                 raw = raw.strip()
                 if not raw:
                     continue
@@ -656,8 +570,8 @@ def build_btw_context_sync(
         )
         try:
             summary = graph.to_summary(
-                max_evidence=10**9,
-                max_dead_ends=10**9,
+                max_evidence=80,
+                max_dead_ends=40,
             )
             if summary and summary.strip():
                 parts.append("=== Facts / Dead-ends 摘要 ===")
@@ -668,7 +582,7 @@ def build_btw_context_sync(
             opens = graph.open_goal_texts()
             if opens:
                 parts.append("=== Open Intents ===")
-                for g in opens:
+                for g in opens[:80]:
                     parts.append(f"  - {g}")
         except Exception:
             pass
@@ -676,7 +590,7 @@ def build_btw_context_sync(
             barren = graph.barren_concluded_goal_texts()
             if barren:
                 parts.append("=== 已尝试但无产出的方向 (dead-ends) ===")
-                for g in barren:
+                for g in barren[-40:]:
                     parts.append(f"  - {g}")
         except Exception:
             pass
@@ -684,7 +598,7 @@ def build_btw_context_sync(
             cands = graph.active_candidates()
             if cands:
                 parts.append(f"=== 候选证据 (未验证) : {len(cands)} 条 ===")
-                for c in cands:
+                for c in cands[-80:]:
                     f = c.get("fact") or ""
                     parts.append(f"  - {f}")
         except Exception:
@@ -693,7 +607,7 @@ def build_btw_context_sync(
             verified = graph.verified_evidence()
             if verified:
                 parts.append(f"=== 已验证证据 : {len(verified)} 条 ===")
-                for v in verified:
+                for v in verified[-80:]:
                     f = v.get("fact") or ""
                     parts.append(f"  - {f}")
         except Exception:
@@ -705,7 +619,7 @@ def build_btw_context_sync(
         except Exception:
             pass
         try:
-            recent = graph.recent_events(limit=10**9)
+            recent = graph.recent_events(limit=40)
             if recent:
                 parts.append("=== 最近事件时间线 (最近 40 条,精简) ===")
                 for e in recent:

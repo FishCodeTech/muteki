@@ -11,7 +11,8 @@ from muteki.solver.cli_engines.types import CliResult
 
 class BtwProgressTest(unittest.IsolatedAsyncioTestCase):
     def driver(self):
-        return SimpleNamespace(new_session=lambda: 'fake', build_execute=lambda *a, **kw: ['fake-cli'])
+        from muteki.solver.cli_driver import driver_for
+        return driver_for({'engine': 'codex', 'model': 'synthetic-model'})
 
     async def collect(self, runner, **options):
         with patch('muteki.solver.cli_driver.run_cli_streaming', runner):

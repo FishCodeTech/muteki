@@ -4,6 +4,7 @@ import contextlib
 import io
 import json
 import os
+import shutil
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -132,14 +133,20 @@ class StandbyCredentialsTest(unittest.TestCase):
         worker._note_worker_stop = lambda reason: None
         async def invoke(argv, *, cwd, timeout, stdin_text=None):
             # Use the real final environment and argv builders; stop before any CLI/API call.
+            if action in {'ask', 'writeup'}:
+                self.addCleanup(shutil.rmtree, cwd, ignore_errors=True)
             env = worker._worker_env(cwd)
             argv = worker._apply_runtime_argv(argv, env)
             expected = self.host['ANTHROPIC_API_KEY'] if inherited else self.secret
             self.assertEqual(env.get('ANTHROPIC_API_KEY'), expected)
             self.assertEqual(env['ANTHROPIC_MODEL'], profile['model'])
             self.assertEqual(argv[argv.index('--model') + 1], profile['model'])
-            self.assertIn('fake-session', argv)
-            self.assertEqual(env['CLAUDE_CONFIG_DIR'], str(self.root / '.muteki-claude-config'))
+            if action in {'ask', 'writeup'}:
+                self.assertNotIn('fake-session', argv)
+                self.assertEqual(argv[argv.index('--tools') + 1], '')
+            else:
+                self.assertIn('fake-session', argv)
+            self.assertEqual(env['CLAUDE_CONFIG_DIR'], str(Path(cwd).resolve() / '.muteki-claude-config'))
             self.assertNotIn(expected, str(argv))
             return CliResult(text='Synthetic response', returncode=0)
         worker._run_invocation = invoke
