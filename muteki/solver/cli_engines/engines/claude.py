@@ -22,6 +22,15 @@ class ClaudeCodeDriver(CliDriver):
     secure_prompt_transport = True
     offline_web_isolation = True
 
+    def build_observer_input(self, prompt: str) -> tuple[list[str], str]:
+        argv = self.build_execute_stdin(prompt, None, web_access=False, kb_access=False, stream=True)
+        argv.remove("--dangerously-skip-permissions")
+        flags = ["--permission-mode", "dontAsk", "--tools", "Read,Grep,Glob",
+                 "--allowedTools", "Read,Grep,Glob", "--settings", '{"disableAllHooks":true}',
+                 "--setting-sources", ""]
+        argv[argv.index("--"):argv.index("--")] = flags
+        return argv, prompt
+
     def native_permission_modes(self) -> tuple[str, ...]:
         return ("acceptEdits", "auto", "bypassPermissions", "manual",
                 "dontAsk", "plan")

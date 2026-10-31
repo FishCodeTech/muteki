@@ -52,6 +52,11 @@ class CursorDriver(CliDriver):
     # optional pinned model (e.g. "sonnet-4.5-thinking"); unset → cursor's default.
     _MODEL_ENV = "MUTEKI_CURSOR_MODEL"
 
+    def build_observer_input(self, prompt: str) -> tuple[list[str], str]:
+        # Native ask mode is read-only; unlike a normal Worker it never gets --force.
+        return [self.bin, "-p", *self._fmt(True), "--mode", "ask", "--sandbox", "enabled",
+                "--trust", *self._model()], prompt
+
     def native_permission_modes(self) -> tuple[str, ...]:
         return ("plan", "ask", "auto-review", "force")
 

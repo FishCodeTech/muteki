@@ -10,6 +10,7 @@ import {
 } from "@/lib/events";
 import { useLang, useT } from "@/lib/i18n";
 import { workerColor, workerEngine, workerEngineKey, resumeCommand, toWorkerIdentity, workerDisplayName, formatWorkerSubtitle, workerGeneration } from "@/lib/workers";
+import { FollowupWorkerSelect } from "./FollowupWorkerSelect";
 import { Icon, type IconName } from "@/components/Icon";
 import { EngineLogo } from "@/components/EngineLogo";
 import { useCopied } from "@/lib/useCopied";
@@ -197,7 +198,7 @@ export function RunInspector({
   // open the "Worker 详情" panel focused on a single worker (roster row click).
   onOpenWorker: (id: string) => void;
   onOpenAgent?: (id: string) => void;
-  onWriteup: () => void;
+  onWriteup: (workerId: string) => void;
   onOpenReport?: () => void;
   onMarkFalseFlag: (flag: string) => void;
   onClose?: () => void;
@@ -207,6 +208,7 @@ export function RunInspector({
   const copyText = useCopyText();
   const { lang } = useLang();
   const [spawnEngine, setSpawnEngine] = useState("");
+  const [reportWorker, setReportWorker] = useState("");
   const spawnEngines = providerEngines(readyCatalog(useProviderDescriptors()));
   const [collapsedSections, setCollapsedSections] = useState<Set<string>>(new Set());
   useEffect(() => {
@@ -621,10 +623,11 @@ export function RunInspector({
                 {panelBtn("directives", "directives", "help")}
               </div>
             </div>
+            {!isPentest && <FollowupWorkerSelect runId={deck.runId || ""} value={reportWorker} onChange={setReportWorker} disabled={running} />}
             {!isPentest && <Button
               className="insp-panel-writeup"
-              onClick={onWriteup}
-              isDisabled={running}
+              onClick={() => onWriteup(reportWorker)}
+              isDisabled={running || !reportWorker}
               data-tooltip={running ? t("insp.run.writeupBusy") : t("insp.run.writeupHint")}
               aria-label={`${t("panelbtn.writeup")} — ${running ? t("insp.run.writeupBusy") : t("insp.run.writeupHint")}`}
             >

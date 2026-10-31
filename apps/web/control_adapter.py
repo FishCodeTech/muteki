@@ -260,6 +260,11 @@ class QueueControlPort:
     ) -> ApplyResult:
         del desired  # the queue consumer applies the desired transition
         wire = self.wire_command(command)
+        if self.is_live() and command.action.value == "ask":
+            return ApplyResult(
+                state=EffectState.FAILED,
+                detail="运行中的记录问答请使用 BTW；Ask 不会投递为解题指令",
+                target_ids=[], metadata={"code": "live_ask_use_btw"})
         if not self.is_live():
             if self.on_standby is not None:
                 standby_result = self.on_standby(wire)

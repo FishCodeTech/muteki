@@ -281,6 +281,7 @@ export function useRun(runId: string) {
   const sendHitl = useCallback(
     async (target: string, action: string, text: string, opts?: {
       preemption?: string;
+      workerId?: string;
       requestId?: string;
       commandId?: string;
       expectedGeneration?: number;
@@ -295,6 +296,7 @@ export function useRun(runId: string) {
       if (opts?.preemption) body.preempt_policy = opts.preemption;
       if (opts?.requestId) body.request_id = opts.requestId;
       if (opts?.commandId) body.command_id = opts.commandId;
+      if (opts?.workerId) body.worker_id = opts.workerId;
       if (opts?.expectedGeneration != null) {
         body.expected_generation = opts.expectedGeneration;
       } else if (CONTROL_CAS_ACTIONS.has(action)) {
@@ -652,6 +654,8 @@ export interface WorkerSettings {
     race: { enabled: boolean; timeout: number; engines: string[] };
     coordinator: {
       dispatch_mode?: "fixed" | "auto";
+      standby_profile?: string;
+      btw_profile?: string;
       wall_clock_budget: number;
       review?: {
         enabled?: boolean;

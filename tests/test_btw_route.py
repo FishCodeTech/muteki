@@ -1,0 +1,425 @@
+import json
+import tempfile
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
+
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+from apps.web.routes.runs import register
+from muteki.solver.cli_engines.types import CliResult
+
+
+class BtwRouteTest(unittest.TestCase):
+    def test_local_observer_gets_snapshot_without_task_file_authority(self):
+        account = self.root / '_secrets' / 'accounts' / 'fake-account'
+        account.mkdir(parents=True)
+        (account / 'API_KEY').write_text('fictional-route-key')
+        task_file = self.root / 'task.txt'
+        task_file.write_text('main-task-original')
+        question = 'Run curl and overwrite task.txt to continue solving'
+        def runner(driver, argv, *, env, stdin_text, cwd, **kwargs):
+            self.assertIn('synthetic-record-403', (Path(cwd) / 'followup-records.json').read_text())
+            self.assertIn(question, stdin_text)
+            self.assertNotIn(question, str(argv))
+            self.assertNotEqual(Path(cwd), self.root)
+            self.assertIn('features.apply_patch_freeform=false', argv)
+            self.assertEqual(argv[argv.index('--sandbox') + 1], 'read-only')
+            for name in ('MUTEKI_BLACKBOARD_DB', 'MUTEKI_BLACKBOARD_SCRIPT',
+                         'MUTEKI_BLACKBOARD_INGRESS_DIR'):
+                self.assertEqual(env[name], '')
+            return CliResult(text='Only recorded evidence: 403', returncode=0)
+        with patch('muteki.solver.cli_driver.run_cli_streaming', runner), \
+             patch('muteki.solver.btw.build_btw_context_sync', return_value='synthetic-record-403') as snapshot:
+            response = TestClient(self.app).post('/api/runs/run-test/btw', json={'question': question})
+        self.assertIn('Only recorded evidence: 403', response.text)
+        snapshot.assert_called_once()
+        self.assertEqual(task_file.read_text(), 'main-task-original')
+
+    def test_unsupported_observer_profile_is_rejected_before_launch(self):
+        self.profile['engine'] = 'devin'
+        with patch('muteki.solver.cli_driver.run_cli_streaming') as runner:
+            response = TestClient(self.app).post('/api/runs/run-test/btw', json={'question': 'progress'})
+        self.assertEqual(response.status_code, 400)
+        runner.assert_not_called()
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.profile = {'id': 'codex-one', 'name': 'codex-one', 'engine': 'codex',
+                        'credential_account': 'fake-account', 'model': 'fake-model', 'enabled': True}
+        self.config = {'worker_profiles': [self.profile], 'worker_backend': 'local',
+                       'stage_policy': {'coordinator': {'btw_profile': 'codex-one'}}}
+        from muteki.core.events import EventType
+        async def replay(run_id):
+            yield SimpleNamespace(event_type=EventType.WORKER_STATUS, solver_id='participant-one',
+                payload=dict(engine=self.profile['engine'], profile_id=self.profile['id'],
+                    model=self.profile['model'], account_id='fake-account', online=True))
+        self.store = SimpleNamespace(replay=replay)
+        self.app = FastAPI()
+        self.app.state.route_helpers = SimpleNamespace(
+            _reject_temporarily_disabled_engine=lambda body: None,
+            _dispatch_run_command=None, _run_receipt_status=None)
+        self.app.state.manager = SimpleNamespace(
+            get=lambda run_id: SimpleNamespace(name='synthetic', category='web', execution_generation=1, run_id='run-test', store=self.store),
+            _safe_run_id=lambda run_id: run_id, workspace_dir=lambda run_id: self.root,
+            graph_dir=lambda run_id: self.root, event_root=self.root, sessions_root=self.root,
+            coordinator_control_dir=lambda run_id: self.root / "control" / run_id,
+            state_root=self.root, load_winner_continuation=lambda run_id: {},
+            worker_config=SimpleNamespace(resolve=lambda category: self.config),
+            usage=SimpleNamespace(record=Mock()))
+        register(self.app)
+
+    def test_http_stream_delivers_progress_and_answer_using_selected_credentials(self):
+        account = self.root / '_secrets' / 'accounts' / 'fake-account'
+        account.mkdir(parents=True)
+        (account / 'API_KEY').write_text('fictional-route-key')
+        def runner(driver, argv, *, on_step, on_proc, env, **kwargs):
+            self.assertEqual(driver.name, 'codex')
+            self.assertEqual(env['OPENAI_API_KEY'], 'fictional-route-key')
+            on_proc(None)
+            on_step(SimpleNamespace(kind='tool', tool='shell', text='fictional-command-secret'))
+            on_step(SimpleNamespace(kind='tool_result', text='fictional-output-secret'))
+            return CliResult(text='synthetic answer', returncode=0)
+        with patch('muteki.solver.cli_driver.run_cli_streaming', runner), \
+             patch('apps.web.routes.runs.is_web_container', create=True, return_value=False):
+            response = TestClient(self.app).post('/api/runs/run-test/btw', json={'question': 'summarize'})
+        self.assertEqual(response.status_code, 200)
+        frames = [json.loads(line[6:]) for line in response.text.splitlines() if line.startswith('data: ')]
+        self.assertTrue(any(frame.get('progress', {}).get('phase') == 'tool' for frame in frames))
+        self.assertIn({'delta': 'synthetic answer'}, frames)
+        self.assertEqual(frames[-1], {'done': True})
+        for secret in ('fictional-route-key', 'fictional-command-secret', 'fictional-output-secret'):
+            self.assertNotIn(secret, response.text)
+        self.app.state.manager.usage.record.assert_called_once()
+
+    def test_invalid_config_returns_400_before_cli_start(self):
+        self.config['worker_profiles'] = []
+        with patch('muteki.solver.cli_driver.run_cli_streaming') as runner:
+            response = TestClient(self.app).post('/api/runs/run-test/btw', json={'question': 'summarize'})
+        self.assertEqual(response.status_code, 400)
+        runner.assert_not_called()
+
+    def test_no_profiles_does_not_fall_back_to_host_claude(self):
+        self.config.clear()
+        with patch('muteki.solver.cli_driver.run_cli_streaming') as runner:
+            response = TestClient(self.app).post('/api/runs/run-test/btw', json={'question': 'summarize'})
+        self.assertEqual(response.status_code, 400)
+        runner.assert_not_called()
+
+    def test_history_api_persists_response_and_deletes_question_answer_pair(self):
+        client = TestClient(self.app)
+        account = self.root / '_secrets' / 'accounts' / 'fake-account'
+        account.mkdir(parents=True)
+        (account / 'API_KEY').write_text('fictional-route-key')
+        def runner(*a, **kw):
+            return CliResult(text='saved answer', returncode=0)
+        with patch('muteki.solver.cli_driver.run_cli_streaming', runner):
+            response = client.post('/api/runs/run-test/btw', json={'question': 'saved question'})
+        self.assertEqual(response.status_code, 200)
+        rows = client.get('/api/runs/run-test/btw/history').json()['turns']
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]['answer'], 'saved answer')
+        self.assertEqual(rows[0]['status'], 'completed')
+        self.assertEqual(client.get('/api/runs/another-run/btw/history').json()['turns'], [])
+        self.assertEqual(client.delete('/api/runs/run-test/btw/history/' + rows[0]['id']).status_code, 200)
+        self.assertEqual(client.get('/api/runs/run-test/btw/history').json()['turns'], [])
+        self.assertEqual(client.delete('/api/runs/run-test/btw/history/' + rows[0]['id']).status_code, 404)
+
+    def test_stale_client_transcript_does_not_restore_deleted_history(self):
+        from muteki.solver.btw_history import BtwHistory
+        history = BtwHistory(self.root / 'control' / 'run-test')
+        turn = history.begin('deleted question', engine='codex', model='fake')
+        history.update(turn, 'deleted answer', 'completed')
+        client = TestClient(self.app)
+        self.assertEqual(client.delete('/api/runs/run-test/btw/history').json()['deleted'], 1)
+        account = self.root / '_secrets' / 'accounts' / 'fake-account'
+        account.mkdir(parents=True)
+        (account / 'API_KEY').write_text('fictional-route-key')
+        prompts = []
+        def runner(driver, argv, **kw):
+            prompts.append(kw['stdin_text'])
+            return CliResult(text='new answer', returncode=0)
+        with patch('muteki.solver.cli_driver.run_cli_streaming', runner):
+            client.post('/api/runs/run-test/btw', json={'question': 'new question',
+                'transcript': [{'role': 'assistant', 'content': 'deleted answer'}]})
+        self.assertNotIn('deleted answer', prompts[0])
+        self.assertIn('new question', prompts[0])
+        self.assertEqual(len(history.list()), 1)
+
+    def test_unknown_run_cannot_access_history(self):
+        self.app.state.manager.get = lambda run_id: None
+        client = TestClient(self.app)
+        for method, suffix in (('get', ''), ('delete', ''), ('delete', '/missing')):
+            response = getattr(client, method)('/api/runs/unknown/btw/history' + suffix)
+            self.assertEqual(response.status_code, 404)
+        self.assertFalse((self.root / 'control' / 'unknown').exists())
+
+    def test_btw_survives_main_stop_and_is_available_after_stop_in_both_modes(self):
+        account = self.root / '_secrets' / 'accounts' / 'fake-account'
+        account.mkdir(parents=True)
+        (account / 'API_KEY').write_text('fictional-route-key')
+        for mode in ('ctf', 'pentest'):
+            for initially_finished in (False, True):
+                with self.subTest(mode=mode, finished=initially_finished):
+                    main_task = Mock()
+                    main_task.done.return_value = initially_finished
+                    main_cost = Mock()
+                    run = SimpleNamespace(name='synthetic', category='web', mode=mode, run_id='run-test', store=self.store,
+                        execution_generation=1, finished=initially_finished,
+                        solved=False, flags=['existing-flag'], task=main_task,
+                        cost=main_cost)
+                    self.app.state.manager.get = lambda run_id: run
+                    def runner(*args, **kwargs):
+                        # A main-task stop occurs while this separate CLI is running.
+                        run.finished = True
+                        main_task.done.return_value = True
+                        kwargs['on_step'](SimpleNamespace(kind='tool_result', text='done'))
+                        return CliResult(text='answer after main stop', returncode=0)
+                    with patch('muteki.solver.cli_driver.run_cli_streaming', runner):
+                        response = TestClient(self.app).post('/api/runs/run-test/btw',
+                            json={'question': 'progress'})
+                    self.assertEqual(response.status_code, 200)
+                    self.assertIn('answer after main stop', response.text)
+                    self.assertIn('"done": true', response.text)
+                    self.assertTrue(run.finished)
+                    self.assertFalse(run.solved)
+                    self.assertEqual(run.flags, ['existing-flag'])
+                    main_task.cancel.assert_not_called()
+                    self.assertEqual(main_cost.mock_calls, [])
+
+    def test_worker_exception_cannot_leak_secret_to_response_or_logs(self):
+        async def fail(**kwargs):
+            raise RuntimeError('Authorization: Bearer fictional-secret-not-for-output')
+            yield
+        with patch('muteki.solver.btw.stream_btw_worker_deltas', fail), \
+             patch('apps.web.drivers._standby_worker_env', return_value={}), \
+             self.assertLogs('apps.web.routes.runs', level='WARNING') as logs:
+            response = TestClient(self.app).post('/api/runs/run-test/btw',
+                json={'question': 'test'})
+        self.assertIn('RuntimeError', response.text)
+        self.assertNotIn('fictional-secret-not-for-output', response.text)
+        self.assertNotIn('fictional-secret-not-for-output', '\n'.join(logs.output))
+
+    def test_container_and_home_are_owned_by_each_request(self):
+        self.config['worker_backend'] = 'container'
+        self.app.state.manager.account_projection_root = self.root / 'projection'
+        self.app.state.manager.container_bootstrap_root = self.root / 'bootstrap'
+        async def answer(**kwargs):
+            kwargs['runtime_exit_callback'](True)
+            yield {'answer': 'synthetic'}
+        with patch('muteki.solver.btw.stream_btw_worker_deltas', answer), \
+             patch('apps.web.drivers._standby_worker_env', return_value={}) as env, \
+             patch('muteki.solver.container_exec.ensure_container', return_value=SimpleNamespace(to_container_path=lambda path: path, image='test')) as create, \
+             patch('muteki.solver.container_exec._chown_tree_to_worker'), \
+             patch('muteki.solver.container_exec.teardown_container', return_value=True) as remove:
+            for _ in range(2):
+                response = TestClient(self.app).post('/api/runs/run-test/btw',
+                    json={'question': 'test'})
+                self.assertIn('synthetic', response.text)
+        ids = [call.args[0] for call in create.call_args_list]
+        self.assertEqual(len(ids), 2)
+        self.assertNotEqual(ids[0], ids[1])
+        self.assertEqual(ids, [call.args[0] for call in remove.call_args_list])
+        labels = [call.kwargs['label'] for call in env.call_args_list]
+        self.assertNotEqual(labels[0], labels[1])
+
+    def test_successful_turn_cleans_scratch_but_keeps_history_and_main_workspace(self):
+        account = self.root / '_secrets' / 'accounts' / 'fake-account'
+        account.mkdir(parents=True)
+        (account / 'API_KEY').write_text('fictional-key')
+        main = self.root / 'workers' / 'main'
+        main.mkdir(parents=True)
+        (main / 'important').write_text('main task')
+        seen = []
+        def runner(*args, cwd, **kwargs):
+            seen.append(Path(cwd))
+            (Path(cwd) / 'temporary').write_text('scratch')
+            return CliResult(text='saved answer', returncode=0)
+        with patch('muteki.solver.cli_driver.run_cli_streaming', runner):
+            client = TestClient(self.app)
+            response = client.post('/api/runs/run-test/btw', json={'question': 'test'})
+        self.assertIn('saved answer', response.text)
+        self.assertFalse(seen[0].exists())
+        self.assertEqual((main / 'important').read_text(), 'main task')
+        self.assertEqual(client.get('/api/runs/run-test/btw/history').json()['turns'][0]['answer'], 'saved answer')
+        self.assertTrue((account / 'API_KEY').exists())
+
+    def test_unconfirmed_runtime_retains_scratch(self):
+        async def answer(**kwargs):
+            kwargs['runtime_exit_callback'](False)
+            yield {'answer': 'synthetic'}
+        with patch('muteki.solver.btw.stream_btw_worker_deltas', answer), \
+             patch('apps.web.drivers._standby_worker_env', return_value={}):
+            TestClient(self.app).post('/api/runs/run-test/btw', json={'question': 'test'})
+        self.assertEqual(len(list((self.root / 'workers' / '_btw').iterdir())), 1)
+
+    def test_http_disconnect_keeps_background_answer_and_durable_history(self):
+        import asyncio
+        import threading
+        from muteki.solver.btw_history import BtwHistory
+        release = threading.Event()
+        def runner(*args, **kwargs):
+            if not release.wait(3):
+                raise AssertionError('test did not release runner')
+            return CliResult(text='answer after navigation', returncode=0)
+        async def exercise():
+            disconnected = asyncio.Event()
+            delivered_body = False
+            async def receive():
+                nonlocal delivered_body
+                if not delivered_body:
+                    delivered_body = True
+                    return {'type': 'http.request', 'body': b'{"question":"test"}', 'more_body': False}
+                await disconnected.wait()
+                return {'type': 'http.disconnect'}
+            async def send(message):
+                if message['type'] == 'http.response.body' and message.get('body'):
+                    disconnected.set()
+            scope = {'type': 'http', 'asgi': {'version': '3.0'}, 'http_version': '1.1',
+                     'method': 'POST', 'scheme': 'http', 'path': '/api/runs/run-test/btw',
+                     'raw_path': b'/api/runs/run-test/btw', 'query_string': b'',
+                     'root_path': '', 'headers': [(b'content-type', b'application/json')],
+                     'client': ('127.0.0.1', 1234), 'server': ('test', 80)}
+            try:
+                await asyncio.wait_for(self.app(scope, receive, send), 2)
+                job = self.app.state.manager.btw_jobs.jobs['run-test']
+                self.assertFalse(job.task.done())
+                release.set()
+                await asyncio.wait_for(job.task, 2)
+                rows = BtwHistory(self.root / 'control' / 'run-test').list()
+                self.assertEqual(rows[0]['answer'], 'answer after navigation')
+                self.assertEqual(rows[0]['status'], 'completed')
+            finally:
+                release.set()
+                await self.app.state.manager.btw_jobs.shutdown()
+        with patch('muteki.solver.cli_driver.run_cli_streaming', runner), \
+             patch('apps.web.drivers._standby_worker_env', return_value={}):
+            asyncio.run(exercise())
+
+    def test_late_process_exit_retains_owner_then_cleans_scratch(self):
+        process = SimpleNamespace(returncode=None)
+        process.poll = lambda: process.returncode
+        workdirs = []
+        def runner(*args, cwd, on_proc, **kwargs):
+            workdirs.append(Path(cwd))
+            on_proc(process)
+            return CliResult(text='answer', returncode=0)
+        with patch('muteki.solver.cli_driver.run_cli_streaming', runner), \
+             patch('apps.web.drivers._standby_worker_env', return_value={}), \
+             TestClient(self.app) as client:
+            response = client.post('/api/runs/run-test/btw', json={'question': 'test'})
+            self.assertIn('answer', response.text)
+            self.assertTrue(workdirs[0].exists())
+            async def verify():
+                jobs = self.app.state.manager.btw_jobs
+                self.assertEqual(jobs.status('run-test')['progress']['phase'], 'cleanup')
+                self.assertFalse(await jobs.stop('run-test', timeout=0.01))
+                process.returncode = 0
+                self.assertTrue(await jobs.stop('run-test', timeout=2))
+            client.portal.call(verify)
+            self.assertFalse(workdirs[0].exists())
+
+    def test_history_poll_keeps_polling_when_job_finishes_during_read(self):
+        from apps.web.btw_jobs import BtwJob
+        from muteki.solver.btw_history import BtwHistory
+        history = BtwHistory(self.root / 'control' / 'run-test')
+        turn = history.begin('question', engine='codex', model='fake')
+        jobs = self.app.state.manager.btw_jobs
+        jobs.jobs['run-test'] = BtwJob()
+        read_saved = history.list
+
+        def read_during_completion():
+            rows = read_saved()
+            # The DB read precedes the producer's final write and removal.
+            history.update(turn, 'final answer', 'completed')
+            jobs.jobs.pop('run-test')
+            return rows
+
+        client = TestClient(self.app)
+        with patch.object(BtwHistory, 'list', side_effect=read_during_completion):
+            first = client.get('/api/runs/run-test/btw/history').json()
+        self.assertEqual(first['turns'][0]['status'], 'incomplete')
+        self.assertTrue(first['active'], 'a stale read must schedule another poll')
+        final = client.get('/api/runs/run-test/btw/history').json()
+        self.assertFalse(final['active'])
+        self.assertEqual(final['turns'][0]['answer'], 'final answer')
+        self.assertEqual(final['turns'][0]['status'], 'completed')
+
+    def test_failed_scratch_cleanup_is_retained_and_retried_before_next_turn(self):
+        import threading
+        from muteki.solver.btw_resources import cleanup_turn
+        allow_retry = threading.Event()
+        calls = []
+        main = self.root / 'workers' / 'main'
+        main.mkdir(parents=True)
+        (main / 'important').write_text('main task')
+
+        def flaky_cleanup(root, workdir, label):
+            calls.append(workdir)
+            if len(calls) == 1:
+                raise OSError('synthetic transient cleanup failure')
+            if not allow_retry.wait(3):
+                raise AssertionError('test did not release cleanup')
+            cleanup_turn(root, workdir, label)
+
+        async def answer(**kwargs):
+            kwargs['runtime_exit_callback'](True)
+            yield {'answer': 'saved answer'}
+
+        with patch('muteki.solver.btw.stream_btw_worker_deltas', answer), \
+             patch('apps.web.drivers._standby_worker_env', return_value={}), \
+             patch('muteki.solver.btw_resources.cleanup_turn', flaky_cleanup), \
+             TestClient(self.app) as client:
+            try:
+                response = client.post('/api/runs/run-test/btw', json={'question': 'test'})
+                self.assertIn('saved answer', response.text)
+                status = client.get('/api/runs/run-test/btw/history').json()
+                self.assertTrue(status['active'])
+                self.assertEqual(status['progress']['phase'], 'cleanup')
+                self.assertEqual(client.post('/api/runs/run-test/btw',
+                    json={'question': 'wait for cleanup'}).status_code, 409)
+            finally:
+                allow_retry.set()
+            async def settle():
+                return await self.app.state.manager.btw_jobs.stop('run-test', timeout=2)
+            self.assertTrue(client.portal.call(settle))
+            self.assertGreaterEqual(len(calls), 2)
+            self.assertFalse(calls[0].exists())
+            self.assertFalse(client.get('/api/runs/run-test/btw/history').json()['active'])
+            self.assertEqual((main / 'important').read_text(), 'main task')
+
+    def test_participants_api_and_invalid_selection(self):
+        client = TestClient(self.app)
+        workers = client.get('/api/runs/run-test/followup/workers').json()['workers']
+        self.assertEqual([worker['worker_id'] for worker in workers], ['participant-one'])
+        response = client.post('/api/runs/run-test/btw', json={'question': 'hello', 'worker_id': 'unlaunched'})
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()['code'], 'followup.worker_unavailable')
+
+    def test_evidence_failure_is_typed_and_does_not_launch_cli(self):
+        from muteki.solver.followup_report import EvidenceReadError
+        with patch('muteki.solver.btw.build_btw_context_sync', side_effect=EvidenceReadError('unavailable')), \
+             patch('muteki.solver.cli_driver.run_cli_streaming') as runner:
+            response = TestClient(self.app).post('/api/runs/run-test/btw', json={'question': 'hello'})
+        self.assertIn('followup.evidence_unreadable', response.text)
+        runner.assert_not_called()
+
+    def test_long_history_is_an_explicit_readable_reference_in_the_prompt(self):
+        from muteki.solver.btw_history import BtwHistory
+        history = BtwHistory(self.root / 'control' / 'run-test')
+        turn = history.begin('retained question', engine='pi', model='fake')
+        history.update(turn, 'x' * 24001 + 'history-tail', 'completed')
+        def runner(driver, argv, *, stdin_text, **kwargs):
+            context = json.loads(stdin_text[stdin_text.index('{'):].split('\n当前问题')[0])
+            self.assertEqual(context['history']['completed_turns'], 1)
+            transcript = json.loads(Path(context['history']['complete_records_file']).read_text())
+            self.assertTrue(transcript[-1]['content'].endswith('history-tail'))
+            self.assertNotEqual(context['history'], [])
+            return CliResult(text='history read', returncode=0)
+        with patch('muteki.solver.cli_driver.run_cli_streaming', runner), \
+             patch('apps.web.drivers._standby_worker_env', return_value={}):
+            response = TestClient(self.app).post('/api/runs/run-test/btw', json={'question': 'previous answer?'})
+        self.assertIn('history read', response.text)

@@ -1,32 +1,9 @@
-"""BTW side-query observer — worker-backed read-only Q&A over a run.
+"""BTW snapshot-only Q&A, independent from the solve scheduler and budget.
 
-This module powers `POST /api/runs/{run_id}/btw`: the operator asks a quick
-side question ("summarize progress", "which worker is on which line", ...) and
-gets a streamed answer from a short-lived CLI worker that reads the run's durable
-files directly.
-
-The current default path is **worker-backed but swarm-isolated**:
-
-  * starts the selected CLI agent through `run_cli_streaming`, not `CliSolver`;
-  * never attaches a run bus, cost ledger, HITL queue, InsightBus, or shared graph
-    writer, so the worker is not a swarm member;
-  * points the worker at JSONL / shared_graph.db / winner.json / artifacts and
-    asks it to inspect those files itself;
-  * forbids blackboard writes and provenance markers (`FOUND_FLAG=`,
-    `VERIFIED_FACT=`, etc.) in the prompt, so `/btw` cannot become a flag source.
-
-The older flash-model helpers remain below for tests and compatibility: they
-build a read-only context snapshot and LLM messages, but the web route no longer
-uses them by default.
-
-Multi-turn: the caller passes the accumulated `transcript`; we re-snapshot the
-graph EVERY turn so a follow-up "and now?" reflects the latest blackboard. The
-transcript lives only in the frontend component state + the request body — it
-is never persisted server-side.
-
-The system prompt forbids asserting flag candidates or inventing facts not in
-the context: btw is an observer, never a flag source (the provenance gate is
-unchanged and never sees btw output anyway).
+The host reads existing JSONL/SQLite records without modifying them. Each turn
+receives complete evidence references and retained conversation history over stdin,
+using the selected adapter's read-only permissions. No solve session or task-writing tools are
+restored. Legacy message builders below remain for compatibility.
 """
 
 from __future__ import annotations
@@ -35,6 +12,7 @@ import asyncio
 import inspect
 import json
 import threading
+import time
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -82,43 +60,6 @@ class BtwWorkerPaths:
     uploads: str = ""
 
 
-_BTWWORKER_RULES = """你是 Muteki `/btw` 的只读旁路 worker。你不是正在解题的 swarm worker,
-也不是 coordinator。你的唯一任务是回答操作员这个 side question。
-
-工作方法:
-- 直接读取下面列出的 run 文件、SQLite graph、JSONL event log、artifacts。
-- 如果要总结解题路径,优先使用 `flag_found` / `verified` evidence / worker 实际输出。
-- 明确区分 `intent_proposed`、open intent、dead_end、operator hint、候选证据、误报 flag。
-- 不要把计划、猜测、失败方向写成已经完成的步骤。
-- 信息不足就说不足;不要补剧情。
-
-绝对禁止:
-- 不要调用或写入 blackboard skill / blackboard.py / shared_graph 写接口。
-- 不要修改 `shared_graph.db`、JSONL、winner.json、artifacts 或 run workspace 里的共享状态。
-- 只允许在当前 cwd 下写临时 scratch 文件。
-- 不要继续攻击目标、不要提交 flag、不要 spawn/kill/pause/redirect worker。
-- 不要输出 `FOUND_FLAG=`, `VERIFIED_FACT=`, `BB_FACT=`, `BB_INTENT=`, `HITL_REQUEST=`
-  等任何 solver 协议标记。
-
-回答风格:
-- 用中文,简洁直接。
-- 若回答"整体解题路径",按已验证事实给出,并标出哪些只是尝试/失败方向。
-"""
-
-
-def _fmt_transcript(transcript: list[dict[str, str]]) -> str:
-    if not transcript:
-        return "(无历史 /btw 对话)"
-    labels = {"user": "操作员", "assistant": "btw", "summary": "历史摘要"}
-    lines: list[str] = []
-    for turn in transcript:
-        role = labels.get(str(turn.get("role") or ""), "btw")
-        content = (turn.get("content") or "").strip()
-        if content:
-            lines.append(f"{role}: {content}")
-    return "\n".join(lines) if lines else "(无历史 /btw 对话)"
-
-
 def build_btw_worker_prompt(
     *,
     question: str,
@@ -127,49 +68,19 @@ def build_btw_worker_prompt(
     challenge_name: str,
     challenge_category: str,
     run_state: str = "",
+    run_summary: Optional[dict[str, Any]] = None,
     context_hint: Optional[str] = "",
     transcript: Optional[list[dict[str, str]]] = None,
 ) -> str:
-    """Prompt for the short-lived `/btw` worker.
-
-    The prompt deliberately points at durable run artifacts instead of injecting
-    a lossy graph summary. This is the main anti-distortion change: the worker can
-    query SQLite/JSONL directly and decide which events are evidence versus leads.
-    """
-    q = (question or "").strip()
-    hint = (context_hint or "").strip()
-    transcript = sanitize_transcript(transcript or [])
-
-    path_lines = [
-        f"- workspace: {paths.workspace}",
-        f"- event log JSONL: {paths.jsonl}",
-        f"- shared graph SQLite DB: {paths.graph_db}",
-        f"- markdown board: {paths.board}",
-        f"- artifacts dir: {paths.arts}",
-    ]
-    if paths.winner:
-        path_lines.append(f"- winner snapshot: {paths.winner}")
-    if paths.uploads:
-        path_lines.append(f"- uploaded challenge files: {paths.uploads}")
-
-    meta_lines = [
-        f"- run_id / challenge_id: {challenge_id}",
-        f"- name: {challenge_name or challenge_id}",
-        f"- category: {challenge_category or 'web'}",
-    ]
-    if run_state:
-        meta_lines.append(f"- run state: {run_state}")
-    if hint:
-        meta_lines.append(f"- operator focus: {hint}")
-
-    return "\n\n".join([
-        _BTWWORKER_RULES,
-        "=== Run metadata ===\n" + "\n".join(meta_lines),
-        "=== Files you may inspect ===\n" + "\n".join(path_lines),
-        "=== Previous /btw transcript ===\n" + _fmt_transcript(transcript),
-        "=== Current question ===\n" + q,
-        "请现在读取必要文件后回答。最终只输出给操作员看的答案,不要输出协议标记。",
-    ])
+    """Compatibility helper: collect records on the host, never ask CLI to read paths."""
+    from muteki.solver.followup_report import question_prompt
+    meta = {**(run_summary or {}), "state": run_state}
+    snapshot = build_btw_context_sync(
+        graph_db_path=paths.graph_db, jsonl_path=paths.jsonl,
+        challenge_id=challenge_id, challenge_name=challenge_name,
+        challenge_category=challenge_category, run_meta=meta)
+    return question_prompt(question, snapshot,
+        transcript=sanitize_transcript(transcript or []), context_hint=context_hint)
 
 
 async def _maybe_disconnected(fn: Callable[[], Any] | None) -> bool:
@@ -196,13 +107,17 @@ async def stream_btw_worker_deltas(
     kb_access: bool = False,
     request_disconnected: Callable[[], Any] | None = None,
     usage_callback: Callable[[Any], Any] | None = None,
-) -> AsyncIterator[str]:
+    include_progress: bool = False,
+    diagnostic: Callable[[dict[str, Any]], None] | None = None,
+    runtime_exit_callback: Callable[[bool], None] | None = None,
+    runtime_query_callback: Callable[[Callable[[], bool]], None] | None = None,
+) -> AsyncIterator[str | dict[str, Any]]:
     """Run one CLI worker turn and yield assistant text chunks for `/btw`.
 
     This is intentionally lower-level than `CliSolver`: it has no EventBus, no
     CostController, no SharedGraph writer, and no flag provenance gate. The worker
-    subprocess may use its normal tools to inspect files, but only assistant prose
-    is forwarded to the HTTP caller.
+    subprocess receives an inline record snapshot via stdin and restricted
+    native permissions. It cannot use ordinary solve tools to gather context.
     """
     from muteki.solver.cli_driver import run_cli_streaming
 
@@ -211,6 +126,24 @@ async def stream_btw_worker_deltas(
     done = object()
     cancel_event = threading.Event()
     streamed = {"count": 0}
+    processes: list[Any] = []
+    runner_finished = threading.Event()
+    def runtime_exited():
+        if not runner_finished.is_set():
+            return False
+        try:
+            return all(proc.poll() is not None for proc in processes)
+        except Exception:
+            return False
+    if runtime_query_callback is not None:
+        runtime_query_callback(runtime_exited)
+
+    def on_proc(proc):
+        if proc is not None:
+            processes.append(proc)
+        if include_progress:
+            _put({"progress": {"phase": "running"}})
+
     result_holder: list[Any] = []
     error_holder: list[BaseException] = []
 
@@ -220,7 +153,28 @@ async def stream_btw_worker_deltas(
         except RuntimeError:
             pass
 
+    stats = {"tools": 0, "tool_results": 0, "thinking_events": 0, "text_events": 0, "text_chars": 0}
+    def report(phase: str, **fields: Any) -> None:
+        if diagnostic is not None:
+            diagnostic({"phase": phase, **stats, **fields})
+
+    tool_count = 0
     def _on_step(step: Any) -> None:
+        nonlocal tool_count
+        kind = getattr(step, "kind", "")
+        if kind == "tool":
+            stats["tools"] += 1
+            report("tool_started")
+        elif kind == "tool_result":
+            stats["tool_results"] += 1
+            report("tool_returned")
+        elif kind == "reasoning" and bool(getattr(step, "thinking", False)):
+            stats["thinking_events"] += 1
+        if include_progress and kind == "tool":
+            tool_count += 1
+            _put({"progress": {"phase": "tool", "tool_count": tool_count}})
+        elif include_progress and kind == "tool_result":
+            _put({"progress": {"phase": "tool_result", "tool_count": tool_count}})
         if (getattr(step, "kind", "") != "reasoning"
                 or bool(getattr(step, "thinking", False))):
             return
@@ -228,38 +182,63 @@ async def stream_btw_worker_deltas(
         if not text:
             return
         streamed["count"] += 1
+        stats["text_events"] += 1
+        stats["text_chars"] += len(text)
+        if stats["text_events"] == 1:
+            report("cli_first_text")
         _put(text)
 
     def _run() -> None:
         try:
-            session = driver.new_session()
-            argv = driver.build_execute(
-                prompt,
-                session,
-                web_access=web_access,
-                kb_access=kb_access,
-                stream=True,
-            )
+            from muteki.solver.followup_report import build_observer_input
+            argv, stdin_text = build_observer_input(driver, prompt)
+            # Reuse the normal Worker's host allowlist; never inherit web/control
+            # credentials or Node/shell startup hooks into this observer process.
+            import os
+            from muteki.solver.cli_process import _SAFE_HOST_ENV, _CONTROL_SECRET_ENV
+            from muteki.solver.cli_workspace import _stable_worker_path
+            sealed_env = {key: value for key, value in os.environ.items() if key in _SAFE_HOST_ENV}
+            sealed_env.update(env or {})
+            for key in _CONTROL_SECRET_ENV:
+                sealed_env.pop(key, None)
+            for key in ("MUTEKI_BLACKBOARD_DB", "MUTEKI_BLACKBOARD_SCRIPT", "MUTEKI_BLACKBOARD_INGRESS_DIR"):
+                sealed_env[key] = ""
+            sealed_env["PATH"] = _stable_worker_path(sealed_env.get("PATH") or os.environ.get("PATH", ""))
             res = run_cli_streaming(
                 driver,
                 argv,
                 cwd=cwd,
                 timeout=timeout,
                 on_step=_on_step,
-                env=env,
+                env=sealed_env,
+                inherit_env=False,
+                stdin_text=stdin_text,
                 cancel_event=cancel_event,
                 container=container,
+                on_proc=on_proc,
             )
+            report("cli_returned", final_chars=len(str(getattr(res, "text", "") or "")),
+                   timed_out=bool(getattr(res, "timed_out", False)),
+                   cancelled=bool(getattr(res, "cancelled", False)),
+                   returncode=getattr(res, "returncode", None))
             if usage_callback is not None:
                 usage_callback(res)
             result_holder.append(res)
         except BaseException as exc:  # noqa: BLE001
+            report("cli_exception", error_type=type(exc).__name__)
             error_holder.append(exc)
         finally:
+            runner_finished.set()
+            if runtime_exit_callback is not None:
+                runtime_exit_callback(runtime_exited())
             _put(done)
 
     task = asyncio.create_task(asyncio.to_thread(_run))
+    started_at = time.monotonic()
+    last_progress = started_at
     try:
+        if include_progress:
+            yield {"progress": {"phase": "starting"}}
         while True:
             if await _maybe_disconnected(request_disconnected):
                 cancel_event.set()
@@ -267,21 +246,31 @@ async def stream_btw_worker_deltas(
             try:
                 item = await asyncio.wait_for(queue.get(), timeout=0.25)
             except asyncio.TimeoutError:
+                now = time.monotonic()
+                if include_progress and now - last_progress >= 5:
+                    last_progress = now
+                    report("waiting", elapsed_seconds=int(now - started_at))
+                    yield {"progress": {"phase": "waiting", "elapsed_seconds": int(now - started_at)}}
                 if task.done() and queue.empty():
                     break
                 continue
             if item is done:
                 break
-            yield str(item)
+            yield item if isinstance(item, dict) else str(item)
     except asyncio.CancelledError:
         cancel_event.set()
         raise
     finally:
-        if cancel_event.is_set() and not task.done():
-            try:
-                await asyncio.wait_for(task, timeout=2.0)
-            except asyncio.TimeoutError:
-                pass
+        # Closing the async iterator must cancel and join the real runner before
+        # its owner removes cwd/HOME. Cancelling to_thread alone cannot do that.
+        cancel_event.set()
+        import anyio
+        with anyio.CancelScope(shield=True):
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    continue
 
     if not task.done():
         await task
@@ -294,9 +283,17 @@ async def stream_btw_worker_deltas(
         return
     if getattr(res, "timed_out", False):
         raise TimeoutError(f"btw worker timed out after {timeout}s")
+    if getattr(res, "returncode", None) not in {None, 0} or getattr(res, "error", ""):
+        raise RuntimeError("BTW Worker failed; check the selected Profile and provider")
     final_text = str(getattr(res, "text", "") or "").strip()
+    if streamed["count"] == 0 and not final_text:
+        raise RuntimeError("BTW Worker returned no answer")
     if streamed["count"] == 0 and final_text:
         yield final_text
+    if include_progress and final_text:
+        # The final parser can recognize a message that the streaming parser
+        # did not. Replace the partial response with the authoritative answer.
+        yield {"answer": final_text}
 
 
 def sanitize_transcript(transcript: Any) -> list[dict[str, str]]:
@@ -389,8 +386,13 @@ def build_btw_run_stats_sync(jsonl_path: str) -> str:
     type_counts: dict[str, int] = {}
 
     try:
-        with open(jsonl_path, "r", encoding="utf-8") as f:
-            for raw in f:
+        with open(jsonl_path, "rb") as f:
+            remaining = _os.fstat(f.fileno()).st_size
+            while remaining > 0:
+                raw = f.readline(remaining)
+                if not raw:
+                    break
+                remaining -= len(raw)
                 raw = raw.strip()
                 if not raw:
                     continue
@@ -505,143 +507,29 @@ def build_btw_context_sync(
     context_hint: Optional[str] = "",
     jsonl_path: str = "",
 ) -> str:
-    """Synchronous, read-only graph snapshot for the btw system prompt.
-
-    Runs inside `asyncio.to_thread` from the route so it never blocks the
-    uvicorn event loop. Opens the graph TRUE read-only; on ANY SQLite
-    operational error (missing file, stale schema, WAL sidecar absent on a
-    live run) it degrades to a minimal context — never attempts migration and
-    never opens read-write.
-
-    `run_meta` carries the live run's worker/status fields (from the Run
-    object) so we can describe worker state without reading worker stdout.
-    """
+    """Read complete records without opening the graph for writes or migrations."""
+    from pathlib import Path
     from muteki.models.solve_graph import Challenge
     from muteki.swarm.shared_graph import SQLiteSharedGraph
+    from muteki.solver.followup_report import EvidenceReadError
 
-    parts: list[str] = []
-    parts.append(f"Challenge: {challenge_name or challenge_id}")
-    parts.append(f"类别: {challenge_category or '未知'}")
-    parts.append(f"Run状态: {run_meta.get('state', '未知')}")
-    if run_meta.get("solved"):
-        parts.append("已解出 flag")
-    if run_meta.get("flags"):
-        parts.append(f"已收集 flags 数: {len(run_meta['flags'])}")
-    if run_meta.get("awaiting_help"):
-        parts.append(f"有 worker 举手求助: {run_meta.get('help_text', '')}")
-    workers = run_meta.get("workers") or []
-    if workers:
-        parts.append("Workers:")
-        for w in workers:
-            parts.append(
-                f"  - {w.get('id','?')} [{w.get('engine','?')}] "
-                f"状态={w.get('state','?')}"
-            )
-
-    # Run-level statistics from the JSONL event log (timing / cost / worker
-    # roster / activity). This is the ONLY reliable source for cost+timing on
-    # a historical run — the in-memory CostController is empty after a server
-    # restart, but the JSONL is persistent. Read-only single pass.
-    if jsonl_path:
-        try:
-            stats = build_btw_run_stats_sync(jsonl_path)
-            if stats:
-                parts.append("=== Run 维度统计 (时长/花费/worker/活动) ===")
-                parts.append(stats)
-        except Exception:
-            pass
-
-    import os
-    if not os.path.exists(graph_db_path):
-        parts.append("Blackboard: 尚未建立 (run 刚启动或未进入协调阶段)")
-        return "\n".join(parts)
-
-    challenge = Challenge(
-        id=challenge_id,
-        name=challenge_name,
-        category=challenge_category or "web",
-    )
+    data = {"challenge": {"id": challenge_id, "name": challenge_name, "category": challenge_category},
+            "run": run_meta, "focus": context_hint, "evidence": None}
     graph = None
     try:
-        graph = SQLiteSharedGraph.open_readonly(
-            db_path=graph_db_path, challenge=challenge,
-        )
-        try:
-            summary = graph.to_summary(
-                max_evidence=10**9,
-                max_dead_ends=10**9,
-            )
-            if summary and summary.strip():
-                parts.append("=== Facts / Dead-ends 摘要 ===")
-                parts.append(summary)
-        except Exception:
-            parts.append("(facts 摘要读取失败 — 可能 schema 过旧)")
-        try:
-            opens = graph.open_goal_texts()
-            if opens:
-                parts.append("=== Open Intents ===")
-                for g in opens:
-                    parts.append(f"  - {g}")
-        except Exception:
-            pass
-        try:
-            barren = graph.barren_concluded_goal_texts()
-            if barren:
-                parts.append("=== 已尝试但无产出的方向 (dead-ends) ===")
-                for g in barren:
-                    parts.append(f"  - {g}")
-        except Exception:
-            pass
-        try:
-            cands = graph.active_candidates()
-            if cands:
-                parts.append(f"=== 候选证据 (未验证) : {len(cands)} 条 ===")
-                for c in cands:
-                    f = c.get("fact") or ""
-                    parts.append(f"  - {f}")
-        except Exception:
-            pass
-        try:
-            verified = graph.verified_evidence()
-            if verified:
-                parts.append(f"=== 已验证证据 : {len(verified)} 条 ===")
-                for v in verified:
-                    f = v.get("fact") or ""
-                    parts.append(f"  - {f}")
-        except Exception:
-            pass
-        try:
-            invalid = graph.invalidated_flags()
-            if invalid:
-                parts.append(f"=== 被标误报的 flags : {len(invalid)} ===")
-        except Exception:
-            pass
-        try:
-            recent = graph.recent_events(limit=10**9)
-            if recent:
-                parts.append("=== 最近事件时间线 (最近 40 条,精简) ===")
-                for e in recent:
-                    kind = e.get("kind", "?")
-                    actor = e.get("actor", "?")
-                    p = e.get("payload") or {}
-                    tag = ""
-                    if isinstance(p, dict):
-                        tag = str(p.get("fact") or p.get("goal") or
-                                  p.get("text") or p.get("summary") or "")
-                    parts.append(f"  [{e.get('seq','?')}] {kind} by {actor}: {tag}")
-        except Exception:
-            pass
-    except Exception:
-        # open_readonly failed (missing WAL sidecar on a live run, stale schema,
-        # etc.) — degrade, do NOT fall back to read-write.
-        parts.append("Blackboard: 暂时不可读 (graph 正在被写入或 schema 不兼容)")
+        if jsonl_path and Path(jsonl_path).exists():
+            data["run_statistics"] = build_btw_run_stats_sync(jsonl_path)
+            data["run_events_jsonl"] = Path(jsonl_path).read_text(encoding="utf-8")
+        if Path(graph_db_path).exists():
+            graph = SQLiteSharedGraph.open_readonly(db_path=graph_db_path,
+                challenge=Challenge(id=challenge_id, name=challenge_name, category=challenge_category or "web"))
+            data["evidence"] = {"current": graph.snapshot().model_dump(mode="json"), "events": graph.events()}
+        return json.dumps(data, ensure_ascii=False)
+    except Exception as exc:
+        raise EvidenceReadError("无法读取任务证据，问答未启动；请检查任务存储后重试") from exc
     finally:
         if graph is not None:
-            try:
-                graph.close()
-            except Exception:
-                pass
-    return "\n".join(parts)
+            graph.close()
 
 
 def run_meta_dict(run: Any) -> dict[str, Any]:

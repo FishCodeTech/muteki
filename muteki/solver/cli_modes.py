@@ -1,6 +1,7 @@
 """CliSolver mode implementations. Moved mechanically from cli_solver.py."""
 from __future__ import annotations
 
+import asyncio
 import tempfile
 import time
 from pathlib import Path
@@ -1249,8 +1250,8 @@ async def _run_review(self) -> SolveOutcome:
 
 
 async def _run_respond(self) -> SolveOutcome:
-    """Post-solve standby: serve ONE operator command by resuming the winner's
-    CLI session (full memory of the solve). action ∈ {ask, mark_false, writeup}.
+    """Standby: Ask/Writeup use fresh snapshot-only turns.
+    Only execution commands may resume the original solve session.
 
     ask/writeup are conversational — their output streams to the deck as the
     worker's reply and (writeup) is persisted; neither produces a Flag.
@@ -1263,6 +1264,7 @@ async def _run_respond(self) -> SolveOutcome:
             EventType.FOLLOWUP_STARTED,
             followup_id=followup_id,
             kind=action,
+            source_worker_id=str(self.hitl_cmd.get("worker_id") or ""),
             question=text,
         )
     else:
@@ -1277,13 +1279,18 @@ async def _run_respond(self) -> SolveOutcome:
     # write a fresh board file into THIS worker's wd before building the prompt
     # (standby reuses a possibly-stale winner dir → rewrite, don't trust a
     # leftover board file).
-    _reuse_winner = bool(self._workdir and Path(self._workdir).exists())
-    wd = Path(self._workdir) if _reuse_winner \
-        else Path(tempfile.mkdtemp(prefix=f"muteki-respond-{self.solver_id}-"))
+    _reuse_winner = action not in {"ask", "writeup"} and bool(self._workdir and Path(self._workdir).exists())
+    wd = Path(self._workdir) if _reuse_winner else Path(tempfile.mkdtemp(
+        prefix=f"muteki-respond-{self.solver_id}-",
+        dir=self._workdir if action in {"ask", "writeup"} and self.container is not None else None))
     if not _reuse_winner:
         self._owned_scratch = wd   # M10: respond mkdtemp was never cleaned before
     wd.mkdir(parents=True, exist_ok=True)
-    self._write_board_file(wd)  # sets _board_file_written for _board_context below
+    if action in {"ask", "writeup"} and self.container is not None:
+        from muteki.solver.container_exec import _chown_tree_to_worker
+        await asyncio.to_thread(_chown_tree_to_worker, str(wd), image=self.container.image)
+    if action not in {"ask", "writeup"}:
+        self._write_board_file(wd)
 
     # build the prompt for this command
     if action == "mark_false":
@@ -1293,8 +1300,18 @@ async def _run_respond(self) -> SolveOutcome:
     elif action == "writeup":
         if str(getattr(self.challenge, "mode", "ctf")) == "pentest":
             raise RuntimeError("Pentest reports are generated from the shared graph; use the Pentest report endpoint")
-        prompt = _RESPOND_WRITEUP_PROMPT
-    else:  # ask / hint / redirect / anything conversational
+        from muteki.solver.followup_report import report_snapshot, evidence_reference, question_prompt
+        snapshot = await asyncio.to_thread(report_snapshot, self)
+        records = await asyncio.to_thread(evidence_reference, snapshot, wd,
+            container=self.container, source_root=self._workdir)
+        prompt = _RESPOND_WRITEUP_PROMPT + question_prompt("根据完整记录生成复盘报告", records)
+    elif action == "ask":
+        from muteki.solver.followup_report import report_snapshot, evidence_reference, question_prompt
+        snapshot = await asyncio.to_thread(report_snapshot, self)
+        records = await asyncio.to_thread(evidence_reference, snapshot, wd,
+            container=self.container, source_root=self._workdir)
+        prompt = question_prompt(text, records)
+    else:  # execution guidance retains its existing behavior
         question = text or "(no question text)"
         if action == "redirect":
             endpoint = str(self.hitl_cmd.get("url") or "").strip()
@@ -1314,15 +1331,19 @@ async def _run_respond(self) -> SolveOutcome:
     if not bool(getattr(self.challenge, "allow_operator_input", True)):
         prompt = without_operator_input_capability(prompt)
 
-    # RESUME the winner's session (full memory) when we have one; otherwise a
-    # fresh session, with the prompt already carrying the board context.
+    # Ask/Writeup always use fresh observers. Other commands resume the winner's
+    # session when available, or receive the normal board context.
     # MIGRATION NOTE (DESIGN_single_shot_migration.md, D-1): this is the ONLY
     # resume path the single-shot migration keeps. standby is a SINGLE cold
     # answer-turn, not a long-lived loop accumulating context across a solve —
     # so resuming the winner's session here doesn't reintroduce the bloat the
     # migration removed; it just gives the answer the winner's full memory.
     stdin_text: "Optional[str]" = None
-    if self._control_secret_values:
+    if action in {"ask", "writeup"}:
+        # A fresh observer gets inline evidence, never the solve-oriented board
+        # pointer or a session that can resume its unfinished investigation.
+        argv, stdin_text = self._execute_invocation(prompt, None)
+    elif self._control_secret_values:
         # The winner session may contain durable history and Cursor cannot make
         # it ephemeral.  A secret-bearing response is always a fresh stdin-only
         # turn with an explicit board snapshot instead of a resume.
@@ -1449,7 +1470,7 @@ async def _run_respond(self) -> SolveOutcome:
     self._note_worker_stop("finished")
     return SolveOutcome(
         False, None, 1, self.graph, f"{self.driver.name} standby {action}",
-        session=(None if self._control_secret_values
+        session=(None if self._control_secret_values or action in {"ask", "writeup"}
                  else res.session or self.resume_session),
         engine=self.driver.name, workdir=str(wd), reply=safe_all_text.strip(),
         flags=list(self.graph.flags),

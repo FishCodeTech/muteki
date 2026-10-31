@@ -739,7 +739,7 @@ function RosterWorkspace({
       <div className="wroster-channel-label">辅助 Worker <span>Pentest</span></div>
       <section className={`wreview-slot${review.enabled ? "" : " disabled"}${selectedInspector === "review" ? " selected" : ""}`}>
         <Button type="button" variant="ghost" className="wreview-selection" aria-label="配置 Review Worker" aria-pressed={selectedInspector === "review"} onClick={onSelectReview}>
-          <span className="wreview-slot-copy"><span className="wreview-symbol"><Icon name="eye" size={17} /></span><span><strong>Review Worker</strong><small>审查建议 · BTW 默认 Worker</small></span><Icon name="chevronRight" size={14} /></span>
+          <span className="wreview-slot-copy"><span className="wreview-symbol"><Icon name="eye" size={17} /></span><span><strong>Review Worker</strong><small>审查建议 · BTW 自动模式候选</small></span><Icon name="chevronRight" size={14} /></span>
           <span className="wreview-assigned">{reviewSeat?.label || "尚未指定 Worker"}</span>
           <span className="wreview-slot-state">{reviewSeat ? <SelfCheckStatus enabled={Boolean(review.enabled && reviewSeat.enabled)} testing={testingIds.has(reviewSeat.id)} result={testResults[reviewSeat.id]} compact /> : <span>{review.enabled ? "待配置" : "已停用"}</span>}<span>并发 1</span></span>
         </Button>
@@ -1063,7 +1063,7 @@ function ReviewInspector({
       <div className="wset-inspector-scroll">
       <section className="wset-form-section">
         <h3>Review 配置</h3>
-        <p className="wsettings-inline-note"><Icon name="info" size={13} />仅 Pentest 生效，占用 1 个总并发名额；同时作为 BTW 默认 Worker。</p>
+        <p className="wsettings-inline-note"><Icon name="info" size={13} />仅 Pentest 生效，占用 1 个总并发名额；BTW 未单独配置时可作为候选 Worker。</p>
         <div className="wset-switch-row"><span><b>启用 Review</b><small>按触发条件启动独立审查进程</small></span><Switch size="sm" aria-label="启用 Review" isSelected={review.enabled ?? false} onChange={(enabled) => onReview({ enabled })}><Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control></Switch.Content></Switch></div>
         <label><span>使用 Worker</span><Select aria-label="Review Worker" selectedKey={review.engine || ""} onSelectionChange={(key) => onReview({ engine: String(key) })}><Select.Trigger><Select.Value /></Select.Trigger><Select.Popover><ListBox><ListBoxItem id="">选择 Worker</ListBoxItem>{options.map((seat) => <ListBoxItem key={seat.id} id={seat.id} isDisabled={!seat.enabled}>{seat.label} · {credentials.find((item) => item.id === seat.credential_id)?.secret_ref || "系统登录"}{seat.enabled ? "" : " · 已停用"}</ListBoxItem>)}</ListBox></Select.Popover></Select></label>
         <div className="wset-binding-help"><span>并发固定为 1</span><Button type="button" onClick={onCreateDedicated}>创建独立配置</Button></div>
@@ -2278,6 +2278,8 @@ export function WorkerOrchestration({ defaultReturnTo = "/", navigation }: { def
         race: { ...config.stage_policy.race, enabled: raceScout, timeout: raceTimeout, engines: raceRefs },
         coordinator: {
           ...config.stage_policy.coordinator,
+          standby_profile: "",
+          btw_profile: "",
           dispatch_mode: dispatchMode,
           wall_clock_budget: wallClock,
           review: { ...review, max_concurrent: 1 },

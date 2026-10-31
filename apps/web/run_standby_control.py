@@ -358,7 +358,8 @@ async def apply_standby_control(
         "detail": ("standby prompt delivery confirmed" if delivered
                    else ("standby prompt delivery was not confirmed and "
                          "may have crossed the process/stdin boundary")),
-        "target_ids": [],
+        "target_ids": ([str(wire["worker_id"])]
+                       if delivered and action in {"ask", "writeup"} and wire.get("worker_id") else []),
         "metadata": {
             "effect": ("standby_prompt_started" if delivered
                        else "delivery_unknown"),

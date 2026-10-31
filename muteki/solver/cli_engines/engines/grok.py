@@ -33,6 +33,13 @@ class GrokDriver(ClaudeCodeDriver):
         "GROK_CURSOR_MCPS_ENABLED=false",
     )
 
+    def build_observer_input(self, prompt: str) -> tuple[list[str], str]:
+        from muteki.solver.cli_engines.types import LaunchPurpose
+        argv, body = self.build_execute_input(prompt, None, web_access=False, kb_access=False,
+            stream=True, launch=LaunchContext(purpose=LaunchPurpose.CONVERSATION, permission_mode="plan"))
+        argv += ["--tools", "Read,Glob,Grep"]
+        return argv, body
+
     def native_permission_modes(self) -> tuple[str, ...]:
         return ("default", "acceptEdits", "auto", "dontAsk",
                 "bypassPermissions", "plan")

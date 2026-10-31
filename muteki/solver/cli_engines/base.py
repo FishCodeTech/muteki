@@ -140,6 +140,11 @@ class CliDriver(abc.ABC):
         raise SecurePromptUnsupported(
             f"{self.name} does not support non-persistent stdin prompt delivery")
 
+    def build_observer_input(self, prompt: str) -> tuple[list[str], str]:
+        """Fresh read-only evidence inspection, implemented by each native adapter."""
+        from muteki.solver.followup_report import ObserverCapabilityError
+        raise ObserverCapabilityError(f"{self.name} 尚未提供可验证的只读问答模式")
+
     def secure_prompt_preflight(self) -> "tuple[bool, str]":
         """Capability-neutral local check for the exact-secret CLI contract."""
         return False, f"{self.name} has no secure stdin prompt capability"
