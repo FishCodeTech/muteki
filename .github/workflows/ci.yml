@@ -34,6 +34,7 @@ jobs:
           filters: |
             python:
               - 'muteki/**'
+              - 'tests/**'
               - 'apps/**/*.py'
               - 'scripts/**'
               - 'apps/web/ui/lib/contracts/**'
@@ -61,6 +62,10 @@ jobs:
       - name: Install locked Python dependencies
         if: ${{ github.event_name == 'workflow_dispatch' || steps.filter.outputs.python == 'true' }}
         run: uv sync --frozen
+
+      - name: Run Python regression tests
+        if: ${{ github.event_name == 'workflow_dispatch' || steps.filter.outputs.python == 'true' }}
+        run: uv run --frozen python -m unittest discover -s tests -q
 
       - name: Check generated API contracts
         if: ${{ github.event_name == 'workflow_dispatch' || steps.filter.outputs.python == 'true' }}
@@ -94,6 +99,7 @@ jobs:
         run: |
           node --test apps/desktop/test/policy.test.cjs
           node scripts/check_conversation_selection.cjs
+          node --test apps/web/ui/tests/btw-history.cjs
 
       - name: Check TypeScript
         id: typecheck

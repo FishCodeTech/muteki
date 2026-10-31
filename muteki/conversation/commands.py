@@ -1475,7 +1475,7 @@ class ConversationCommandHandler:
                     threads=self._manager.list_threads(),
                     message_loader=self._manager.conv.list_current_messages,
                     message_lookup=self._manager.conv.get_message,
-                    src_object_resolver=_src_object_resolver(manager.store, thread.thread_id),
+                    src_object_resolver=_src_object_resolver(self._manager.store, thread.thread_id),
                 )
             except ComposerCapabilityError as exc:
                 raise _failed(

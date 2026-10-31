@@ -1750,6 +1750,12 @@ def _claude_credential_env(
         )
         _add_base_url(out, base=base, env_name="ANTHROPIC_BASE_URL")
     else:
+        # Sealed CLI launches do not inherit os.environ. Carry the supported
+        # Anthropic-compatible host credentials through the resolver explicitly.
+        # Explicit accounts have source={} and must never borrow these values.
+        for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"):
+            if source.get(name):
+                out[name] = str(source[name])
         _add_secret_file_or_env(
             out,
             base=base,

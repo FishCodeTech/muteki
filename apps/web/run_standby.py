@@ -694,6 +694,13 @@ async def shutdown(self) -> None:
     # shutdown, but no new main or standby generation can race into the gap.
     async with self._lifecycle_lock:
         self._shutting_down = True
+    btw_shutdown_failed = False
+    if getattr(self, "btw_jobs", None) is not None:
+        try:
+            await self.btw_jobs.shutdown()
+        except Exception:
+            # A side-worker cleanup failure must never skip main/standby cleanup.
+            btw_shutdown_failed = True
     pending: dict[asyncio.Task, str] = {}
     live_standbys = [
         run for run in list(self.runs.values())
@@ -783,7 +790,7 @@ async def shutdown(self) -> None:
                 run.control_journal.close()
             except Exception:
                 LOG.exception("failed to close control journal for %s", run.run_id)
-    if unsettled:
-        joined = ", ".join(sorted(unsettled))
+    if unsettled or btw_shutdown_failed:
+        joined = ", ".join(sorted(unsettled | ({"BTW"} if btw_shutdown_failed else set())))
         raise RuntimeError(
             f"runtime owner exit unconfirmed; shutdown incomplete for: {joined}")

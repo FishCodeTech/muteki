@@ -977,8 +977,8 @@ const STRINGS: Dict = {
   "settings.reviewToggle": { zh: "启用 review 审稿", en: "Enable review" },
   "settings.reviewRevealHint": { zh: "开启后展开子设置", en: "Sub-settings appear when on" },
   "settings.reviewBtwNote": {
-    zh: "右侧「顺嘴问 / BTW」默认使用这里选择的 Review worker；它会作为一次性只读旁路进程启动，不占 max worker 或 review 并发槽，不写入 graph，也不计入成本账。",
-    en: "The right-side \"BTW\" panel uses the Review worker selected here by default. It starts as a one-shot read-only side process, consumes no max-worker or review concurrency slot, writes no graph state, and is not counted in the cost ledger.",
+    zh: "右侧「顺嘴问 / BTW」优先使用出战配置中单独指定的 BTW Worker；自动模式可使用此 Review Worker。它作为一次性旁路进程启动，不占解题或 Review 并发槽，用量单独记录。",
+    en: "The right-side \"BTW\" panel prefers the dedicated BTW Worker in lineup settings; automatic mode may use this Review Worker. It runs as a one-shot side process, consumes no solve or review slot, and records usage separately.",
   },
   "settings.verifierEnabled": { zh: "Verifier worker", en: "Verifier worker" },
   "settings.verifierToggle": { zh: "启用 Verifier", en: "Enable verifier" },
