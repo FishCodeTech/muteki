@@ -332,7 +332,15 @@ def register(app: FastAPI) -> None:
     @app.get("/api/runs/{run_id}/btw/history")
     async def get_btw_history(run_id: str) -> Any:
         history = _btw_history(run_id)
-        return {"turns": await run_blocking(history.list), **app.state.manager.btw_jobs.status(run_id)}
+        jobs = app.state.manager.btw_jobs
+        was_active = jobs.status(run_id)["active"]
+        turns = await run_blocking(history.list)
+        status = jobs.status(run_id)
+        # A producer can commit its final answer after list() has read the DB,
+        # then disappear while we await the thread. Keep one more poll alive
+        # rather than declaring that stale partial transcript terminal.
+        status["active"] = was_active or status["active"]
+        return {"turns": turns, **status}
 
     @app.post("/api/runs/{run_id}/btw/cancel")
     async def cancel_btw(run_id: str) -> Any:
@@ -601,15 +609,17 @@ def register(app: FastAPI) -> None:
                             import logging
                             logging.getLogger(__name__).error(
                                 "BTW container teardown failed for %s", btw_container_id)
+                    scratch_removed = False
                     if runtime_exited and container_removed:
                         from muteki.solver.btw_resources import cleanup_turn
                         import anyio
                         with anyio.CancelScope(shield=True):
                             try:
                                 await run_blocking(cleanup_turn, root, workdir, f"btw-{transport}-{request_id}")
+                                scratch_removed = True
                             except Exception as exc:
                                 diagnose({"phase": "cleanup_failed", "error_type": type(exc).__name__})
-                    if not runtime_exited or not container_removed:
+                    if not scratch_removed:
                         async def retry_cleanup():
                             nonlocal container_removed
                             if container is not None and not container_removed:
