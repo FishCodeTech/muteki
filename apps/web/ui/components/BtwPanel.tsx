@@ -10,6 +10,7 @@ import { MessageMarkdown } from "@/components/ai-native/message-markdown";
 import { useT } from "@/lib/i18n";
 import { apiFetch } from "@/lib/useRun";
 import styles from "./BtwPanel.module.css";
+import { FollowupWorkerSelect } from "./FollowupWorkerSelect";
 
 /**
  * BTW side-query worker — a right-side drawer for read-only Q&A over a run.
@@ -48,6 +49,7 @@ export function BtwPanel({ open, onClose, runId }: BtwPanelProps) {
   const t = useT();
   const [turns, setTurns] = useState<Turn[]>([]);
   const [input, setInput] = useState("");
+  const [workerId, setWorkerId] = useState("");
   const [streaming, setStreaming] = useState(false);
   const [error, setError] = useState<string>("");
   const [progress, setProgress] = useState("正在启动旁路 Worker…");
@@ -124,7 +126,7 @@ export function BtwPanel({ open, onClose, runId }: BtwPanelProps) {
   // Auto-scroll the conversation to the bottom as deltas stream in.
   useEffect(() => {
     if (scrollRef.current) {
-      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+      scrollRef.current.scrollTop = turns.length || streaming ? scrollRef.current.scrollHeight : 0;
     }
   }, [turns, streaming]);
 
@@ -170,7 +172,7 @@ export function BtwPanel({ open, onClose, runId }: BtwPanelProps) {
   const send = useCallback(
     async (question: string) => {
       const q = question.trim();
-      if (!q || streaming || historyLoading || deleting || !runId) return;
+      if (!q || streaming || historyLoading || deleting || !runId || !workerId) return;
       setError("");
       // cancel any prior in-flight stream
       if (abortRef.current) abortRef.current.abort();
@@ -190,7 +192,7 @@ export function BtwPanel({ open, onClose, runId }: BtwPanelProps) {
         const resp = await apiFetch(`/api/runs/${runId}/btw`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ question: q }),
+          body: JSON.stringify({ question: q, worker_id: workerId }),
           signal: ctrl.signal,
         });
         if (abortRef.current !== ctrl || currentRunRef.current !== runId) return;
@@ -280,7 +282,7 @@ export function BtwPanel({ open, onClose, runId }: BtwPanelProps) {
         }
       }
     },
-    [runId, streaming, historyLoading, deleting, loadHistory],
+    [runId, workerId, streaming, historyLoading, deleting, loadHistory],
   );
 
   const userTurnCount = turns.filter((t) => t.role === "user").length;
@@ -314,6 +316,7 @@ export function BtwPanel({ open, onClose, runId }: BtwPanelProps) {
                 <span>只读旁路</span>
                 <span className={styles.turnCount}>{userTurnCount} 轮</span>
               </div>
+              {open && <FollowupWorkerSelect runId={runId} value={workerId} onChange={setWorkerId} disabled={streaming} />}
             </Drawer.Header>
 
             <Drawer.Body className={styles.body}>
@@ -363,7 +366,7 @@ export function BtwPanel({ open, onClose, runId }: BtwPanelProps) {
                 />
                 <div className={styles.composerBottom}>
                   <span>Enter 发送 <span aria-hidden="true">·</span> Shift+Enter 换行</span>
-                  {streaming ? <button type="button" className={styles.stopButton} onClick={handleStop}><Icon name="stop" size={14} />停止</button> : <button type="button" className={styles.sendButton} disabled={!input.trim() || historyLoading || deleting} onClick={() => void send(input)}><span>{t("btw.send") || "发送"}</span><Icon name="send" size={14} /></button>}
+                  {streaming ? <button type="button" className={styles.stopButton} onClick={handleStop}><Icon name="stop" size={14} />停止</button> : <button type="button" className={styles.sendButton} disabled={!input.trim() || !workerId || historyLoading || deleting} onClick={() => void send(input)}><span>{t("btw.send") || "发送"}</span><Icon name="send" size={14} /></button>}
                 </div>
               </div>
             </Drawer.Footer>

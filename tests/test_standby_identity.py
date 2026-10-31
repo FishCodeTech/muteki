@@ -61,30 +61,27 @@ class StandbyIdentityTest(unittest.TestCase):
                                   payload={'challenge': {'name': 'synthetic'}})
             for worker_id, fields in self.workers.items():
                 yield SimpleNamespace(event_type=EventType.WORKER_STATUS,
-                                      solver_id=worker_id, payload=fields)
+                                      solver_id=worker_id, payload={**fields, 'online': True})
         for action in ('ask', 'writeup'):
             with self.subTest(action=action):
                 manager = SimpleNamespace(
                     _ensure_control_async=AsyncMock(return_value=(None, None, None)),
                     storage=SimpleNamespace(workspace=lambda run_id: Path('/unused')),
                     load_winner_continuation=lambda run_id: {},
-                    worker_config=SimpleNamespace(resolve=lambda category: {}),
+                    worker_config=SimpleNamespace(resolve=lambda category: {'worker_profiles': [
+                        {'id': row['profile_id'], 'engine': row['engine']} for row in self.workers.values()]}),
                 )
                 run = SimpleNamespace(run_id='stopped-run', name='synthetic', category='web',
                                       store=SimpleNamespace(replay=replay))
-                recovered = []
-                def recover(*args):
-                    value = _standby_identity_from_workers(*args)
-                    recovered.append(value)
-                    return value
-                with patch('apps.web.drivers._standby_identity_from_workers', side_effect=recover), \
-                     patch('muteki.models.solve_graph.Challenge', side_effect=StopBeforeRuntime):
+                with patch('muteki.models.solve_graph.Challenge', side_effect=StopBeforeRuntime), \
+                     patch('muteki.solver.followup_profiles.configured_standby_identity', wraps=__import__(
+                         'muteki.solver.followup_profiles', fromlist=['configured_standby_identity']).configured_standby_identity) as select:
                     with self.assertRaises(StopBeforeRuntime):
-                        asyncio.run(build_standby_driver({'action': action}, mgr=manager)(run))
-                self.assertEqual(recovered[0]['profile_id'], 'codex-original')
-                self.assertEqual(recovered[0]['engine'], 'codex')
+                        asyncio.run(build_standby_driver({'action': action, 'worker_id': 'cli-codex-2'}, mgr=manager)(run))
+                self.assertEqual(select.call_args.kwargs['requested'], 'cli-codex-2')
+                self.assertEqual(len(select.call_args.kwargs['participants']), 2)
 
-    def test_driver_uses_configured_standby_without_original_identity(self):
+    def test_driver_rejects_global_profile_that_never_participated(self):
         class StopBeforeRuntime(Exception):
             pass
         async def replay(run_id):
@@ -103,7 +100,8 @@ class StandbyIdentityTest(unittest.TestCase):
             with self.subTest(action=action), \
                  patch('apps.web.drivers._standby_identity_from_workers') as recover, \
                  patch('muteki.models.solve_graph.Challenge', side_effect=StopBeforeRuntime):
-                with self.assertRaises(StopBeforeRuntime):
+                from muteki.solver.followup_profiles import FollowupSelectionError
+                with self.assertRaises(FollowupSelectionError):
                     asyncio.run(build_standby_driver({'action': action}, mgr=manager)(run))
                 recover.assert_not_called()
 

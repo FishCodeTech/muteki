@@ -3,7 +3,7 @@ import { priceKey, priceLabel, useModelPrices } from "@/lib/modelPricing";
 
 import { ConversationRouteLink } from "@/components/conversation/ConversationNavigation";
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { ComponentProps, ReactNode } from "react";
+import type { ComponentProps } from "react";
 import { Alert, Card, Chip, ComboBox, Input, Button, Dropdown, Label, ListBox, ListBoxItem, Radio, RadioGroup, Select, Skeleton, Switch } from "@heroui/react";
 import { Icon, type IconName } from "@/components/Icon";
 import { EngineLogo } from "@/components/EngineLogo";
@@ -69,8 +69,6 @@ type SaveState = "idle" | "saving" | "saved" | "error";
 type AccountConnection = "official" | "custom_endpoint";
 type LlmProfileName = "planner" | "titler";
 type WorkerDraftSnapshot = {
-  standbyProfile: string;
-  btwProfile: string;
   seats: Seat[];
   review: ReviewPolicy;
   verifier: VerifierPolicy;
@@ -573,7 +571,6 @@ function WorkerCard({
 }
 
 function RosterWorkspace({
-  followupSettings,
   seats,
   credentials,
   backend,
@@ -597,7 +594,6 @@ function RosterWorkspace({
   onTest,
   onDelete,
 }: {
-  followupSettings?: ReactNode;
   seats: Seat[];
   credentials: Credential[];
   backend: WorkerSettings["worker_backend"];
@@ -653,7 +649,6 @@ function RosterWorkspace({
 
   return (
     <section className="wroster-workspace">
-      {followupSettings}
       <header className="wroster-head">
         <div className="wsettings-section-head wroster-head-main">
           <div className="wsettings-section-copy"><h2>Worker <Chip size="sm" variant="soft">{ordinary.length}</Chip></h2><p>{enabledOrdinary.length} 个启用 · 并发合计 {maxWorkers}</p></div>
@@ -1677,8 +1672,6 @@ export function WorkerOrchestration({ defaultReturnTo = "/", navigation }: { def
   const [mobileInspectorOpen, setMobileInspectorOpen] = useState(false);
   const [inspector, setInspector] = useState<"seat" | "review" | "verifier">("seat");
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [standbyProfile, setStandbyProfile] = useState("");
-  const [btwProfile, setBtwProfile] = useState("");
   const [review, setReview] = useState<ReviewPolicy>(DEFAULT_REVIEW);
   const [verifier, setVerifier] = useState<VerifierPolicy>(DEFAULT_VERIFIER);
   const [backend, setBackend] = useState<WorkerSettings["worker_backend"]>("local");
@@ -1712,7 +1705,6 @@ export function WorkerOrchestration({ defaultReturnTo = "/", navigation }: { def
   const baselineDraftRef = useRef("");
 
   const currentDraftSignature = useMemo(() => workerDraftSignature({
-    standbyProfile, btwProfile,
     seats,
     review,
     verifier,
@@ -1728,7 +1720,7 @@ export function WorkerOrchestration({ defaultReturnTo = "/", navigation }: { def
     wallClock,
     costBudget,
     llmProfiles,
-  }), [standbyProfile, btwProfile, backend, containerScope, costBudget, dispatchMode, llmProfiles, maxTotal, network,
+  }), [backend, containerScope, costBudget, dispatchMode, llmProfiles, maxTotal, network,
     raceTimeout, review, seats, startWorkers, verifier, vpnEnabled, wallClock, workerPrivilege]);
   const currentDraftSignatureRef = useRef(currentDraftSignature);
   currentDraftSignatureRef.current = currentDraftSignature;
@@ -1820,8 +1812,6 @@ export function WorkerOrchestration({ defaultReturnTo = "/", navigation }: { def
       const loadedVerifier = { ...DEFAULT_VERIFIER, ...(cfg.stage_policy.coordinator.verifier || {}) };
       const loadedDispatchMode = cfg.stage_policy.coordinator.dispatch_mode === "auto" ? "auto" : "fixed";
       baselineDraftRef.current = workerDraftSignature({
-        standbyProfile: cfg.stage_policy.coordinator.standby_profile || "",
-        btwProfile: cfg.stage_policy.coordinator.btw_profile || "",
         seats: identity.seats,
         review: loadedReview,
         verifier: loadedVerifier,
@@ -1847,8 +1837,6 @@ export function WorkerOrchestration({ defaultReturnTo = "/", navigation }: { def
       setHealth(Object.fromEntries(healthRows.map((item) => [item.profile_id, item])));
       setTestResults(modelTestRows);
       setSelectedId(ordinary[0]?.id || identity.seats[0]?.id || null);
-      setStandbyProfile(cfg.stage_policy.coordinator.standby_profile || "");
-      setBtwProfile(cfg.stage_policy.coordinator.btw_profile || "");
       setReview(loadedReview);
       setVerifier(loadedVerifier);
       setBackend(cfg.worker_backend || "local");
@@ -2245,11 +2233,6 @@ export function WorkerOrchestration({ defaultReturnTo = "/", navigation }: { def
 
   const save = async () => {
     if (!config) return;
-    for (const [label, ref] of [["Standby", standbyProfile], ["BTW", btwProfile]]) {
-      if (ref && !seats.some((seat) => seat.id === ref && seat.enabled)) {
-        setSaveState("error"); showFeedback(`${label} Worker 已停用或删除，请重新选择`); return;
-      }
-    }
     const enabledOrdinary = seats.filter((seat) => isOrdinarySeat(seat) && seat.enabled);
     if (review.enabled && !seats.some((seat) => seat.id === review.engine && seat.enabled && canServeChannel(seat, "review"))) { setSaveState("error"); showFeedback("Review 已启用，但没有指定可用 Worker"); return; }
     if (verifier.enabled && !seats.some((seat) => seat.id === verifier.engine && seat.enabled && canServeChannel(seat, "verifier"))) { setSaveState("error"); showFeedback("Verifier 已启用，但没有指定可用 Worker"); return; }
@@ -2295,8 +2278,8 @@ export function WorkerOrchestration({ defaultReturnTo = "/", navigation }: { def
         race: { ...config.stage_policy.race, enabled: raceScout, timeout: raceTimeout, engines: raceRefs },
         coordinator: {
           ...config.stage_policy.coordinator,
-          standby_profile: standbyProfile,
-          btw_profile: btwProfile,
+          standby_profile: "",
+          btw_profile: "",
           dispatch_mode: dispatchMode,
           wall_clock_budget: wallClock,
           review: { ...review, max_concurrent: 1 },
@@ -2316,8 +2299,6 @@ export function WorkerOrchestration({ defaultReturnTo = "/", navigation }: { def
     if (!saved) { setSaveState("error"); showFeedback("保存失败：服务未返回生效配置"); return; }
     const savedIdentity = legacyIdentity(saved, descriptors);
     const savedDraft: WorkerDraftSnapshot = {
-      standbyProfile: saved.stage_policy.coordinator.standby_profile || "",
-      btwProfile: saved.stage_policy.coordinator.btw_profile || "",
       seats: savedIdentity.seats,
       review: { ...DEFAULT_REVIEW, ...(saved.stage_policy.coordinator.review || {}) },
       verifier: { ...DEFAULT_VERIFIER, ...(saved.stage_policy.coordinator.verifier || {}) },
@@ -2340,8 +2321,6 @@ export function WorkerOrchestration({ defaultReturnTo = "/", navigation }: { def
     if (!editedWhileSaving) {
       setSeats(savedDraft.seats);
       setCredentials(syncCredentialsFromGlobal(savedIdentity.credentials, availableCredentials, descriptors));
-      setStandbyProfile(savedDraft.standbyProfile);
-      setBtwProfile(savedDraft.btwProfile);
       setReview(savedDraft.review);
       setVerifier(savedDraft.verifier);
       setBackend(savedDraft.backend);
@@ -2442,36 +2421,7 @@ export function WorkerOrchestration({ defaultReturnTo = "/", navigation }: { def
 
         <div className="wsettings-content">
           {section === "roster" ? <div className="wsettings-orchestration" data-inspector-open={mobileInspectorOpen}>
-            <RosterWorkspace followupSettings={<section className="wsettings-followup-workers" aria-label="后续与旁路 Worker">
-                <div className="wfollowup-heading"><div><h2>后续与旁路 Worker</h2><p>各自选择配置，与主任务分工独立。</p></div><Chip size="sm" variant="soft">独立计费</Chip></div>
-                <div className="wfollowup-grid">
-                {([
-                  { label: "Standby Worker", icon: "messages" as const, value: standbyProfile, update: setStandbyProfile, automatic: "沿用任务原 Worker", description: "询问任务细节，生成 Writeup", tag: "后续问答" },
-                  { label: "BTW Worker", icon: "sparkles" as const, value: btwProfile, update: setBtwProfile, automatic: "自动选择可用配置", description: "随时查看进度，不打断主任务", tag: "旁路助手" },
-                ] as const).map(({ label, icon, value, update, automatic, description, tag }) => {
-                  const selected = seats.find((seat) => seat.id === value);
-                  const invalid = Boolean(value && (!selected || !selected.enabled));
-                  return <Card key={label} className="wfollowup-card">
-                    <div className="wfollowup-card-head"><span className="wfollowup-icon"><Icon name={icon} size={19} /></span><div><h3>{label}</h3><span>{tag}</span></div><Chip size="sm" variant="soft" color={invalid ? "warning" : "default"}>{invalid ? "需要配置" : value ? "已指定" : "自动"}</Chip></div>
-                    <p className="wfollowup-description">{description}</p>
-                    <Select aria-label={label} selectedKey={value || "__automatic__"} onSelectionChange={(key) => { if (key == null) return; update(key === "__automatic__" ? "" : String(key)); markDirty(); }}>
-                      <Label>运行配置</Label>
-                      <Select.Trigger><Select.Value /></Select.Trigger>
-                      <Select.Popover><ListBox>
-                        <ListBoxItem id="__automatic__" textValue={automatic}>{automatic}</ListBoxItem>
-                        {value && !selected ? <ListBoxItem id={value} isDisabled textValue="原 Worker 已删除">原 Worker 已删除，请重新选择</ListBoxItem> : null}
-                        {seats.map((seat) => <ListBoxItem key={seat.id} id={seat.id} textValue={`${seat.label} · ${seat.model || seat.engine}`} isDisabled={!seat.enabled}>{seat.label} · {seat.model || seat.engine}{seat.enabled ? "" : " · 已停用"}</ListBoxItem>)}
-                      </ListBox></Select.Popover>
-                    </Select>
-                    <div className={`wfollowup-binding${invalid ? " invalid" : ""}`}>
-                      {selected ? <EngineLogo engine={engineOf(selected.engine)} size={18} /> : <Icon name={invalid ? "clock" : icon} size={17} />}
-                      <div><strong>{invalid ? "请重新选择有效配置" : selected?.label || automatic}</strong><span title={selected?.model || undefined}>{selected?.model || (value ? "配置不可用" : label === "Standby Worker" ? "跟随任务的原始配置" : "按 Review 与已有 Worker 配置选择")}</span></div>
-                    </div>
-                  </Card>;
-                })}
-                </div>
-                <div className="wfollowup-foot"><Icon name="check" size={14} /><span>保存后对下一次请求生效，不修改主力 Worker。费用单独记录，不占主任务预算。</span></div>
-              </section>} seats={seats} credentials={credentials} backend={backend} testingIds={testingIds} testResults={testResults} batchCheck={batchCheck} selectedId={inspector === "seat" ? selectedId : null} selectedInspector={inspector} review={review} verifier={verifier} onSelect={(id) => { setSelectedId(id); setInspector("seat"); setMobileInspectorOpen(true); }} onSelectReview={() => { setInspector("review"); setMobileInspectorOpen(true); }} onSelectVerifier={() => { setInspector("verifier"); setMobileInspectorOpen(true); }} onAdd={addSeat} onReorder={reorderSeats} onDuplicate={duplicateSeat} onToggleEnabled={toggleSeatEnabled} onSetReview={setReviewSeat} onSetVerifier={setVerifierSeat} onTestAll={() => void testAllSeats()} onTest={(seat) => void testSeat(seat)} onDelete={deleteSeat} />
+            <RosterWorkspace seats={seats} credentials={credentials} backend={backend} testingIds={testingIds} testResults={testResults} batchCheck={batchCheck} selectedId={inspector === "seat" ? selectedId : null} selectedInspector={inspector} review={review} verifier={verifier} onSelect={(id) => { setSelectedId(id); setInspector("seat"); setMobileInspectorOpen(true); }} onSelectReview={() => { setInspector("review"); setMobileInspectorOpen(true); }} onSelectVerifier={() => { setInspector("verifier"); setMobileInspectorOpen(true); }} onAdd={addSeat} onReorder={reorderSeats} onDuplicate={duplicateSeat} onToggleEnabled={toggleSeatEnabled} onSetReview={setReviewSeat} onSetVerifier={setVerifierSeat} onTestAll={() => void testAllSeats()} onTest={(seat) => void testSeat(seat)} onDelete={deleteSeat} />
             <div className="wsettings-detail">
               <Button type="button" variant="ghost" className="wsettings-detail-back" onPress={() => setMobileInspectorOpen(false)}><Icon name="chevronLeft" size={15} />Worker 列表</Button>
             {inspector === "review" ? <ReviewInspector seats={seats} credentials={credentials} availableCredentials={availableCredentials} models={models} backend={backend} review={review} onReview={updateReview} onCreateDedicated={createDedicatedReview} onSeatUpdate={updateSeat} onSeatEngine={changeEngine} onSeatAccount={bindAccount} onDiscoverModels={refreshWorkerModels} discoveringModels={discoveringModels} onEditOrdinary={(id) => { setSelectedId(id); setInspector("seat"); }} onTest={() => { const seat = seats.find((item) => item.id === review.engine); if (seat) void testSeat({ ...seat, reasoning_effort: review.reasoning_effort && review.reasoning_effort !== "inherit" ? review.reasoning_effort : seat.reasoning_effort || "default" }); }} testing={testingIds.has(review.engine || "")} testResult={review.engine ? testResults[review.engine] || null : null} />

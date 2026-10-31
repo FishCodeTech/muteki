@@ -33,6 +33,14 @@ class ZCodeDriver(CliDriver):
     name = "zcode"
     offline_web_isolation = True
 
+    def build_observer_input(self, prompt: str) -> tuple[list[str], str]:
+        from muteki.solver.cli_engines.types import LaunchPurpose
+        argv, body = self.build_execute_input(prompt, None, web_access=False, kb_access=False,
+            stream=True, launch=LaunchContext(purpose=LaunchPurpose.CONVERSATION, permission_mode="plan"))
+        for tool in ("Bash", "Write", "Edit", "ExitPlanMode"):
+            argv += ["--deny-tool", tool]
+        return argv, body
+
     def native_permission_modes(self) -> tuple[str, ...]:
         return ("build", "edit", "plan", "yolo", "guarded")
 

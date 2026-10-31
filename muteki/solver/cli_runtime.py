@@ -462,8 +462,6 @@ def _execute_invocation(
     self._finalize_control_context_prompt_manifest(prompt)
     if self.mode == "respond" and str(self.hitl_cmd.get("action") or "ask").lower() in {"ask", "writeup"}:
         from muteki.solver.followup_report import build_observer_input
-        if self.driver.name not in {"codex", "claude"}:
-            raise RuntimeError(f"{self.driver.name} does not support restricted Writeup/Ask generation")
         if self._control_secret_values:
             supported, detail = self.driver.secure_prompt_preflight()
             if not supported:

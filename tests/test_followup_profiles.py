@@ -22,74 +22,73 @@ class FollowupProfilesTest(unittest.TestCase):
                         stage_policy={'coordinator': {'review': {'engine': 'claude-a'}}})
         self.policy = self.cfg['stage_policy']['coordinator']
 
-    def test_explicit_request_wins_and_preserves_account_model(self):
-        self.policy['btw_profile'] = 'claude-a'
-        self.assertEqual(select_btw_profile(self.cfg, {}, 'codex-b'), self.other)
+    def participants(self):
+        return [dict(worker_id=f"worker-{index}", profile_id=p['id'], engine=p['engine'],
+                     model=p.get('model', ''), account_id=p.get('credential_account', ''))
+                for index, p in enumerate(self.cfg['worker_profiles'])]
 
-    def test_dedicated_btw_overrides_review(self):
-        self.policy['btw_profile'] = 'codex-a'
-        self.assertEqual(select_btw_profile(self.cfg, {}), self.codex)
+    def select(self, requested='', winner=None):
+        return select_btw_profile(self.cfg, winner or {}, requested, participants=self.participants())
 
-    def test_missing_explicit_profile_never_falls_back(self):
-        with self.assertRaises(ValueError):
-            select_btw_profile(self.cfg, {}, 'missing')
+    def test_three_participants_are_selectable_including_same_engine(self):
+        for index, profile in enumerate(self.cfg['worker_profiles']):
+            self.assertEqual(self.select(f'worker-{index}'), profile)
 
-    def test_disabled_explicit_profile_never_falls_back(self):
+    def test_unlaunched_profile_and_bare_engine_are_rejected(self):
+        participants = self.participants()[:1]
+        for ref in ('codex-b', 'codex', 'missing'):
+            with self.assertRaises(ValueError):
+                select_btw_profile(self.cfg, {}, ref, participants=participants)
+
+    def test_missing_or_disabled_profile_does_not_change_identity(self):
         self.codex['enabled'] = False
         with self.assertRaises(ValueError):
-            select_btw_profile(self.cfg, {}, 'codex-a')
-
-    def test_ambiguous_engine_requires_profile(self):
+            self.select('worker-0')
+        self.cfg['worker_profiles'].pop(0)
         with self.assertRaises(ValueError):
-            select_btw_profile(self.cfg, {}, 'codex')
+            select_btw_profile(self.cfg, {}, 'worker-0', participants=[dict(
+                worker_id='worker-0', profile_id='codex-a', engine='codex')])
 
-    def test_legacy_unique_engine_resolves_a_profile(self):
-        self.assertEqual(select_btw_profile(self.cfg, {}, 'claude'), self.claude)
-
-    def test_missing_configured_btw_fails_closed(self):
-        self.policy['btw_profile'] = 'deleted'
+    def test_empty_roster_fails_without_fallback(self):
         with self.assertRaises(ValueError):
-            select_btw_profile(self.cfg, {})
+            select_btw_profile(self.cfg, {}, participants=[])
 
-    def test_enabled_review_with_deleted_profile_fails_closed(self):
-        self.policy['review'] = {'enabled': True, 'engine': 'deleted'}
+    def test_default_prefers_participating_winner_and_ignores_global_overrides(self):
+        self.policy.update(btw_profile='deleted', standby_profile='deleted')
+        self.assertEqual(self.select(winner={'worker_id': 'worker-1'}), self.other)
+
+    def test_recorded_model_is_preserved_and_changed_account_rejected(self):
+        participants = self.participants()
+        self.codex['model'] = 'new-model'
+        self.assertEqual(select_btw_profile(self.cfg, {}, 'worker-0', participants=participants)['model'], 'model-a')
+        self.codex['credential_account'] = 'new-account'
         with self.assertRaises(ValueError):
-            select_btw_profile(self.cfg, {})
+            select_btw_profile(self.cfg, {}, 'worker-0', participants=participants)
 
-    def test_empty_roster_never_returns_claude(self):
-        with self.assertRaises(ValueError):
-            select_btw_profile({}, {})
-
-    def test_winner_uses_exact_profile_not_first_matching_engine(self):
-        self.policy['review'] = {}
-        self.assertEqual(select_btw_profile(self.cfg, {'engine': 'codex', 'profile_id': 'codex-b'}), self.other)
-
-    def test_unbound_legacy_default_does_not_launch_claude(self):
-        self.cfg['worker_profiles'] = [self.codex]
-        self.policy['review'] = {'engine': 'claude'}
-        self.assertEqual(select_btw_profile(self.cfg, {}), self.codex)
-
-    def test_standby_override_does_not_reuse_other_worker_state(self):
-        winner = dict(engine='claude', profile_id='claude-a', session='old',
-                      worker_id='old-worker', workdir_rel='old-dir', agent_state_rel='old-state')
-        before = copy.deepcopy(winner)
-        self.policy['standby_profile'] = 'codex-b'
+    def test_standby_uses_selected_identity_without_resuming_solve_session(self):
+        winner = dict(worker_id='worker-0', session='old', workdir_rel='old-dir', agent_state_rel='old-state')
+        original = copy.deepcopy(winner)
         for action in ('ask', 'writeup'):
-            result = configured_standby_identity(winner, self.cfg, action)
-            self.assertEqual(result['engine'], 'codex')
+            result = configured_standby_identity(winner, self.cfg, action,
+                participants=self.participants(), requested='worker-1')
             self.assertEqual(result['profile_id'], 'codex-b')
-            for key in ('session', 'worker_id', 'workdir_rel', 'agent_state_rel'):
+            self.assertEqual(result['worker_id'], 'worker-1')
+            for key in ('session', 'workdir_rel', 'agent_state_rel'):
                 self.assertEqual(result[key], '')
-        self.assertEqual(winner, before)
-        self.assertIsNone(configured_standby_identity(winner, self.cfg, 'mark_false'))
+        self.assertEqual(winner, original)
+        self.assertIsNone(configured_standby_identity(winner, self.cfg, 'mark_false', participants=[]))
 
-    def test_automatic_standby_keeps_existing_recovery(self):
-        self.assertIsNone(configured_standby_identity({}, self.cfg, 'ask'))
-
-    def test_missing_standby_override_fails_closed(self):
-        self.policy['standby_profile'] = 'missing'
-        with self.assertRaises(ValueError):
-            configured_standby_identity({}, self.cfg, 'ask')
+    def test_only_actual_launch_events_establish_participation(self):
+        from types import SimpleNamespace
+        from muteki.core.events import EventType
+        from muteki.solver.followup_profiles import participant_rows
+        def event(worker, **payload):
+            return SimpleNamespace(event_type=EventType.WORKER_STATUS, solver_id=worker,
+                payload=dict(engine='codex', profile_id='codex-a', **payload))
+        rows = participant_rows([event('configured-only', online=False),
+            event('real-worker', online=True), event('real-worker', online=False),
+            event('cli-codex-standby', online=True), event('respond', online=True, worker_role='respond')])
+        self.assertEqual([row['worker_id'] for row in rows], ['real-worker'])
 
     def test_settings_preserve_new_fields_on_disk_and_resolve(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -126,14 +125,9 @@ class FollowupProfilesTest(unittest.TestCase):
         self.policy.update(standby_profile='codex-a', btw_profile='codex-b')
         WorkerConfigStore._validate_active_stage_channels(self.cfg)
 
-    def test_btw_and_standby_selection_do_not_mutate_main_profiles(self):
-        self.policy['standby_profile'] = 'codex-a'
-        self.policy['btw_profile'] = 'codex-b'
+    def test_selection_does_not_mutate_main_profiles(self):
         original = copy.deepcopy(self.cfg)
-        btw = select_btw_profile(self.cfg, {})
-        standby = configured_standby_identity({}, self.cfg, 'ask')
-        self.assertEqual(standby['profile_id'], 'codex-a')
-        self.assertEqual(btw['id'], 'codex-b')
-        btw['credential_account'] = 'changed-only-in-runtime'
-        btw['roles'].append('temporary')
+        profile = self.select('worker-1')
+        profile['roles'].append('temporary')
+        profile['credential_account'] = 'changed'
         self.assertEqual(self.cfg, original)

@@ -1629,7 +1629,7 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
                 for key in (
                     "action", "target", "command_id", "request_id",
                     "standing", "preempt_policy", "preemption", "flag",
-                    "followup_id",
+                    "followup_id", "worker_id",
                 )
                 if key in safe_cmd
             }
@@ -1698,8 +1698,10 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
             except Exception:
                 pass
         wc = mgr.worker_config.resolve(ch.get("category") or run.category or "web")
-        from muteki.solver.followup_profiles import configured_standby_identity
-        configured_identity = configured_standby_identity(winner, wc, action)
+        from muteki.solver.followup_profiles import configured_standby_identity, participating_workers
+        configured_identity = configured_standby_identity(winner, wc, action,
+            participants=await participating_workers(run) if action in {"ask", "writeup"} else [],
+            requested=str(runtime_cmd.get("worker_id") or ""))
         winner = configured_identity if configured_identity is not None else _standby_identity_from_workers(
             winner, legacy_workers, legacy_winner_actor)
         mode = ch.get("mode") or "ctf"
@@ -1785,6 +1787,9 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
             )
         if not profile and not winner_engine:
             raise RuntimeError("Original Worker engine is unavailable")
+        if configured_identity is not None:
+            from muteki.solver.followup_profiles import participant_profile
+            profile = participant_profile(winner, worker_profiles)
         transport = base_engine_for_profile(profile or winner_engine)
         worker_backend = resolve_worker_backend(
             request_backend=runtime_policy.get("worker_backend"),
@@ -1956,9 +1961,11 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
         acquired_graphs: list[Any] = []
 
         def open_shared_graph():
-            graph = SQLiteSharedGraph.open(
-                db_path=graph_dir / "shared_graph.db", challenge=challenge,
-                artifacts=arts)
+            if action in {"ask", "writeup"}:
+                graph = SQLiteSharedGraph.open_readonly(db_path=graph_dir / "shared_graph.db", challenge=challenge)
+            else:
+                graph = SQLiteSharedGraph.open(
+                    db_path=graph_dir / "shared_graph.db", challenge=challenge, artifacts=arts)
             acquired_graphs.append(graph)
             return graph
 
@@ -1967,6 +1974,9 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
                 graph_dir.mkdir(parents=True, exist_ok=True)
                 shared_graph = await run_blocking(open_shared_graph)
             except Exception:
+                if action in {"ask", "writeup"} and (graph_dir / "shared_graph.db").exists():
+                    from muteki.solver.followup_report import EvidenceReadError
+                    raise EvidenceReadError("无法读取任务证据，报告未启动") from None
                 shared_graph = None
 
             canonical_graph_flags: list[str] = []
@@ -2071,8 +2081,10 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
             if container is not None:
                 from muteki.solver.container_exec import _chown_tree_to_worker
                 await run_blocking(_chown_tree_to_worker, workdir)
+            import uuid
             solver_label = f"cli-{transport}-standby"
-            home_label = f"cli-{transport}-standby" if configured_identity is not None or action in {"ask", "writeup"} else ""
+            identity_tag = uuid.uuid5(uuid.NAMESPACE_URL, f"{winner.get('worker_id')}:{winner.get('account_id')}").hex[:16]
+            home_label = f"cli-{transport}-standby-{identity_tag}" if action in {"ask", "writeup"} else ""
             agent_state_rel = str(winner.get("agent_state_rel") or "").strip()
             if agent_state_rel and action not in {"ask", "writeup"}:
                 try:
@@ -2100,7 +2112,7 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
                 run_id=run.run_id,
                 execution_generation=max(
                     1, int(getattr(run, "execution_generation", 1) or 1)),
-                shared_graph=shared_graph,
+                shared_graph=None if action in {"ask", "writeup"} else shared_graph,
             )
             from muteki.solver.followup_budget import standby_cost_controller
             worker_cost = standby_cost_controller(run.cost, action)

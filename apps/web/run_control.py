@@ -415,6 +415,20 @@ async def _post_control_serialized(
             "detail": "runtime shutdown is incomplete",
             "code": "runtime_shutdown_incomplete",
         }
+    if str(body.get("action") or "").strip().lower() in {"ask", "writeup"}:
+        from muteki.solver.followup_profiles import participating_workers, select_btw_profile
+        from muteki.solver.followup_report import ObserverCapabilityError
+        from muteki.solver.cli_driver import driver_for
+        payload = body.get("payload") if isinstance(body.get("payload"), dict) else {}
+        try:
+            profile = select_btw_profile(self.worker_config.resolve(run.category or "web"),
+                self.load_winner_continuation(run_id),
+                str(payload.get("worker_id") or body.get("worker_id") or ""),
+                participants=await participating_workers(run))
+            driver_for(profile).build_observer_input("")
+        except (ValueError, ObserverCapabilityError) as exc:
+            return {"ok": False, "status": "rejected", "code": getattr(exc, "code", "followup.worker_unavailable"),
+                    "detail": str(exc)}
     actor, journal, secrets = await self._ensure_control_async(run)
     requested_id = str(body.get("command_id") or "").strip()
     existing = journal.get_command(requested_id) if requested_id else None

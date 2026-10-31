@@ -60,19 +60,10 @@ class BtwHistory:
             cursor = db.execute('DELETE FROM turns WHERE id=?', (turn_id,)) if turn_id is not None else db.execute('DELETE FROM turns')
             return cursor.rowcount
 
-    def transcript(self, max_chars: int = 200000) -> list[dict[str, str]]:
-        # Only retained, completed turns may enter the next model request.
-        selected = []
-        used = 0
-        for row in reversed(self.list()):
-            if row['status'] != 'completed':
-                continue
-            size = len(row['question']) + len(row['answer'])
-            if used + size > max_chars:
-                break
-            selected.append(row)
-            used += size
-        return [turn for row in reversed(selected) for turn in (
+    def transcript(self) -> list[dict[str, str]]:
+        # Preserve complete retained turns, including a single very long answer.
+        # Provider context limits must surface as failures, not silent data loss.
+        return [turn for row in self.list() if row['status'] == 'completed' for turn in (
             {'role': 'user', 'content': row['question']},
             {'role': 'assistant', 'content': row['answer']},
         )]

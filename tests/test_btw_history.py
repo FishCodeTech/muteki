@@ -56,13 +56,15 @@ class BtwHistoryTest(unittest.TestCase):
         self.assertEqual(self.history.transcript(), [])
         self.assertEqual(self.history.list()[0]['answer'], 'partial')
 
-    def test_context_is_bounded_without_deleting_history(self):
-        for i in range(3):
-            turn = self.history.begin(str(i), engine='codex', model='fake')
-            self.history.update(turn, 'abc', 'completed')
-        self.assertEqual(self.history.transcript(max_chars=4), [
-            {'role': 'user', 'content': '2'}, {'role': 'assistant', 'content': 'abc'}])
-        self.assertEqual(len(self.history.list()), 3)
+    def test_long_latest_answer_preserves_all_retained_history(self):
+        first = self.history.begin('first', engine='codex', model='fake')
+        self.history.update(first, 'older answer', 'completed')
+        latest = self.history.begin('latest', engine='codex', model='fake')
+        self.history.update(latest, 'x' * 24001, 'completed')
+        transcript = self.history.transcript()
+        self.assertEqual(len(transcript), 4)
+        self.assertEqual(transcript[0]['content'], 'first')
+        self.assertEqual(transcript[-1]['content'], 'x' * 24001)
 
     def test_cancelled_or_crashed_turn_is_not_shown_as_completed(self):
         turn = self.history.begin('first', engine='codex', model='fake')

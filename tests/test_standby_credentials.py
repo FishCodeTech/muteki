@@ -143,7 +143,7 @@ class StandbyCredentialsTest(unittest.TestCase):
             self.assertEqual(argv[argv.index('--model') + 1], profile['model'])
             if action in {'ask', 'writeup'}:
                 self.assertNotIn('fake-session', argv)
-                self.assertEqual(argv[argv.index('--tools') + 1], '')
+                self.assertEqual(argv[argv.index('--tools') + 1], 'Read,Grep,Glob')
             else:
                 self.assertIn('fake-session', argv)
             self.assertEqual(env['CLAUDE_CONFIG_DIR'], str(Path(cwd).resolve() / '.muteki-claude-config'))

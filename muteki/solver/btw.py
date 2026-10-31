@@ -1,8 +1,8 @@
 """BTW snapshot-only Q&A, independent from the solve scheduler and budget.
 
 The host reads existing JSONL/SQLite records without modifying them. Each turn
-receives a bounded snapshot and retained conversation history over stdin, using
-restricted Codex/Claude permissions. No solve session or task-writing tools are
+receives complete evidence references and retained conversation history over stdin,
+using the selected adapter's read-only permissions. No solve session or task-writing tools are
 restored. Legacy message builders below remain for compatibility.
 """
 
@@ -507,143 +507,29 @@ def build_btw_context_sync(
     context_hint: Optional[str] = "",
     jsonl_path: str = "",
 ) -> str:
-    """Synchronous, read-only graph snapshot for the btw system prompt.
-
-    Runs inside `asyncio.to_thread` from the route so it never blocks the
-    uvicorn event loop. Opens the graph TRUE read-only; on ANY SQLite
-    operational error (missing file, stale schema, WAL sidecar absent on a
-    live run) it degrades to a minimal context — never attempts migration and
-    never opens read-write.
-
-    `run_meta` carries the live run's worker/status fields (from the Run
-    object) so we can describe worker state without reading worker stdout.
-    """
+    """Read complete records without opening the graph for writes or migrations."""
+    from pathlib import Path
     from muteki.models.solve_graph import Challenge
     from muteki.swarm.shared_graph import SQLiteSharedGraph
+    from muteki.solver.followup_report import EvidenceReadError
 
-    parts: list[str] = []
-    parts.append(f"Challenge: {challenge_name or challenge_id}")
-    parts.append(f"类别: {challenge_category or '未知'}")
-    parts.append(f"Run状态: {run_meta.get('state', '未知')}")
-    if run_meta.get("solved"):
-        parts.append("已解出 flag")
-    if run_meta.get("flags"):
-        parts.append(f"已收集 flags 数: {len(run_meta['flags'])}")
-    if run_meta.get("awaiting_help"):
-        parts.append(f"有 worker 举手求助: {run_meta.get('help_text', '')}")
-    workers = run_meta.get("workers") or []
-    if workers:
-        parts.append("Workers:")
-        for w in workers:
-            parts.append(
-                f"  - {w.get('id','?')} [{w.get('engine','?')}] "
-                f"状态={w.get('state','?')}"
-            )
-
-    # Run-level statistics from the JSONL event log (timing / cost / worker
-    # roster / activity). This is the ONLY reliable source for cost+timing on
-    # a historical run — the in-memory CostController is empty after a server
-    # restart, but the JSONL is persistent. Read-only single pass.
-    if jsonl_path:
-        try:
-            stats = build_btw_run_stats_sync(jsonl_path)
-            if stats:
-                parts.append("=== Run 维度统计 (时长/花费/worker/活动) ===")
-                parts.append(stats)
-        except Exception:
-            pass
-
-    import os
-    if not os.path.exists(graph_db_path):
-        parts.append("Blackboard: 尚未建立 (run 刚启动或未进入协调阶段)")
-        return "\n".join(parts)
-
-    challenge = Challenge(
-        id=challenge_id,
-        name=challenge_name,
-        category=challenge_category or "web",
-    )
+    data = {"challenge": {"id": challenge_id, "name": challenge_name, "category": challenge_category},
+            "run": run_meta, "focus": context_hint, "evidence": None}
     graph = None
     try:
-        graph = SQLiteSharedGraph.open_readonly(
-            db_path=graph_db_path, challenge=challenge,
-        )
-        try:
-            summary = graph.to_summary(
-                max_evidence=80,
-                max_dead_ends=40,
-            )
-            if summary and summary.strip():
-                parts.append("=== Facts / Dead-ends 摘要 ===")
-                parts.append(summary)
-        except Exception:
-            parts.append("(facts 摘要读取失败 — 可能 schema 过旧)")
-        try:
-            opens = graph.open_goal_texts()
-            if opens:
-                parts.append("=== Open Intents ===")
-                for g in opens[:80]:
-                    parts.append(f"  - {g}")
-        except Exception:
-            pass
-        try:
-            barren = graph.barren_concluded_goal_texts()
-            if barren:
-                parts.append("=== 已尝试但无产出的方向 (dead-ends) ===")
-                for g in barren[-40:]:
-                    parts.append(f"  - {g}")
-        except Exception:
-            pass
-        try:
-            cands = graph.active_candidates()
-            if cands:
-                parts.append(f"=== 候选证据 (未验证) : {len(cands)} 条 ===")
-                for c in cands[-80:]:
-                    f = c.get("fact") or ""
-                    parts.append(f"  - {f}")
-        except Exception:
-            pass
-        try:
-            verified = graph.verified_evidence()
-            if verified:
-                parts.append(f"=== 已验证证据 : {len(verified)} 条 ===")
-                for v in verified[-80:]:
-                    f = v.get("fact") or ""
-                    parts.append(f"  - {f}")
-        except Exception:
-            pass
-        try:
-            invalid = graph.invalidated_flags()
-            if invalid:
-                parts.append(f"=== 被标误报的 flags : {len(invalid)} ===")
-        except Exception:
-            pass
-        try:
-            recent = graph.recent_events(limit=40)
-            if recent:
-                parts.append("=== 最近事件时间线 (最近 40 条,精简) ===")
-                for e in recent:
-                    kind = e.get("kind", "?")
-                    actor = e.get("actor", "?")
-                    p = e.get("payload") or {}
-                    tag = ""
-                    if isinstance(p, dict):
-                        tag = str(p.get("fact") or p.get("goal") or
-                                  p.get("text") or p.get("summary") or "")
-                    parts.append(f"  [{e.get('seq','?')}] {kind} by {actor}: {tag}")
-        except Exception:
-            pass
-    except Exception:
-        # open_readonly failed (missing WAL sidecar on a live run, stale schema,
-        # etc.) — degrade, do NOT fall back to read-write.
-        parts.append("Blackboard: 暂时不可读 (graph 正在被写入或 schema 不兼容)")
+        if jsonl_path and Path(jsonl_path).exists():
+            data["run_statistics"] = build_btw_run_stats_sync(jsonl_path)
+            data["run_events_jsonl"] = Path(jsonl_path).read_text(encoding="utf-8")
+        if Path(graph_db_path).exists():
+            graph = SQLiteSharedGraph.open_readonly(db_path=graph_db_path,
+                challenge=Challenge(id=challenge_id, name=challenge_name, category=challenge_category or "web"))
+            data["evidence"] = {"current": graph.snapshot().model_dump(mode="json"), "events": graph.events()}
+        return json.dumps(data, ensure_ascii=False)
+    except Exception as exc:
+        raise EvidenceReadError("无法读取任务证据，问答未启动；请检查任务存储后重试") from exc
     finally:
         if graph is not None:
-            try:
-                graph.close()
-            except Exception:
-                pass
-    return "\n".join(parts)
+            graph.close()
 
 
 def run_meta_dict(run: Any) -> dict[str, Any]:

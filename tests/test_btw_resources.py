@@ -83,3 +83,16 @@ class BtwResourcesTest(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(ValueError):
                 cleanup_turn(root, work, label)
             self.assertEqual((main / 'keep').read_text(), 'main credentials')
+
+
+class EvidencePartsTest(unittest.TestCase):
+    def test_long_record_remains_accessible_in_full_and_numbered_parts(self):
+        from muteki.solver.followup_report import evidence_reference
+        import json
+        with tempfile.TemporaryDirectory() as root:
+            directory = Path(root)
+            original = 'first' + 'x' * 100000 + 'last'
+            ref = json.loads(evidence_reference(original, directory))
+            self.assertEqual(Path(ref['complete_records_file']).read_text(), original)
+            restored = ''.join(path.read_text() for path in sorted(Path(ref['lossless_parts_directory']).glob('*.txt')))
+            self.assertEqual(restored, original)

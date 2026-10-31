@@ -28,6 +28,13 @@ class OhMyPiDriver(PiLikeDriver):
     _ENV_EXTRA = {"OMP_SKIP_SETUP": "1"}
     _OFFLINE_CONFIG = _SOLVER_DIR / "omp_offline_config.yml"
 
+    def build_observer_input(self, prompt: str) -> tuple[list[str], str]:
+        from muteki.solver.cli_engines.types import LaunchPurpose
+        argv = self.build_execute_stdin(prompt, None, web_access=False, kb_access=False,
+            stream=True, launch=LaunchContext(purpose=LaunchPurpose.CONVERSATION))
+        argv += ["--tools", "read,grep,find,ls", "--no-extensions", "--no-lsp"]
+        return argv, prompt
+
     def native_permission_modes(self) -> tuple[str, ...]:
         return ("always-ask", "write", "yolo")
 
