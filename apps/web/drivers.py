@@ -2294,6 +2294,7 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
                     payload={
                         "followup_id": runtime_cmd.get("followup_id") or "",
                         "kind": action,
+                        "source_worker_id": str(winner.get("worker_id") or ""),
                         "text": getattr(out, "reply", "") or "",
                         "artifact_path": artifact_path,
                     },

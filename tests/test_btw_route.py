@@ -406,3 +406,20 @@ class BtwRouteTest(unittest.TestCase):
             response = TestClient(self.app).post('/api/runs/run-test/btw', json={'question': 'hello'})
         self.assertIn('followup.evidence_unreadable', response.text)
         runner.assert_not_called()
+
+    def test_long_history_is_an_explicit_readable_reference_in_the_prompt(self):
+        from muteki.solver.btw_history import BtwHistory
+        history = BtwHistory(self.root / 'control' / 'run-test')
+        turn = history.begin('retained question', engine='pi', model='fake')
+        history.update(turn, 'x' * 24001 + 'history-tail', 'completed')
+        def runner(driver, argv, *, stdin_text, **kwargs):
+            context = json.loads(stdin_text[stdin_text.index('{'):].split('\n当前问题')[0])
+            self.assertEqual(context['history']['completed_turns'], 1)
+            transcript = json.loads(Path(context['history']['complete_records_file']).read_text())
+            self.assertTrue(transcript[-1]['content'].endswith('history-tail'))
+            self.assertNotEqual(context['history'], [])
+            return CliResult(text='history read', returncode=0)
+        with patch('muteki.solver.cli_driver.run_cli_streaming', runner), \
+             patch('apps.web.drivers._standby_worker_env', return_value={}):
+            response = TestClient(self.app).post('/api/runs/run-test/btw', json={'question': 'previous answer?'})
+        self.assertIn('history read', response.text)

@@ -116,6 +116,23 @@ class ObserverPermissionsTest(unittest.IsolatedAsyncioTestCase):
                                '--dangerously-bypass-approvals-and-sandbox', '--skip-permissions-unsafe', '--auto'):
                     self.assertNotIn(bypass, argv)
 
+    async def test_standby_receipt_reports_selected_participant(self):
+        from apps.web.run_standby_control import apply_standby_control
+        async def start(run_id, wire):
+            wire['_standby_delivery_ack'].set_result(True)
+            return True
+        manager = SimpleNamespace(_standby_busy=lambda run: False,
+            _standby_scope_matches_winner=lambda run, target: True,
+            _STANDBY_ACTIONS={'writeup'}, _OFFLINE_CONTROL_ACTIONS=set(),
+            _ensure_standby=start)
+        journal = Mock()
+        journal.context_delivery_status.return_value = 'missing'
+        result = await apply_standby_control(manager,
+            run=SimpleNamespace(run_id='existing-run'), journal=journal, claim_timeout=1,
+            wire={'action':'writeup', 'target':'global', 'command_id':'test', 'worker_id':'third-worker'})
+        self.assertEqual(result['state'], 'effect_observed')
+        self.assertEqual(result['target_ids'], ['third-worker'])
+
     def test_question_exact_bytes_survive_delivery_manifest(self):
         question = '解释 "flag"\n不要执行任何动作'
         self.assertIn(question, question_prompt(question, 'record'))
