@@ -362,10 +362,25 @@ class SrcEgressManager:
 
     def stop_all(self) -> None:
         self.stop_inspection_bridge()
-        result = self._docker("ps", "-aq", "--filter", "name=^/muteki-src-egress-")
-        if result.returncode:
-            return
-        names = result.stdout.split()
+        # A temporary/schema-only instance must not stop another installation's
+        # gateways. Discover only persisted task roots, then prove mount ownership.
+        names = []
+        for task_root in self.root.iterdir():
+            if (not re.fullmatch(r"[a-f0-9]{24}", task_root.name)
+                    or task_root.is_symlink() or not task_root.is_dir()):
+                continue
+            name = "muteki-src-egress-" + task_root.name
+            inspected = self._inspect(name)
+            if not inspected:
+                continue
+            owned = any(
+                mount.get("Type") == "bind"
+                and mount.get("Destination") == "/run/src"
+                and Path(str(mount.get("Source") or "")).resolve() == task_root.resolve()
+                for mount in inspected.get("Mounts", [])
+            )
+            if owned:
+                names.append(name)
         if names:
             self._docker("stop", *names)
 

@@ -166,6 +166,9 @@ async def delete(self, run_id: str) -> bool:
 
 async def _delete_owned_run(self, run_id: str, run: Run) -> bool:
     """Settle and remove the exact Run captured by :meth:`delete`."""
+    if (getattr(self, "btw_jobs", None) is not None
+            and not await self.btw_jobs.stop(run_id)):
+        return False
     if run.runtime_incomplete and not await self._settle_incomplete_runtime(
             run, timeout=self._standby_cancel_timeout()):
         LOG.error(
@@ -386,7 +389,7 @@ async def create_async(self, run_id: str) -> Run:
         store = SessionStore(root=self.event_root)
         return {
             "stream_seq": store.last_stream_seq(run_id),
-            "usage": self.usage.run_totals(run_id),
+            "usage": self.usage.run_totals(run_id, exclude_followups=True),
             "event_usd": _recorded_run_cost_usd(store, run_id),
             "readiness": self._load_profile_readiness(run_id),
         }
@@ -414,7 +417,7 @@ def create(self, run_id: str, *, stream_seq: int | None = None, recovery=None) -
     # usage and graph remain. Continue the same run's ledger instead of showing
     # only the latest execution generation (and resetting its budget gate).
     run.cost.restore_run_totals(
-        self.usage.run_totals(run_id) if recovery is None else recovery["usage"],
+        self.usage.run_totals(run_id, exclude_followups=True) if recovery is None else recovery["usage"],
         event_usd=(_recorded_run_cost_usd(store, run_id)
                    if recovery is None else recovery["event_usd"]),
     )

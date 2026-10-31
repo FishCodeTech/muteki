@@ -405,6 +405,7 @@ export interface SessionOptions {
   session_dir?: string;
   chat_native_extensions?: string[];
   chat_native_agents?: string[];
+  disabled_tools?: string[];
   title?: string | null;
   timeout_s?: number | null;
   web_access?: boolean;

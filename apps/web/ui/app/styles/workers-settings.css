@@ -926,3 +926,27 @@
   .wruntime-networks [data-slot="radio-control"],
   .wruntime-card-foot-actions button { transition: none; }
 }
+
+.wsettings-followup-workers { margin-bottom: 20px; min-width: 0; container-type: inline-size; }
+.wfollowup-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
+.wfollowup-heading h2 { margin: 0; font-size: 15px; font-weight: 600; color: var(--bright); }
+.wfollowup-heading p { margin: 5px 0 0; font-size: 12px; color: var(--muted); }
+.wfollowup-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.wfollowup-card { display: flex; flex-direction: column; gap: 14px; min-width: 0; padding: 18px; border: 1px solid var(--border); border-radius: 14px; background: var(--panel); box-shadow: none; }
+.wfollowup-card-head { display: flex; align-items: center; gap: 10px; }
+.wfollowup-card-head > div { flex: 1; min-width: 0; }
+.wfollowup-card-head h3 { margin: 0; font-size: 14px; font-weight: 600; color: var(--bright); }
+.wfollowup-card-head > div > span { display: block; margin-top: 3px; font-size: 11px; color: var(--muted); }
+.wfollowup-icon { display: grid; place-items: center; width: 36px; height: 36px; flex-shrink: 0; border: 1px solid var(--border); border-radius: 10px; color: var(--bright); background: color-mix(in srgb, var(--bright) 5%, transparent); }
+.wfollowup-description { margin: 0; font-size: 12px; line-height: 1.6; color: var(--muted); }
+.wfollowup-card [data-slot="select-trigger"] { min-width: 0; width: 100%; }
+.wfollowup-binding { display: flex; align-items: center; gap: 9px; margin-top: auto; padding-top: 13px; border-top: 1px solid var(--border); color: var(--muted); }
+.wfollowup-binding > div { min-width: 0; }
+.wfollowup-binding strong, .wfollowup-binding span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wfollowup-binding strong { font-size: 12px; font-weight: 500; color: var(--bright); }
+.wfollowup-binding span { margin-top: 3px; font-size: 11px; }
+.wfollowup-binding.invalid strong { color: var(--warning, #dba75b); }
+.wfollowup-foot { display: flex; align-items: flex-start; gap: 7px; margin-top: 12px; font-size: 11px; line-height: 1.7; color: var(--muted); }
+.wfollowup-foot > svg { flex-shrink: 0; margin-top: 3px; }
+@container (max-width: 540px) { .wfollowup-grid { grid-template-columns: minmax(0, 1fr); } }
+@media (max-width: 640px) { .wfollowup-grid { grid-template-columns: minmax(0, 1fr); } .wfollowup-card { padding: 15px; } }
