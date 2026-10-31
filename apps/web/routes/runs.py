@@ -525,10 +525,17 @@ def register(app: FastAPI) -> None:
                     graph_db_path=str(graph_db), jsonl_path=str(jsonl_path),
                     challenge_id=run_id, challenge_name=challenge_name,
                     challenge_category=challenge_category, run_meta=meta)
-                records = await run_blocking(evidence_reference, json.dumps({"records": snapshot, "history": transcript}, ensure_ascii=False),
+                records = await run_blocking(evidence_reference, snapshot,
                     workdir, container=container, source_root=root)
+                history_context = []
+                if transcript:
+                    history_ref = await run_blocking(evidence_reference,
+                        json.dumps(transcript, ensure_ascii=False), workdir,
+                        container=container, name="followup-history")
+                    history_context = {**json.loads(history_ref),
+                                       "completed_turns": len(transcript) // 2}
                 prompt = question_prompt(question, records,
-                    context_hint=context_hint)
+                    transcript=history_context, context_hint=context_hint)
                 worker_env = await run_blocking(_standby_worker_env,
                     root=root,
                     label=f"btw-{transport}-{request_id}",

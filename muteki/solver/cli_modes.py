@@ -1264,6 +1264,7 @@ async def _run_respond(self) -> SolveOutcome:
             EventType.FOLLOWUP_STARTED,
             followup_id=followup_id,
             kind=action,
+            source_worker_id=str(self.hitl_cmd.get("worker_id") or ""),
             question=text,
         )
     else:

@@ -545,7 +545,7 @@ const STRINGS: Dict = {
   "control.action.spawn_worker": { zh: "派发 Worker", en: "Spawn worker" },
   "control.action.cancel_worker": { zh: "取消 Worker", en: "Cancel worker" },
   "quick.resolve.tip": { zh: "拉起完整蜂群续解", en: "Relaunch the full swarm to keep solving" },
-  "quick.ask.tip": { zh: "向获胜 Worker 追问", en: "Ask the winning worker a question" },
+  "quick.ask.tip": { zh: "向所选 Agent 追问", en: "Ask the selected agent a question" },
   "quick.writeup.tip": { zh: "生成复盘报告", en: "Generate a writeup report" },
   "quick.markFalse": { zh: "标记误报", en: "Mark false" },
   "quick.markFalseTitle": { zh: "这个 flag 是假的 → 重开解题（单 worker 续解）", en: "This flag is wrong → reopen (single-worker re-solve)" },

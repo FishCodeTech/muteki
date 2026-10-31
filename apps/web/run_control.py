@@ -416,16 +416,19 @@ async def _post_control_serialized(
             "code": "runtime_shutdown_incomplete",
         }
     if str(body.get("action") or "").strip().lower() in {"ask", "writeup"}:
-        from muteki.solver.followup_profiles import participating_workers, select_btw_profile
+        from muteki.solver.followup_profiles import participating_workers, select_participant, participant_profile
         from muteki.solver.followup_report import ObserverCapabilityError
         from muteki.solver.cli_driver import driver_for
         payload = body.get("payload") if isinstance(body.get("payload"), dict) else {}
         try:
-            profile = select_btw_profile(self.worker_config.resolve(run.category or "web"),
-                self.load_winner_continuation(run_id),
+            participant = select_participant(await participating_workers(run),
                 str(payload.get("worker_id") or body.get("worker_id") or ""),
-                participants=await participating_workers(run))
+                self.load_winner_continuation(run_id))
+            profile = participant_profile(participant,
+                self.worker_config.resolve(run.category or "web").get("worker_profiles") or [])
             driver_for(profile).build_observer_input("")
+            body = {**body, "worker_id": participant["worker_id"],
+                    "payload": {**payload, "worker_id": participant["worker_id"]}}
         except (ValueError, ObserverCapabilityError) as exc:
             return {"ok": False, "status": "rejected", "code": getattr(exc, "code", "followup.worker_unavailable"),
                     "detail": str(exc)}
