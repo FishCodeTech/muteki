@@ -404,6 +404,10 @@ async def _post_control_serialized(
     wait_for_effect: bool = False,
 ) -> dict[str, Any]:
     """Compile and submit under the per-run idempotency/secret boundary."""
+    if (str(body.get("action") or "").strip().lower() == "ask"
+            and run.task is not None and not run.task.done()):
+        return {"ok": False, "status": "rejected", "code": "live_ask_use_btw",
+                "detail": "运行中的记录问答请使用 BTW；Ask 不会投递为解题指令"}
     if run.runtime_incomplete:
         return {
             "ok": False,

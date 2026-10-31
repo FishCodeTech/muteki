@@ -157,7 +157,8 @@ def _worker_env(self, cwd: Optional[str] = None) -> dict:
         )
         self._agent_browser_enabled = browser_enabled
     skill_workdir = cwd or self._workdir
-    if skill_workdir:
+    report_only = self.mode == "respond" and str(self.hitl_cmd.get("action") or "ask").lower() in {"ask", "writeup"}
+    if skill_workdir and not report_only:
         try:
             stage_blackboard_skill(
                 skill_workdir,
@@ -376,7 +377,7 @@ def _worker_env(self, cwd: Optional[str] = None) -> dict:
         env[proxy_name] = ""
     env["NO_PROXY"] = "*"
     env["no_proxy"] = "*"
-    env["MUTEKI_BLACKBOARD_SCRIPT"] = self._blackboard_script_path(cwd)
+    env["MUTEKI_BLACKBOARD_SCRIPT"] = "" if report_only else self._blackboard_script_path(cwd)
     env["MUTEKI_WORKER_EXECUTION_MODE"] = (
         "campaign" if getattr(self, "campaign_mode", False) else "step")
     env["MUTEKI_SETTLEMENT_ACTIVE"] = (
@@ -408,7 +409,7 @@ def _worker_env(self, cwd: Optional[str] = None) -> dict:
     # Workers receive role-scoped context and host-drained mutation ingress.
     # Only post-solve respond receives read-only raw graph access.
     db = getattr(self.shared_graph, "db_path", None)
-    if db and self.mode == "respond":
+    if db and self.mode == "respond" and not report_only:
         # ABSOLUTE path: the worker subprocess runs with cwd=<its own workdir>,
         # so a relative db_path would resolve against the wrong dir and the
         # blackboard skill / raw sqlite would hit "unable to open database file"
@@ -422,7 +423,7 @@ def _worker_env(self, cwd: Optional[str] = None) -> dict:
                 pass
         env["MUTEKI_BLACKBOARD_DB"] = db_path
     plugins = getattr(self, "plugin_service", None)
-    if plugins is not None and skill_workdir:
+    if plugins is not None and skill_workdir and not report_only:
         try:
             plugins.stage_native_worker(
                 skill_workdir, engine=self.driver.name,

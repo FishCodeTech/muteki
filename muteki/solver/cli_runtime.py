@@ -460,6 +460,18 @@ def _execute_invocation(
 ) -> "tuple[list[str], Optional[str]]":
     """Build one invocation, selecting the stdin-only capability for secrets."""
     self._finalize_control_context_prompt_manifest(prompt)
+    if self.mode == "respond" and str(self.hitl_cmd.get("action") or "ask").lower() in {"ask", "writeup"}:
+        from muteki.solver.followup_report import build_observer_input
+        if self.driver.name not in {"codex", "claude"}:
+            raise RuntimeError(f"{self.driver.name} does not support restricted Writeup/Ask generation")
+        if self._control_secret_values:
+            supported, detail = self.driver.secure_prompt_preflight()
+            if not supported:
+                raise SecurePromptUnsupported(detail or "Secure observer transport unavailable")
+        # Use the same profile/credential transport, but an ephemeral stdin
+        # request without remote tool providers, regardless of session history.
+        argv, prompt = build_observer_input(self.driver, prompt)
+        return PromptArgv(argv, prompt, None, "execute", has_positional_prompt=False), prompt
     if self._control_secret_values:
         preflight = getattr(self.driver, "secure_prompt_preflight", None)
         if not callable(preflight):
@@ -499,6 +511,8 @@ def _resume_invocation(
     included secret remains, deliberately fall back to a fresh ephemeral stdin
     invocation because persisted sessions are not a valid secret boundary.
     """
+    if self.mode == "respond" and str(self.hitl_cmd.get("action") or "ask").lower() in {"ask", "writeup"}:
+        return self._execute_invocation(prompt, None)
     self._finalize_control_context_prompt_manifest(prompt)
     if self._control_secret_values:
         return self._execute_invocation(prompt, None)
