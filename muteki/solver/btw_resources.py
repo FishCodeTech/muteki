@@ -46,7 +46,8 @@ def cleanup_turn(root: Path, workdir: Path, label: str) -> None:
     if workdir.name != label.removeprefix('btw-'):
         raise ValueError('BTW cleanup identity mismatch')
     for path, parent in ((workdir, root / 'workers' / '_btw'),
-                         (root / '.muteki-agent-state' / label, root / '.muteki-agent-state')):
+                         (root / '.muteki-agent-state' / label, root / '.muteki-agent-state'),
+                         (root / 'homes' / label, root / 'homes')):
         if path.is_symlink() or path.parent.resolve() != parent.resolve():
             raise ValueError('unsafe BTW cleanup path')
         # Parent paths must still be inside the run workspace.

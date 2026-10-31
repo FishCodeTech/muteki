@@ -41,14 +41,18 @@ class BtwResourcesTest(unittest.IsolatedAsyncioTestCase):
             token = 'a' * 32
             work = root / 'workers' / '_btw' / ('codex-' + token)
             home = root / '.muteki-agent-state' / ('btw-codex-' + token)
+            container_home = root / 'homes' / home.name
+            main_home = root / 'homes' / 'main'
             main = root / 'workers' / 'main'
             sibling = work.with_name('codex-' + 'b' * 32)
-            for path in (work, home, main, sibling):
+            for path in (work, home, container_home, main_home, main, sibling):
                 path.mkdir(parents=True)
                 (path / 'keep').write_text('fake')
             await run_blocking(cleanup_turn, root, work, home.name)
             self.assertFalse(work.exists())
             self.assertFalse(home.exists())
+            self.assertFalse(container_home.exists())
+            self.assertTrue((main_home / 'keep').exists())
             self.assertTrue((main / 'keep').exists())
             self.assertTrue((sibling / 'keep').exists())
             with self.assertRaises(ValueError):
@@ -65,3 +69,17 @@ class BtwResourcesTest(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(ValueError):
                 cleanup_turn(root, work, 'btw-' + work.name)
             self.assertTrue(target.exists())
+
+    async def test_cleanup_rejects_container_home_symlink_without_touching_main(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            label = 'btw-codex-' + 'a' * 32
+            work = root / 'workers' / '_btw' / label.removeprefix('btw-')
+            work.mkdir(parents=True)
+            main = root / 'homes' / 'main'
+            main.mkdir(parents=True)
+            (main / 'keep').write_text('main credentials')
+            (root / 'homes' / label).symlink_to(main, target_is_directory=True)
+            with self.assertRaises(ValueError):
+                cleanup_turn(root, work, label)
+            self.assertEqual((main / 'keep').read_text(), 'main credentials')

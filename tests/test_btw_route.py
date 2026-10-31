@@ -315,3 +315,72 @@ class BtwRouteTest(unittest.TestCase):
                 self.assertTrue(await jobs.stop('run-test', timeout=2))
             client.portal.call(verify)
             self.assertFalse(workdirs[0].exists())
+
+    def test_history_poll_keeps_polling_when_job_finishes_during_read(self):
+        from apps.web.btw_jobs import BtwJob
+        from muteki.solver.btw_history import BtwHistory
+        history = BtwHistory(self.root / 'control' / 'run-test')
+        turn = history.begin('question', engine='codex', model='fake')
+        jobs = self.app.state.manager.btw_jobs
+        jobs.jobs['run-test'] = BtwJob()
+        read_saved = history.list
+
+        def read_during_completion():
+            rows = read_saved()
+            # The DB read precedes the producer's final write and removal.
+            history.update(turn, 'final answer', 'completed')
+            jobs.jobs.pop('run-test')
+            return rows
+
+        client = TestClient(self.app)
+        with patch.object(BtwHistory, 'list', side_effect=read_during_completion):
+            first = client.get('/api/runs/run-test/btw/history').json()
+        self.assertEqual(first['turns'][0]['status'], 'incomplete')
+        self.assertTrue(first['active'], 'a stale read must schedule another poll')
+        final = client.get('/api/runs/run-test/btw/history').json()
+        self.assertFalse(final['active'])
+        self.assertEqual(final['turns'][0]['answer'], 'final answer')
+        self.assertEqual(final['turns'][0]['status'], 'completed')
+
+    def test_failed_scratch_cleanup_is_retained_and_retried_before_next_turn(self):
+        import threading
+        from muteki.solver.btw_resources import cleanup_turn
+        allow_retry = threading.Event()
+        calls = []
+        main = self.root / 'workers' / 'main'
+        main.mkdir(parents=True)
+        (main / 'important').write_text('main task')
+
+        def flaky_cleanup(root, workdir, label):
+            calls.append(workdir)
+            if len(calls) == 1:
+                raise OSError('synthetic transient cleanup failure')
+            if not allow_retry.wait(3):
+                raise AssertionError('test did not release cleanup')
+            cleanup_turn(root, workdir, label)
+
+        async def answer(**kwargs):
+            kwargs['runtime_exit_callback'](True)
+            yield {'answer': 'saved answer'}
+
+        with patch('muteki.solver.btw.stream_btw_worker_deltas', answer), \
+             patch('apps.web.drivers._standby_worker_env', return_value={}), \
+             patch('muteki.solver.btw_resources.cleanup_turn', flaky_cleanup), \
+             TestClient(self.app) as client:
+            try:
+                response = client.post('/api/runs/run-test/btw', json={'question': 'test'})
+                self.assertIn('saved answer', response.text)
+                status = client.get('/api/runs/run-test/btw/history').json()
+                self.assertTrue(status['active'])
+                self.assertEqual(status['progress']['phase'], 'cleanup')
+                self.assertEqual(client.post('/api/runs/run-test/btw',
+                    json={'question': 'wait for cleanup'}).status_code, 409)
+            finally:
+                allow_retry.set()
+            async def settle():
+                return await self.app.state.manager.btw_jobs.stop('run-test', timeout=2)
+            self.assertTrue(client.portal.call(settle))
+            self.assertGreaterEqual(len(calls), 2)
+            self.assertFalse(calls[0].exists())
+            self.assertFalse(client.get('/api/runs/run-test/btw/history').json()['active'])
+            self.assertEqual((main / 'important').read_text(), 'main task')
