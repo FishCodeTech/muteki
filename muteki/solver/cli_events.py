@@ -15,6 +15,9 @@ from muteki.core.events import (
 
 async def _emit(self, etype: EventType, **payload: Any) -> Optional[Event]:
     if self.bus is not None:
+        if (getattr(self, "mode", "") == "respond"
+                and (getattr(self, "hitl_cmd", {}) or {}).get("action") in {"ask", "writeup"}):
+            payload.setdefault("followup_id", self.hitl_cmd.get("followup_id") or "")
         return await self.bus.emit(Event(
             event_type=etype, run_id=self.run_id,
             challenge_id=self.challenge.id, solver_id=self.solver_id,

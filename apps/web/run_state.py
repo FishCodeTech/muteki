@@ -28,7 +28,8 @@ LOG = logging.getLogger("apps.web.run_manager")
 
 def _safe_exception_detail(prefix: str, exc: BaseException) -> str:
     """Keep the concrete boundary error available for operator diagnosis."""
-    message = str(exc).replace("\x00", "").strip()
+    from muteki.platform.contracts.agent_events import redact_secrets
+    message = redact_secrets(str(exc)).replace("\x00", "").strip()
     message = "".join(ch for ch in message if ch in "\n\t" or ord(ch) >= 32)
     suffix = f": {message[:2000]}" if message else ""
     return f"{prefix} ({type(exc).__name__}){suffix}"

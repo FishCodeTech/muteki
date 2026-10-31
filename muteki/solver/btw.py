@@ -19,10 +19,8 @@ The older flash-model helpers remain below for tests and compatibility: they
 build a read-only context snapshot and LLM messages, but the web route no longer
 uses them by default.
 
-Multi-turn: the caller passes the accumulated `transcript`; we re-snapshot the
-graph EVERY turn so a follow-up "and now?" reflects the latest blackboard. The
-transcript lives only in the frontend component state + the request body — it
-is never persisted server-side.
+Multi-turn: retained completed turns come from coordinator-owned BTW history.
+Each request starts a fresh worker with that transcript and current run paths.
 
 The system prompt forbids asserting flag candidates or inventing facts not in
 the context: btw is an observer, never a flag source (the provenance gate is
@@ -35,6 +33,7 @@ import asyncio
 import inspect
 import json
 import threading
+import time
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -85,8 +84,13 @@ class BtwWorkerPaths:
 _BTWWORKER_RULES = """你是 Muteki `/btw` 的只读旁路 worker。你不是正在解题的 swarm worker,
 也不是 coordinator。你的唯一任务是回答操作员这个 side question。
 
-工作方法:
-- 直接读取下面列出的 run 文件、SQLite graph、JSONL event log、artifacts。
+工作方法（优先快速回答）:
+- 先回答当前问题，不执行全面复盘；默认不超过 6 条要点，用户要求详细时再展开。
+- 已提供的元信息和对话足够时直接回答，不调用工具。
+- 需要证据时，优先一次工具调用读取相关摘要或日志末尾；必要的独立读取尽量合并。
+- 不递归遍历工作目录，不全量扫描事件日志或数据库。SQLite 查询限定相关字段及 LIMIT 20；日志默认只读末尾 80 行。
+- 默认最多两轮证据读取；仍不足就明确说明缺口，用户明确要求深入调查时才继续。
+- 对话历史可能已截短，不把历史推测当作已验证事实。
 - 如果要总结解题路径,优先使用 `flag_found` / `verified` evidence / worker 实际输出。
 - 明确区分 `intent_proposed`、open intent、dead_end、operator hint、候选证据、误报 flag。
 - 不要把计划、猜测、失败方向写成已经完成的步骤。
@@ -127,6 +131,7 @@ def build_btw_worker_prompt(
     challenge_name: str,
     challenge_category: str,
     run_state: str = "",
+    run_summary: Optional[dict[str, Any]] = None,
     context_hint: Optional[str] = "",
     transcript: Optional[list[dict[str, str]]] = None,
 ) -> str:
@@ -159,6 +164,11 @@ def build_btw_worker_prompt(
     ]
     if run_state:
         meta_lines.append(f"- run state: {run_state}")
+    if run_summary is not None:
+        meta_lines.append(f"- 已解决: {bool(run_summary.get('solved'))}")
+        meta_lines.append(f"- 已记录 Flag 数: {len(run_summary.get('flags') or [])}")
+        meta_lines.append(f"- 等待人工协助: {bool(run_summary.get('awaiting_help'))}")
+        meta_lines.append("- 以上为请求开始时的状态快照，不代表完整证据或后续变化。")
     if hint:
         meta_lines.append(f"- operator focus: {hint}")
 
@@ -196,7 +206,11 @@ async def stream_btw_worker_deltas(
     kb_access: bool = False,
     request_disconnected: Callable[[], Any] | None = None,
     usage_callback: Callable[[Any], Any] | None = None,
-) -> AsyncIterator[str]:
+    include_progress: bool = False,
+    diagnostic: Callable[[dict[str, Any]], None] | None = None,
+    runtime_exit_callback: Callable[[bool], None] | None = None,
+    runtime_query_callback: Callable[[Callable[[], bool]], None] | None = None,
+) -> AsyncIterator[str | dict[str, Any]]:
     """Run one CLI worker turn and yield assistant text chunks for `/btw`.
 
     This is intentionally lower-level than `CliSolver`: it has no EventBus, no
@@ -211,6 +225,24 @@ async def stream_btw_worker_deltas(
     done = object()
     cancel_event = threading.Event()
     streamed = {"count": 0}
+    processes: list[Any] = []
+    runner_finished = threading.Event()
+    def runtime_exited():
+        if not runner_finished.is_set():
+            return False
+        try:
+            return all(proc.poll() is not None for proc in processes)
+        except Exception:
+            return False
+    if runtime_query_callback is not None:
+        runtime_query_callback(runtime_exited)
+
+    def on_proc(proc):
+        if proc is not None:
+            processes.append(proc)
+        if include_progress:
+            _put({"progress": {"phase": "running"}})
+
     result_holder: list[Any] = []
     error_holder: list[BaseException] = []
 
@@ -220,7 +252,28 @@ async def stream_btw_worker_deltas(
         except RuntimeError:
             pass
 
+    stats = {"tools": 0, "tool_results": 0, "thinking_events": 0, "text_events": 0, "text_chars": 0}
+    def report(phase: str, **fields: Any) -> None:
+        if diagnostic is not None:
+            diagnostic({"phase": phase, **stats, **fields})
+
+    tool_count = 0
     def _on_step(step: Any) -> None:
+        nonlocal tool_count
+        kind = getattr(step, "kind", "")
+        if kind == "tool":
+            stats["tools"] += 1
+            report("tool_started")
+        elif kind == "tool_result":
+            stats["tool_results"] += 1
+            report("tool_returned")
+        elif kind == "reasoning" and bool(getattr(step, "thinking", False)):
+            stats["thinking_events"] += 1
+        if include_progress and kind == "tool":
+            tool_count += 1
+            _put({"progress": {"phase": "tool", "tool_count": tool_count}})
+        elif include_progress and kind == "tool_result":
+            _put({"progress": {"phase": "tool_result", "tool_count": tool_count}})
         if (getattr(step, "kind", "") != "reasoning"
                 or bool(getattr(step, "thinking", False))):
             return
@@ -228,6 +281,10 @@ async def stream_btw_worker_deltas(
         if not text:
             return
         streamed["count"] += 1
+        stats["text_events"] += 1
+        stats["text_chars"] += len(text)
+        if stats["text_events"] == 1:
+            report("cli_first_text")
         _put(text)
 
     def _run() -> None:
@@ -249,17 +306,30 @@ async def stream_btw_worker_deltas(
                 env=env,
                 cancel_event=cancel_event,
                 container=container,
+                on_proc=on_proc,
             )
+            report("cli_returned", final_chars=len(str(getattr(res, "text", "") or "")),
+                   timed_out=bool(getattr(res, "timed_out", False)),
+                   cancelled=bool(getattr(res, "cancelled", False)),
+                   returncode=getattr(res, "returncode", None))
             if usage_callback is not None:
                 usage_callback(res)
             result_holder.append(res)
         except BaseException as exc:  # noqa: BLE001
+            report("cli_exception", error_type=type(exc).__name__)
             error_holder.append(exc)
         finally:
+            runner_finished.set()
+            if runtime_exit_callback is not None:
+                runtime_exit_callback(runtime_exited())
             _put(done)
 
     task = asyncio.create_task(asyncio.to_thread(_run))
+    started_at = time.monotonic()
+    last_progress = started_at
     try:
+        if include_progress:
+            yield {"progress": {"phase": "starting"}}
         while True:
             if await _maybe_disconnected(request_disconnected):
                 cancel_event.set()
@@ -267,21 +337,31 @@ async def stream_btw_worker_deltas(
             try:
                 item = await asyncio.wait_for(queue.get(), timeout=0.25)
             except asyncio.TimeoutError:
+                now = time.monotonic()
+                if include_progress and now - last_progress >= 5:
+                    last_progress = now
+                    report("waiting", elapsed_seconds=int(now - started_at))
+                    yield {"progress": {"phase": "waiting", "elapsed_seconds": int(now - started_at)}}
                 if task.done() and queue.empty():
                     break
                 continue
             if item is done:
                 break
-            yield str(item)
+            yield item if isinstance(item, dict) else str(item)
     except asyncio.CancelledError:
         cancel_event.set()
         raise
     finally:
-        if cancel_event.is_set() and not task.done():
-            try:
-                await asyncio.wait_for(task, timeout=2.0)
-            except asyncio.TimeoutError:
-                pass
+        # Closing the async iterator must cancel and join the real runner before
+        # its owner removes cwd/HOME. Cancelling to_thread alone cannot do that.
+        cancel_event.set()
+        import anyio
+        with anyio.CancelScope(shield=True):
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    continue
 
     if not task.done():
         await task
@@ -294,9 +374,17 @@ async def stream_btw_worker_deltas(
         return
     if getattr(res, "timed_out", False):
         raise TimeoutError(f"btw worker timed out after {timeout}s")
+    if getattr(res, "returncode", None) not in {None, 0} or getattr(res, "error", ""):
+        raise RuntimeError("BTW Worker failed; check the selected Profile and provider")
     final_text = str(getattr(res, "text", "") or "").strip()
+    if streamed["count"] == 0 and not final_text:
+        raise RuntimeError("BTW Worker returned no answer")
     if streamed["count"] == 0 and final_text:
         yield final_text
+    if include_progress and final_text:
+        # The final parser can recognize a message that the streaming parser
+        # did not. Replace the partial response with the authoritative answer.
+        yield {"answer": final_text}
 
 
 def sanitize_transcript(transcript: Any) -> list[dict[str, str]]:

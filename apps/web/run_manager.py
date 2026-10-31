@@ -170,9 +170,34 @@ class RunManager:
             # depend on a transient in-memory set because a very short worker can
             # complete while its control receipt is still settling.
             allowed_followup = ev.event_type in followup_types
+            # A finished generation still owns a separate, live follow-up.
+            # Admit only its observational events, never late solve mutations.
+            followup_output_types = {
+                EventType.WORKER_PROMPT, EventType.TEXT_MESSAGE_DELTA,
+                EventType.REASONING_DELTA, EventType.TOOL_CALL_START,
+                EventType.TOOL_CALL_ARGS, EventType.TOOL_CALL_RESULT,
+                EventType.TERMINAL_OUTPUT, EventType.COST_UPDATE,
+            }
+            allowed_followup_output = (
+                ev.event_type in followup_output_types
+                and str(ev.solver_id or "").startswith("cli-")
+                and str(ev.solver_id or "").endswith("-standby")
+                and bool(payload.get("followup_id"))
+                and payload.get("followup_id") in run.active_followups
+            )
+            # Ask/writeup are observations, even while the main solve is live.
+            # mark_false is deliberately excluded: it owns a real re-solve.
+            is_standby_followup = (
+                str(ev.solver_id or "").endswith("-standby")
+                and bool(payload.get("followup_id"))
+            )
+            if (is_standby_followup
+                    and not allowed_followup and not allowed_followup_output):
+                return False
             if (generation in run.terminal_generations
                     and ev.event_type is not EventType.CONTROL_COMMAND
-                    and not allowed_followup):
+                    and not allowed_followup
+                    and not allowed_followup_output):
                 # The terminal event closes this execution generation.  A worker
                 # subprocess may still flush a buffered frame while cancellation is
                 # propagating, but that frame belongs to a closed runtime and must not
