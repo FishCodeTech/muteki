@@ -652,6 +652,8 @@ export interface WorkerSettings {
     race: { enabled: boolean; timeout: number; engines: string[] };
     coordinator: {
       dispatch_mode?: "fixed" | "auto";
+      standby_profile?: string;
+      btw_profile?: string;
       wall_clock_budget: number;
       review?: {
         enabled?: boolean;

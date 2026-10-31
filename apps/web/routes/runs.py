@@ -63,6 +63,8 @@ class RunRetentionPolicyBody(BaseModel):
         return self
 
 def register(app: FastAPI) -> None:
+    from apps.web.btw_jobs import BtwJobs
+    app.state.manager.btw_jobs = BtwJobs()
     h = app.state.route_helpers
     _reject_temporarily_disabled_engine = h._reject_temporarily_disabled_engine
     _dispatch_run_command = h._dispatch_run_command
@@ -320,12 +322,41 @@ def register(app: FastAPI) -> None:
             },
         )
 
+    def _btw_history(run_id: str):
+        from muteki.solver.btw_history import BtwHistory
+        mgr = app.state.manager
+        if mgr.get(run_id) is None:
+            raise HTTPException(status_code=404, detail="unknown run")
+        return BtwHistory(mgr.coordinator_control_dir(run_id))
+
+    @app.get("/api/runs/{run_id}/btw/history")
+    async def get_btw_history(run_id: str) -> Any:
+        history = _btw_history(run_id)
+        return {"turns": await run_blocking(history.list), **app.state.manager.btw_jobs.status(run_id)}
+
+    @app.post("/api/runs/{run_id}/btw/cancel")
+    async def cancel_btw(run_id: str) -> Any:
+        _btw_history(run_id)
+        stopped = await app.state.manager.btw_jobs.stop(run_id)
+        return JSONResponse({"stopped": stopped}, status_code=200 if stopped else 202)
+
+    @app.delete("/api/runs/{run_id}/btw/history")
+    async def clear_btw_history(run_id: str) -> Any:
+        return {"deleted": await run_blocking(_btw_history(run_id).delete)}
+
+    @app.delete("/api/runs/{run_id}/btw/history/{turn_id}")
+    async def delete_btw_turn(run_id: str, turn_id: str) -> Any:
+        deleted = await run_blocking(_btw_history(run_id).delete, turn_id)
+        if not deleted:
+            raise HTTPException(status_code=404, detail="BTW turn not found")
+        return {"deleted": deleted}
+
     # ── BTW side-query worker (separate one-shot process, no swarm slot) ──────
     # Independent route (not /hitl), no run.hitl queue, no InsightBus GUIDANCE,
     # no bus.emit, no CostController, no CliSolver, no scheduler/max_worker slot.
-    # Each turn cold-starts one CLI worker process, passes the frontend transcript
-    # for multi-turn context, streams its answer, and kills it on disconnect or
-    # superseding /btw request. The process exits after the turn.
+    # Each turn cold-starts one CLI worker process, passes retained history
+    # for multi-turn context, streams its answer, and continues across browser navigation.
+    # Only explicit stop, run deletion, or shutdown cancels the background job.
     @app.post("/api/runs/{run_id}/btw")
     async def btw(run_id: str, request: Request) -> Any:
         from apps.web.drivers import _standby_profile_for, _standby_worker_env
@@ -336,7 +367,6 @@ def register(app: FastAPI) -> None:
             BtwWorkerPaths,
             build_btw_worker_prompt,
             run_meta_dict,
-            sanitize_transcript,
             stream_btw_worker_deltas,
         )
         from muteki.solver.cli_driver import driver_for
@@ -347,7 +377,9 @@ def register(app: FastAPI) -> None:
         question = str(body.get("question") or "").strip()
         if not question:
             return JSONResponse({"error": "empty question"}, status_code=400)
-        transcript = sanitize_transcript(body.get("transcript"))
+        # History is server-owned; stale client transcripts cannot undo deletion.
+        history = _btw_history(run_id)
+        transcript = await run_blocking(history.transcript, max_chars=24000)
         context_hint = str(body.get("context_hint") or "")
 
         mgr: RunManager = app.state.manager
@@ -386,41 +418,14 @@ def register(app: FastAPI) -> None:
         worker_profiles = wc.get("worker_profiles") or []
         worker_network = str(wc.get("worker_network") or "bridge")
 
-        def _pick_profile() -> tuple[dict[str, Any] | None, str]:
-            requested = str(
-                body.get("profile") or body.get("engine") or ""
-            ).strip()
-            review = ((wc.get("stage_policy") or {}).get("coordinator") or {}).get("review") or {}
-            candidates = [
-                requested,
-                str(review.get("engine") or "").strip(),
-                str(winner.get("engine") or "").strip(),
-            ]
-            for p in worker_profiles:
-                if isinstance(p, dict) and p.get("enabled", True):
-                    roles = p.get("roles") or []
-                    if "respond" in roles or "review" in roles:
-                        candidates.append(str(p.get("name") or p.get("id") or ""))
-            candidates.extend(str(e) for e in (wc.get("engines") or []))
-            candidates.extend(["claude", "codex"])
-            for cand in candidates:
-                if not cand:
-                    continue
-                profile = _standby_profile_for(cand, worker_profiles)
-                if profile is not None:
-                    return profile, cand
-                base = base_engine_for_profile(cand)
-                if base in SUPPORTED_ENGINE_IDS:
-                    return None, base
-            return None, "claude"
+        from muteki.solver.followup_profiles import select_btw_profile
+        try:
+            profile = select_btw_profile(wc, winner, str(body.get("profile") or body.get("engine") or "").strip())
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        transport = base_engine_for_profile(profile)
 
         async def stream():
-            # Register this generation as the run's active btw; cancel any prior.
-            this_task = asyncio.current_task()
-            if this_task is not None:
-                limiter.acquire(run_id, this_task)
-            profile, selected = _pick_profile()
-            transport = base_engine_for_profile(profile or selected)
             worker_backend = resolve_worker_backend(
                 request_backend=body.get("worker_backend"),
                 config_backend=wc.get("worker_backend"),
@@ -434,16 +439,46 @@ def register(app: FastAPI) -> None:
                 )
                 if profile else worker_backend
             )
+            import uuid
+            request_id = uuid.uuid4().hex
             container = None
-            btw_container_id = f"{run_id}:btw"
+            # Replacement requests may overlap their predecessor's cleanup.
+            btw_container_id = f"{run_id}:btw:{request_id}"
             account_root = account_store_root(mgr.state_root)
             worker_root = root / "workers" / "_btw"
-            worker_root.mkdir(parents=True, exist_ok=True)
-            workdir = worker_root / f"{transport}-{int(time.time() * 1000)}"
-            workdir.mkdir(parents=True, exist_ok=True)
+            workdir = worker_root / f"{transport}-{request_id}"
             visible_jsonl = jsonl_path
             visible_graph = graph_db
+            import logging
+            diagnostic_id = request_id[:12]
+            sent_chars = 0
+            def diagnose(fields):
+                logging.getLogger(__name__).warning(
+                    "btw_diag run=%s request=%s %s", safe, diagnostic_id,
+                    json.dumps(fields, ensure_ascii=True))
+            diagnose({"phase": "request_started"})
+            history_id = ""
+            answer = ""
+            history_status = "incomplete"
+            history_save_failed = False
+            last_history_write = 0.0
+            runtime_exited = True
+            runtime_query = None
+            def register_runtime_query(query):
+                nonlocal runtime_query
+                runtime_query = query
+            def note_runtime_exit(exited):
+                nonlocal runtime_exited
+                runtime_exited = exited
+            this_task = asyncio.current_task()
+            if this_task is not None:
+                limiter.acquire(run_id, this_task)
             try:
+                await run_blocking(workdir.mkdir, parents=True, exist_ok=True)
+                history_id = await run_blocking(history.begin, question,
+                    engine=transport, model=str(profile.get("model") or ""))
+                yield {"data": json.dumps({"history_id": history_id})}
+                yield {"data": json.dumps({"progress": {"phase": "preparing"}})}
                 if backend == "container":
                     from muteki.solver.container_exec import (
                         _chown_tree_to_worker,
@@ -454,40 +489,29 @@ def register(app: FastAPI) -> None:
                     # sessions tree. Give the read-only side worker point-in-time
                     # copies inside its own scratch directory instead of mounting
                     # coordinator state or silently mapping an inaccessible path.
-                    context_dir = workdir / "context"
-                    context_dir.mkdir(parents=True, exist_ok=True)
-                    visible_jsonl = context_dir / "events.jsonl"
-                    if jsonl_path.is_file():
-                        shutil.copyfile(jsonl_path, visible_jsonl)
-                    visible_graph = context_dir / "shared_graph.db"
-                    if graph_db.is_file():
-                        source_db = sqlite3.connect(
-                            f"{graph_db.resolve().as_uri()}?mode=ro", uri=True
-                        )
-                        target_db = sqlite3.connect(visible_graph)
-                        try:
-                            source_db.backup(target_db)
-                        finally:
-                            target_db.close()
-                            source_db.close()
+                    from muteki.solver.btw_resources import snapshot_context
+                    visible_jsonl, visible_graph = await run_blocking(
+                        snapshot_context, workdir, jsonl_path, graph_db)
 
                     from muteki.solver.credential_accounts import engine_account_id
                     from muteki.solver.worker_resource_limits import resolve_worker_resource_limits
                     limits = resolve_worker_resource_limits(config=wc)
-                    container = await asyncio.to_thread(
-                        ensure_container,
-                        btw_container_id,
-                        str(root.parent),
-                        network=worker_network,
-                        memory=limits.memory, cpus=limits.cpus, pids_limit=limits.pids_limit,
-                        output_limit=limits.output_limit, disk_limit=limits.disk_limit,
-                        account_root=str(account_root),
-                        account_ids=[str((profile or {}).get("credential_account") or engine_account_id(transport))],
-                        worker_privilege=str(wc.get("worker_privilege") or "default"),
-                        account_projection_root=str(mgr.account_projection_root),
-                        bootstrap_root=str(mgr.container_bootstrap_root),
-                    )
-                    await asyncio.to_thread(_chown_tree_to_worker, str(workdir))
+                    def acquire_container():
+                        nonlocal container
+                        container = ensure_container(
+                            btw_container_id,
+                            str(root.parent),
+                            network=worker_network,
+                            memory=limits.memory, cpus=limits.cpus, pids_limit=limits.pids_limit,
+                            output_limit=limits.output_limit, disk_limit=limits.disk_limit,
+                            account_root=str(account_root),
+                            account_ids=[str((profile or {}).get("credential_account") or engine_account_id(transport))],
+                            worker_privilege=str(wc.get("worker_privilege") or "default"),
+                            account_projection_root=str(mgr.account_projection_root),
+                            bootstrap_root=str(mgr.container_bootstrap_root),
+                        )
+                    await run_blocking(acquire_container)
+                    await run_blocking(_chown_tree_to_worker, str(workdir))
 
                 def _worker_path(p: Path) -> str:
                     if container is not None:
@@ -496,7 +520,7 @@ def register(app: FastAPI) -> None:
                             return str(mapper(str(p)))
                     return str(p)
 
-                prompt = build_btw_worker_prompt(
+                prompt = await run_blocking(build_btw_worker_prompt,
                     question=question,
                     paths=BtwWorkerPaths(
                         workspace=_worker_path(root),
@@ -513,12 +537,13 @@ def register(app: FastAPI) -> None:
                     challenge_name=challenge_name,
                     challenge_category=challenge_category,
                     run_state=str(meta.get("state") or ""),
+                    run_summary=meta,
                     context_hint=context_hint,
                     transcript=transcript,
                 )
-                worker_env = _standby_worker_env(
+                worker_env = await run_blocking(_standby_worker_env,
                     root=root,
-                    label=f"btw-{transport}",
+                    label=f"btw-{transport}-{request_id}",
                     engine=transport,
                     profile=profile,
                     account_root=account_root,
@@ -533,7 +558,9 @@ def register(app: FastAPI) -> None:
                                      run_id=run_id, generation=usage_generation,
                                      workspace_kind="single-security-task", actor_kind="auxiliary",
                                      role="btw", model=(profile or {}).get("model"), engine=transport)
-                async for chunk in stream_btw_worker_deltas(
+                from contextlib import aclosing
+                runtime_exited = False
+                async with aclosing(stream_btw_worker_deltas(
                     driver=driver_for(profile or transport),
                     usage_callback=record_btw_usage,
                     prompt=prompt,
@@ -543,37 +570,105 @@ def register(app: FastAPI) -> None:
                     container=container,
                     web_access=False,
                     kb_access=False,
-                ):
-                    if await request.is_disconnected():
-                        break
-                    yield {"data": json.dumps({"delta": chunk}, ensure_ascii=False)}
+                    include_progress=True,
+                    diagnostic=diagnose,
+                    runtime_exit_callback=note_runtime_exit,
+                    runtime_query_callback=register_runtime_query,
+                    request_disconnected=None,
+                )) as chunks:
+                    async for chunk in chunks:
+                        frame = chunk if isinstance(chunk, dict) else {"delta": chunk}
+                        if "answer" in frame:
+                            answer = str(frame["answer"])
+                        elif "delta" in frame:
+                            answer += str(frame["delta"])
+                        if answer and ("answer" in frame or time.monotonic() - last_history_write >= 1):
+                            await run_blocking(history.update, history_id, answer, "incomplete")
+                            last_history_write = time.monotonic()
+                        text_size = len(str(frame.get("answer") or frame.get("delta") or ""))
+                        if text_size:
+                            if not sent_chars or "answer" in frame:
+                                diagnose({"phase": "http_answer" if "answer" in frame else "http_first_text",
+                                          "chars": text_size})
+                            sent_chars += text_size
+                        yield {"data": json.dumps(frame, ensure_ascii=False)}
+                if history_status != "cancelled":
+                    history_status = "completed" if answer else "cancelled"
             except asyncio.CancelledError:
                 # limiter cancel or client disconnect — stop cleanly.
-                pass
+                history_status = "cancelled"
+                diagnose({"phase": "http_cancelled", "sent_chars": sent_chars})
             except Exception as e:  # noqa: BLE001
-                yield {"data": json.dumps({"error": str(e)[:300]}, ensure_ascii=False)}
+                history_status = "failed"
+                diagnose({"phase": "http_error", "error_type": type(e).__name__, "sent_chars": sent_chars})
+                yield {"data": json.dumps({"error": f"BTW Worker 失败 ({type(e).__name__})，诊断编号：{diagnostic_id}"}, ensure_ascii=False)}
             finally:
-                if container is not None:
-                    from muteki.solver.container_exec import teardown_container
-                    try:
-                        removed = await asyncio.to_thread(
-                            teardown_container, btw_container_id, remove=True)
-                        if removed is not True:
+                import anyio
+                with anyio.CancelScope(shield=True):
+                    if history_id:
+                        import anyio
+                        # Client disconnect cancellation must not discard the partial answer.
+                        with anyio.CancelScope(shield=True):
+                            try:
+                                await run_blocking(history.update, history_id, answer, history_status)
+                            except Exception as exc:
+                                history_save_failed = True
+                                diagnose({"phase": "history_save_failed", "error_type": type(exc).__name__})
+                    diagnose({"phase": "http_stream_closing", "sent_chars": sent_chars})
+                    container_removed = container is None
+                    if container is not None:
+                        from muteki.solver.container_exec import teardown_container
+                        try:
+                            removed = await run_blocking(
+                                teardown_container, btw_container_id, remove=True)
+                            container_removed = removed is True
+                            if removed is not True:
+                                import logging
+                                logging.getLogger(__name__).warning(
+                                    "BTW container teardown could not be proven for %s",
+                                    btw_container_id,
+                                )
+                        except Exception:
                             import logging
-                            logging.getLogger(__name__).warning(
-                                "BTW container teardown could not be proven for %s",
-                                btw_container_id,
-                            )
-                    except Exception:
-                        import logging
-                        logging.getLogger(__name__).exception(
-                            "BTW container teardown failed for %s", btw_container_id)
-                this_task = asyncio.current_task()
-                if this_task is not None:
-                    limiter.release(run_id, this_task)
+                            logging.getLogger(__name__).error(
+                                "BTW container teardown failed for %s", btw_container_id)
+                    if runtime_exited and container_removed:
+                        from muteki.solver.btw_resources import cleanup_turn
+                        import anyio
+                        with anyio.CancelScope(shield=True):
+                            try:
+                                await run_blocking(cleanup_turn, root, workdir, f"btw-{transport}-{request_id}")
+                            except Exception as exc:
+                                diagnose({"phase": "cleanup_failed", "error_type": type(exc).__name__})
+                    if not runtime_exited or not container_removed:
+                        async def retry_cleanup():
+                            nonlocal container_removed
+                            if container is not None and not container_removed:
+                                from muteki.solver.container_exec import teardown_container
+                                container_removed = await run_blocking(
+                                    teardown_container, btw_container_id, remove=True) is True
+                            exited = runtime_query() if runtime_query is not None else runtime_exited
+                            if not exited or not container_removed:
+                                return False
+                            from muteki.solver.btw_resources import cleanup_turn
+                            await run_blocking(cleanup_turn, root, workdir, f"btw-{transport}-{request_id}")
+                            return True
+                        mgr.btw_jobs.retain_cleanup(run_id, retry_cleanup)
+                    this_task = asyncio.current_task()
+                    if this_task is not None:
+                        limiter.release(run_id, this_task)
+            if history_save_failed:
+                yield {"data": json.dumps({"error": "回答未能保存到 BTW 历史，请检查服务存储空间"}, ensure_ascii=False)}
             yield {"data": json.dumps({"done": True}, ensure_ascii=False)}
 
-        return EventSourceResponse(stream(), ping=10)
+        if (getattr(mgr, "_shutting_down", False)
+                or run_id in getattr(mgr, "_closing_runs", set())):
+            return JSONResponse({"error": "任务正在删除或服务正在关闭"}, status_code=409)
+        try:
+            job = mgr.btw_jobs.start(run_id, stream)
+        except ValueError:
+            return JSONResponse({"error": "BTW 已在运行，请等待完成或点击停止"}, status_code=409)
+        return EventSourceResponse(job.events(), ping=10)
 
     @app.post("/api/runs")
     async def new_run(request: Request) -> Any:
