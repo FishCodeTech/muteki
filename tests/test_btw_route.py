@@ -20,11 +20,11 @@ class BtwRouteTest(unittest.TestCase):
         task_file.write_text('main-task-original')
         question = 'Run curl and overwrite task.txt to continue solving'
         def runner(driver, argv, *, env, stdin_text, cwd, **kwargs):
-            self.assertIn('synthetic-record-403', stdin_text)
+            self.assertIn('synthetic-record-403', (Path(cwd) / 'followup-records.json').read_text())
             self.assertIn(question, stdin_text)
             self.assertNotIn(question, str(argv))
             self.assertNotEqual(Path(cwd), self.root)
-            self.assertIn('features.shell_tool=false', argv)
+            self.assertIn('features.apply_patch_freeform=false', argv)
             self.assertEqual(argv[argv.index('--sandbox') + 1], 'read-only')
             for name in ('MUTEKI_BLACKBOARD_DB', 'MUTEKI_BLACKBOARD_SCRIPT',
                          'MUTEKI_BLACKBOARD_INGRESS_DIR'):
@@ -38,7 +38,7 @@ class BtwRouteTest(unittest.TestCase):
         self.assertEqual(task_file.read_text(), 'main-task-original')
 
     def test_unsupported_observer_profile_is_rejected_before_launch(self):
-        self.profile['engine'] = 'cursor'
+        self.profile['engine'] = 'devin'
         with patch('muteki.solver.cli_driver.run_cli_streaming') as runner:
             response = TestClient(self.app).post('/api/runs/run-test/btw', json={'question': 'progress'})
         self.assertEqual(response.status_code, 400)
@@ -52,12 +52,18 @@ class BtwRouteTest(unittest.TestCase):
                         'credential_account': 'fake-account', 'model': 'fake-model', 'enabled': True}
         self.config = {'worker_profiles': [self.profile], 'worker_backend': 'local',
                        'stage_policy': {'coordinator': {'btw_profile': 'codex-one'}}}
+        from muteki.core.events import EventType
+        async def replay(run_id):
+            yield SimpleNamespace(event_type=EventType.WORKER_STATUS, solver_id='participant-one',
+                payload=dict(engine=self.profile['engine'], profile_id=self.profile['id'],
+                    model=self.profile['model'], account_id='fake-account', online=True))
+        self.store = SimpleNamespace(replay=replay)
         self.app = FastAPI()
         self.app.state.route_helpers = SimpleNamespace(
             _reject_temporarily_disabled_engine=lambda body: None,
             _dispatch_run_command=None, _run_receipt_status=None)
         self.app.state.manager = SimpleNamespace(
-            get=lambda run_id: SimpleNamespace(name='synthetic', category='web', execution_generation=1),
+            get=lambda run_id: SimpleNamespace(name='synthetic', category='web', execution_generation=1, run_id='run-test', store=self.store),
             _safe_run_id=lambda run_id: run_id, workspace_dir=lambda run_id: self.root,
             graph_dir=lambda run_id: self.root, event_root=self.root, sessions_root=self.root,
             coordinator_control_dir=lambda run_id: self.root / "control" / run_id,
@@ -90,7 +96,7 @@ class BtwRouteTest(unittest.TestCase):
         self.app.state.manager.usage.record.assert_called_once()
 
     def test_invalid_config_returns_400_before_cli_start(self):
-        self.config['stage_policy']['coordinator']['btw_profile'] = 'deleted'
+        self.config['worker_profiles'] = []
         with patch('muteki.solver.cli_driver.run_cli_streaming') as runner:
             response = TestClient(self.app).post('/api/runs/run-test/btw', json={'question': 'summarize'})
         self.assertEqual(response.status_code, 400)
@@ -161,7 +167,7 @@ class BtwRouteTest(unittest.TestCase):
                     main_task = Mock()
                     main_task.done.return_value = initially_finished
                     main_cost = Mock()
-                    run = SimpleNamespace(name='synthetic', category='web', mode=mode,
+                    run = SimpleNamespace(name='synthetic', category='web', mode=mode, run_id='run-test', store=self.store,
                         execution_generation=1, finished=initially_finished,
                         solved=False, flags=['existing-flag'], task=main_task,
                         cost=main_cost)
@@ -206,7 +212,7 @@ class BtwRouteTest(unittest.TestCase):
             yield {'answer': 'synthetic'}
         with patch('muteki.solver.btw.stream_btw_worker_deltas', answer), \
              patch('apps.web.drivers._standby_worker_env', return_value={}) as env, \
-             patch('muteki.solver.container_exec.ensure_container', return_value=SimpleNamespace()) as create, \
+             patch('muteki.solver.container_exec.ensure_container', return_value=SimpleNamespace(to_container_path=lambda path: path, image='test')) as create, \
              patch('muteki.solver.container_exec._chown_tree_to_worker'), \
              patch('muteki.solver.container_exec.teardown_container', return_value=True) as remove:
             for _ in range(2):
@@ -384,3 +390,19 @@ class BtwRouteTest(unittest.TestCase):
             self.assertFalse(calls[0].exists())
             self.assertFalse(client.get('/api/runs/run-test/btw/history').json()['active'])
             self.assertEqual((main / 'important').read_text(), 'main task')
+
+    def test_participants_api_and_invalid_selection(self):
+        client = TestClient(self.app)
+        workers = client.get('/api/runs/run-test/followup/workers').json()['workers']
+        self.assertEqual([worker['worker_id'] for worker in workers], ['participant-one'])
+        response = client.post('/api/runs/run-test/btw', json={'question': 'hello', 'worker_id': 'unlaunched'})
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()['code'], 'followup.worker_unavailable')
+
+    def test_evidence_failure_is_typed_and_does_not_launch_cli(self):
+        from muteki.solver.followup_report import EvidenceReadError
+        with patch('muteki.solver.btw.build_btw_context_sync', side_effect=EvidenceReadError('unavailable')), \
+             patch('muteki.solver.cli_driver.run_cli_streaming') as runner:
+            response = TestClient(self.app).post('/api/runs/run-test/btw', json={'question': 'hello'})
+        self.assertIn('followup.evidence_unreadable', response.text)
+        runner.assert_not_called()

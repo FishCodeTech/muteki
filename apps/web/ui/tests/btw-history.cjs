@@ -8,7 +8,7 @@ const ts = require('typescript');
 const React = require('react');
 const { act, create } = require('react-test-renderer');
 global.IS_REACT_ACT_ENVIRONMENT = true;
-global.window = { confirm: () => true };
+global.window = { confirm: () => true, setInterval: () => 1, clearInterval: () => {} };
 let apiFetch;
 const widget = ({ children }) => React.createElement('div', null, children);
 const originalLoad = Module._load;
@@ -17,7 +17,20 @@ Module._load = function (request, ...args) {
   if (request === '@/components/Icon') return { Icon: () => null };
   if (request === '@/components/ai-native/message-markdown') return { MessageMarkdown: ({ text }) => React.createElement('p', null, text) };
   if (request === '@/lib/i18n') return { useT: () => key => key };
-  if (request === '@/lib/useRun') return { apiFetch: (...a) => apiFetch(...a) };
+  if (request === '@/lib/useRun') return { apiFetch: (...a) => a[0].endsWith('/followup/workers')
+    ? Promise.resolve({ ok: true, json: async () => ({ workers: [
+      { worker_id: 'worker-1', engine: 'codex', model: 'one' },
+      { worker_id: 'worker-2', engine: 'codex', model: 'two' },
+      { worker_id: 'worker-3', engine: 'cursor', model: 'three' },
+    ] }) }) : apiFetch(...a) };
+  if (request === './FollowupWorkerSelect') {
+    const target = path.resolve(__dirname, '../components/FollowupWorkerSelect.tsx');
+    const source = ts.transpileModule(fs.readFileSync(target, 'utf8'), { compilerOptions: {
+      module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX, esModuleInterop: true,
+    } }).outputText;
+    const loaded = new Module(target, module); loaded.filename = target; loaded.paths = module.paths;
+    loaded._compile(source, target); return loaded.exports;
+  }
   if (request.endsWith('.module.css')) return {};
   return originalLoad.call(this, request, ...args);
 };
@@ -122,5 +135,26 @@ test('stop explicitly cancels the server job instead of only disconnecting', asy
   assert.ok(stop);
   await act(async () => stop.props.onClick());
   assert.ok(requests.some(([url, method]) => url === '/api/runs/a/btw/cancel' && method === 'POST'));
+  await act(async () => renderer.unmount());
+});
+
+
+test('all three participating agents remain distinct and selection is sent with the question', async () => {
+  let submitted;
+  apiFetch = async (url, options = {}) => {
+    if (options.method === 'POST') {
+      submitted = JSON.parse(options.body);
+      return { ok: false, status: 409, text: async () => 'test request captured' };
+    }
+    return response([]);
+  };
+  let renderer;
+  await act(async () => { renderer = create(React.createElement(BtwPanel, { open: true, runId: 'a', onClose() {} })); });
+  const select = renderer.root.findByType('select');
+  assert.equal(select.findAllByType('option').length, 3);
+  await act(async () => select.props.onChange({ target: { value: 'worker-3' } }));
+  await act(async () => renderer.root.findByType('textarea').props.onChange({ target: { value: 'Question' } }));
+  await act(async () => renderer.root.findByType('textarea').props.onKeyDown({ key: 'Enter', shiftKey: false, nativeEvent: {}, preventDefault() {} }));
+  assert.equal(submitted.worker_id, 'worker-3');
   await act(async () => renderer.unmount());
 });

@@ -329,6 +329,14 @@ def register(app: FastAPI) -> None:
             raise HTTPException(status_code=404, detail="unknown run")
         return BtwHistory(mgr.coordinator_control_dir(run_id))
 
+    @app.get("/api/runs/{run_id}/followup/workers")
+    async def get_followup_workers(run_id: str) -> Any:
+        from muteki.solver.followup_profiles import participating_workers
+        run = app.state.manager.get(run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail="unknown run")
+        return {"workers": await participating_workers(run)}
+
     @app.get("/api/runs/{run_id}/btw/history")
     async def get_btw_history(run_id: str) -> Any:
         history = _btw_history(run_id)
@@ -386,7 +394,7 @@ def register(app: FastAPI) -> None:
             return JSONResponse({"error": "empty question"}, status_code=400)
         # History is server-owned; stale client transcripts cannot undo deletion.
         history = _btw_history(run_id)
-        transcript = await run_blocking(history.transcript, max_chars=24000)
+        transcript = await run_blocking(history.transcript)
         context_hint = str(body.get("context_hint") or "")
 
         mgr: RunManager = app.state.manager
@@ -419,17 +427,20 @@ def register(app: FastAPI) -> None:
 
         winner = mgr.load_winner_continuation(run_id)
         wc = mgr.worker_config.resolve(challenge_category)
-        worker_profiles = wc.get("worker_profiles") or []
         worker_network = str(wc.get("worker_network") or "bridge")
 
-        from muteki.solver.followup_profiles import select_btw_profile
+        from muteki.solver.followup_profiles import select_btw_profile, participating_workers
         try:
-            profile = select_btw_profile(wc, winner, str(body.get("profile") or body.get("engine") or "").strip())
+            profile = select_btw_profile(wc, winner, str(body.get("worker_id") or body.get("profile") or body.get("engine") or "").strip(),
+                                         participants=await participating_workers(run))
         except ValueError as exc:
-            return JSONResponse({"error": str(exc)}, status_code=400)
+            return JSONResponse({"error": str(exc), "code": getattr(exc, "code", "followup.worker_unavailable")}, status_code=400)
+        from muteki.solver.followup_report import ObserverCapabilityError
+        try:
+            driver_for(profile).build_observer_input("")
+        except ObserverCapabilityError as exc:
+            return JSONResponse({"error": str(exc), "code": exc.code}, status_code=400)
         transport = base_engine_for_profile(profile)
-        if transport not in {"codex", "claude"}:
-            return JSONResponse({"error": "BTW 只读问答目前支持 Codex / Claude，请选择对应 Profile"}, status_code=400)
 
         async def stream():
             worker_backend = resolve_worker_backend(
@@ -509,13 +520,15 @@ def register(app: FastAPI) -> None:
                     await run_blocking(acquire_container)
                     await run_blocking(_chown_tree_to_worker, str(workdir))
 
-                from muteki.solver.followup_report import question_prompt
+                from muteki.solver.followup_report import question_prompt, evidence_reference
                 snapshot = await run_blocking(build_btw_context_sync,
                     graph_db_path=str(graph_db), jsonl_path=str(jsonl_path),
                     challenge_id=run_id, challenge_name=challenge_name,
                     challenge_category=challenge_category, run_meta=meta)
-                prompt = question_prompt(question, snapshot,
-                    transcript=transcript, context_hint=context_hint)
+                records = await run_blocking(evidence_reference, json.dumps({"records": snapshot, "history": transcript}, ensure_ascii=False),
+                    workdir, container=container, source_root=root)
+                prompt = question_prompt(question, records,
+                    context_hint=context_hint)
                 worker_env = await run_blocking(_standby_worker_env,
                     root=root,
                     label=f"btw-{transport}-{request_id}",
@@ -578,7 +591,8 @@ def register(app: FastAPI) -> None:
             except Exception as e:  # noqa: BLE001
                 history_status = "failed"
                 diagnose({"phase": "http_error", "error_type": type(e).__name__, "sent_chars": sent_chars})
-                yield {"data": json.dumps({"error": f"BTW Worker 失败 ({type(e).__name__})，诊断编号：{diagnostic_id}"}, ensure_ascii=False)}
+                yield {"data": json.dumps({"error": f"BTW Worker 失败 ({type(e).__name__})，诊断编号：{diagnostic_id}",
+                    "code": getattr(e, "code", "followup.worker_failed")}, ensure_ascii=False)}
             finally:
                 import anyio
                 with anyio.CancelScope(shield=True):

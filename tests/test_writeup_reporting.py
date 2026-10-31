@@ -22,14 +22,14 @@ class WriteupReportingTest(unittest.IsolatedAsyncioTestCase):
             task_file.write_text('original')
             _, call = await self.run_report(worker)
             self.assertNotEqual(Path(call.kwargs['cwd']), self.root)
-            self.assertIn('禁止执行命令', call.kwargs['stdin_text'])
+            self.assertIn('禁止修改任务文件', call.kwargs['stdin_text'])
             worker._write_board_file.assert_not_called()
             worker._board_context.assert_not_called()
             self.assertEqual(task_file.read_text(), 'original')
             if engine == 'claude':
-                self.assertEqual(call.args[0][call.args[0].index('--tools') + 1], '')
+                self.assertEqual(call.args[0][call.args[0].index('--tools') + 1], 'Read,Grep,Glob')
             else:
-                self.assertIn('features.shell_tool=false', call.args[0])
+                self.assertIn('features.apply_patch_freeform=false', call.args[0])
 
     def test_direct_ask_resume_attempt_is_converted_to_fresh_observation(self):
         worker = self.worker(action='ask')
@@ -37,7 +37,7 @@ class WriteupReportingTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('resume', argv)
         self.assertNotIn('old-solve-session', argv)
         self.assertEqual(argv.session, '')
-        self.assertIn('features.shell_tool=false', argv)
+        self.assertIn('features.apply_patch_freeform=false', argv)
 
     def test_ask_does_not_stage_mutation_skills(self):
         worker = self.worker(action='ask')
@@ -67,7 +67,8 @@ class WriteupReportingTest(unittest.IsolatedAsyncioTestCase):
                       'task_status': {'solved': solved, 'finished': finished}},
             found_flags=list(flags))
         worker.shared_graph = Mock()
-        worker.shared_graph.to_summary.return_value = '已确认：接口返回 403。尚未验证绕过假设。'
+        worker.shared_graph.snapshot.return_value = Challenge(id='test', name='接口返回 403', category='web')
+        worker.shared_graph.events.return_value = [{'seq': 1, 'payload': {'fact': '接口返回 403'}}]
         worker._emit = AsyncMock()
         worker._write_board_file = Mock()
         worker._board_context = Mock(return_value='SOLVE-ONLY: query the LIVE board and write-fact')
@@ -81,7 +82,10 @@ class WriteupReportingTest(unittest.IsolatedAsyncioTestCase):
     async def run_report(self, worker):
         try:
             result = await worker._run_respond()
-            return result, worker._run_invocation.call_args
+            call = worker._run_invocation.call_args
+            evidence = Path(call.kwargs['cwd']) / 'followup-records.json'
+            self.evidence = evidence.read_text()
+            return result, call
         finally:
             if getattr(worker, '_owned_scratch', None):
                 shutil.rmtree(worker._owned_scratch, ignore_errors=True)
@@ -95,8 +99,8 @@ class WriteupReportingTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(result.flag)
         self.assertFalse(result.solved)
         self.assertIsNone(result.session)
-        self.assertIn('尚未获得 Flag，未解决', prompt)
-        self.assertIn('接口返回 403', prompt)
+        self.assertIn('尚未获得 Flag，未解决', self.evidence)
+        self.assertIn('接口返回 403', self.evidence)
         self.assertIn('建议下一步（仅建议，不执行）', prompt)
         self.assertNotIn('SOLVE-ONLY', prompt)
         self.assertNotIn('old-solve-session', argv)
@@ -105,38 +109,38 @@ class WriteupReportingTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(call.kwargs['cwd'], str(self.root))
         worker._board_context.assert_not_called()
         worker._write_board_file.assert_not_called()
-        worker.shared_graph.to_summary.assert_called_once()
+        worker.shared_graph.snapshot.assert_called_once()
         self.assertEqual(worker._already_found, set())
 
     async def test_completed_report_uses_accepted_flags(self):
         worker = self.worker(flags=['flag{synthetic}'], solved=True)
         _, call = await self.run_report(worker)
-        self.assertIn('已解决', call.kwargs['stdin_text'])
-        self.assertIn('flag{synthetic}', call.kwargs['stdin_text'])
+        self.assertIn('已解决', self.evidence)
+        self.assertIn('flag{synthetic}', self.evidence)
         self.assertEqual(worker._already_found, {'flag{synthetic}'})
 
     async def test_partial_flags_are_not_a_completed_solve(self):
         worker = self.worker(flags=['flag{one}'])
         worker.challenge.expected_flags = 2
         _, call = await self.run_report(worker)
-        self.assertIn('已有部分 Flag，任务尚未确认解决', call.kwargs['stdin_text'])
-        self.assertIn('"目标 Flag 数": 2', call.kwargs['stdin_text'])
+        self.assertIn('已有部分 Flag，任务尚未确认解决', self.evidence)
+        self.assertIn('"目标 Flag 数": 2', __import__('json').loads(self.evidence)['status'])
 
     async def test_live_task_uses_same_observational_report(self):
         worker = self.worker(finished=False)
         _, call = await self.run_report(worker)
-        self.assertIn('"任务已结束": false', call.kwargs['stdin_text'])
-        self.assertEqual(worker.shared_graph.method_calls[0][0], 'to_summary')
-        self.assertEqual(len(worker.shared_graph.method_calls), 1)
+        self.assertIn('"任务已结束": false', __import__('json').loads(self.evidence)['status'])
+        self.assertEqual(worker.shared_graph.method_calls[0][0], 'snapshot')
+        self.assertEqual(len(worker.shared_graph.method_calls), 2)
 
     async def test_container_report_scratch_stays_inside_mount(self):
         worker = self.worker()
-        worker.container = SimpleNamespace(image='synthetic-container')
+        worker.container = SimpleNamespace(image='synthetic-container', to_container_path=lambda path: path)
         with patch('muteki.solver.container_exec._chown_tree_to_worker') as chown:
             _, call = await self.run_report(worker)
         cwd = Path(call.kwargs['cwd'])
         self.assertEqual(cwd.parent, self.root)
-        chown.assert_called_once_with(str(cwd), image='synthetic-container')
+        chown.assert_called_with(str(cwd), image='synthetic-container')
         self.assertFalse(cwd.exists())
 
     def test_missing_status_is_not_assumed_solved(self):
@@ -147,20 +151,20 @@ class WriteupReportingTest(unittest.IsolatedAsyncioTestCase):
     def test_inconsistent_historical_solved_bit_does_not_invent_a_flag(self):
         self.assertIn('尚未获得 Flag，未解决', followup_status(self.worker(solved=True)))
 
-    def test_unavailable_snapshot_is_reported_without_fallback_investigation(self):
+    def test_unavailable_snapshot_has_typed_error_without_fallback(self):
+        from muteki.solver.followup_report import EvidenceReadError
         worker = self.worker()
-        worker.shared_graph.to_summary.side_effect = RuntimeError('fictional-private-error')
-        prompt = report_snapshot(worker)
-        self.assertIn('资料缺失', prompt)
-        self.assertNotIn('fictional-private-error', prompt)
+        worker.shared_graph.snapshot.side_effect = OSError('private detail')
+        with self.assertRaises(EvidenceReadError) as caught:
+            report_snapshot(worker)
+        self.assertEqual(caught.exception.code, 'followup.evidence_unreadable')
+        self.assertNotIn('private detail', str(caught.exception))
         worker._board_context.assert_not_called()
 
-    def test_snapshot_is_bounded_and_truncation_disclosed(self):
+    def test_evidence_is_complete_beyond_old_summary_limits(self):
         worker = self.worker()
-        worker.shared_graph.to_summary.return_value = 'x' * 100000
-        prompt = report_snapshot(worker)
-        self.assertLess(len(prompt), 50000)
-        self.assertIn('快照已截断', prompt)
+        worker.shared_graph.events.return_value = [{'payload': {'fact': 'x' * 100000 + 'last-evidence'}}]
+        self.assertIn('last-evidence', report_snapshot(worker))
 
     def test_codex_report_restricts_commands_and_preserves_provider(self):
         worker = self.worker()
@@ -169,8 +173,8 @@ class WriteupReportingTest(unittest.IsolatedAsyncioTestCase):
                                                'OPENAI_BASE_URL': 'https://synthetic.invalid/v1'})
         self.assertIn('model_providers.muteki.base_url=https://synthetic.invalid/v1', argv)
         self.assertIn('fake-report-model', argv)
-        self.assertIn('features.shell_tool=false', argv)
-        self.assertIn('features.code_mode=false', argv)
+        self.assertIn('features.apply_patch_freeform=false', argv)
+        self.assertIn('code_mode', argv)
         self.assertIn('web_search="disabled"', argv)
         self.assertIn('--ignore-user-config', argv)
         self.assertIn('approval_policy="never"', argv)
@@ -185,7 +189,7 @@ class WriteupReportingTest(unittest.IsolatedAsyncioTestCase):
     def test_claude_report_has_no_tools_or_mcp(self):
         worker = self.worker(engine='claude')
         argv, _ = worker._execute_invocation('Synthetic report', None)
-        self.assertEqual(argv[argv.index('--tools') + 1], '')
+        self.assertEqual(argv[argv.index('--tools') + 1], 'Read,Grep,Glob')
         self.assertIn('--strict-mcp-config', argv)
         self.assertEqual(argv.count('--no-session-persistence'), 1)
         self.assertIn('fake-report-model', argv)
@@ -198,23 +202,30 @@ class WriteupReportingTest(unittest.IsolatedAsyncioTestCase):
             worker.mode = 'bootstrap'
             argv, _ = worker._execute_invocation('Ordinary worker', None)
             self.assertIn(flag, argv)
-            self.assertNotIn('features.shell_tool=false', argv)
+            self.assertNotIn('features.apply_patch_freeform=false', argv)
             self.assertNotIn('--tools', argv)
 
     async def test_ask_sees_flag_state_without_restoring_solve_session(self):
         for flags, expected in [((), '尚未获得 Flag'), (('flag{one}',), '已有部分 Flag')]:
             worker = self.worker(action='ask', flags=flags)
             _, call = await self.run_report(worker)
-            self.assertIn(expected, call.kwargs['stdin_text'])
+            self.assertIn(expected, self.evidence)
             self.assertNotIn('old-solve-session', call.args[0])
             worker._board_context.assert_not_called()
-            self.assertIn('features.shell_tool=false', call.args[0])
+            self.assertIn('features.apply_patch_freeform=false', call.args[0])
 
-    def test_unsupported_report_engine_fails_before_launch(self):
+    def test_cursor_uses_native_read_only_mode(self):
         worker = self.worker(engine='cursor')
-        with self.assertRaisesRegex(RuntimeError, 'restricted Writeup'):
+        argv, body = worker._execute_invocation('Synthetic report', None)
+        self.assertEqual(argv[argv.index('--mode') + 1], 'ask')
+        self.assertNotIn('--force', argv)
+        self.assertEqual(body, 'Synthetic report')
+
+    def test_missing_read_only_capability_fails_explicitly(self):
+        from muteki.solver.followup_report import ObserverCapabilityError
+        worker = self.worker(engine='devin')
+        with self.assertRaises(ObserverCapabilityError):
             worker._execute_invocation('Synthetic report', None)
-        worker._run_invocation.assert_not_called()
 
     def test_report_environment_has_no_solve_skills_or_board_access(self):
         worker = self.worker()
@@ -244,14 +255,14 @@ class WriteupReportingTest(unittest.IsolatedAsyncioTestCase):
     def test_case_insensitive_action_cannot_bypass_report_restrictions(self):
         worker = self.worker(action='WRITEUP')
         argv, _ = worker._execute_invocation('Synthetic report', None)
-        self.assertIn('features.shell_tool=false', argv)
+        self.assertIn('features.apply_patch_freeform=false', argv)
         self.assertNotIn('--dangerously-bypass-approvals-and-sandbox', argv)
 
     def test_mark_false_keeps_real_solve_capabilities(self):
         worker = self.worker(action='mark_false')
         argv, _ = worker._execute_invocation('Reopen rejected flag', None)
         self.assertIn('--dangerously-bypass-approvals-and-sandbox', argv)
-        self.assertNotIn('features.shell_tool=false', argv)
+        self.assertNotIn('features.apply_patch_freeform=false', argv)
 
 
 if __name__ == '__main__':

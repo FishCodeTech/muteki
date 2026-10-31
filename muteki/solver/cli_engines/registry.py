@@ -159,6 +159,10 @@ class ProfileDriver(CliDriver):
             stream=stream, launch=launch)
         return self._with_profile_options(argv), stdin_text
 
+    def build_observer_input(self, prompt: str) -> tuple[list[str], str]:
+        argv, body = self.base.build_observer_input(prompt)
+        return self._with_profile_options(argv), body
+
     def secure_prompt_preflight(self) -> "tuple[bool, str]":
         return self.base.secure_prompt_preflight()
 
@@ -325,6 +329,10 @@ class EndpointDriver(CliDriver):
             self.base.build_execute(
                 prompt, session, web_access=web_access,
                 kb_access=kb_access, stream=stream, launch=launch)))
+
+    def build_observer_input(self, prompt: str) -> tuple[list[str], str]:
+        argv, body = self.base.build_observer_input(prompt)
+        return self._with_profile_options(self._inject_before_exec(argv)), body
 
     def build_execute_stdin(
         self, prompt: str, session: Optional[str], *,

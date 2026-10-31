@@ -1299,12 +1299,17 @@ async def _run_respond(self) -> SolveOutcome:
     elif action == "writeup":
         if str(getattr(self.challenge, "mode", "ctf")) == "pentest":
             raise RuntimeError("Pentest reports are generated from the shared graph; use the Pentest report endpoint")
-        from muteki.solver.followup_report import report_snapshot
-        prompt = _RESPOND_WRITEUP_PROMPT + await asyncio.to_thread(report_snapshot, self)
-    elif action == "ask":
-        from muteki.solver.followup_report import question_prompt, report_snapshot
+        from muteki.solver.followup_report import report_snapshot, evidence_reference, question_prompt
         snapshot = await asyncio.to_thread(report_snapshot, self)
-        prompt = question_prompt(text, snapshot)
+        records = await asyncio.to_thread(evidence_reference, snapshot, wd,
+            container=self.container, source_root=self._workdir)
+        prompt = _RESPOND_WRITEUP_PROMPT + question_prompt("根据完整记录生成复盘报告", records)
+    elif action == "ask":
+        from muteki.solver.followup_report import report_snapshot, evidence_reference, question_prompt
+        snapshot = await asyncio.to_thread(report_snapshot, self)
+        records = await asyncio.to_thread(evidence_reference, snapshot, wd,
+            container=self.container, source_root=self._workdir)
+        prompt = question_prompt(text, records)
     else:  # execution guidance retains its existing behavior
         question = text or "(no question text)"
         if action == "redirect":

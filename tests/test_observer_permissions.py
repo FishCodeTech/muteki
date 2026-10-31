@@ -79,11 +79,11 @@ class ObserverPermissionsTest(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn('--dangerously-bypass-approvals-and-sandbox', argv)
                 self.assertNotIn('--dangerously-skip-permissions', argv)
                 if engine == 'codex':
-                    self.assertIn('features.shell_tool=false', argv)
+                    self.assertIn('features.apply_patch_freeform=false', argv)
                     self.assertIn('--ignore-user-config', argv)
                     self.assertEqual(argv[argv.index('--sandbox') + 1], 'read-only')
                 else:
-                    self.assertEqual(argv[argv.index('--tools') + 1], '')
+                    self.assertEqual(argv[argv.index('--tools') + 1], 'Read,Grep,Glob')
                     self.assertIn('--strict-mcp-config', argv)
                 return CliResult(text='Only existing records are available', returncode=0)
             with patch('muteki.solver.cli_driver.run_cli_streaming', runner), \
@@ -95,12 +95,26 @@ class ObserverPermissionsTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(chunks, ['Only existing records are available'])
 
     def test_unknown_engine_never_falls_back_to_unrestricted_execution(self):
-        driver = Mock(name='unrestricted-driver')
-        driver.name = 'unsupported'
-        with self.assertRaisesRegex(RuntimeError, 'restricted Ask/BTW/Writeup'):
+        driver = driver_for('devin')
+        with self.assertRaisesRegex(RuntimeError, '只读问答模式'):
             build_observer_input(driver, 'question')
-        driver.build_execute.assert_not_called()
-        driver.build_execute_stdin.assert_not_called()
+
+    def test_native_read_only_adapters_preserve_profile_model_and_stdin(self):
+        expected = {'codex': '--sandbox', 'claude': '--tools', 'cursor': '--mode',
+                    'grok': '--tools', 'pi': '--tools', 'omp': '--tools',
+                    'droid': '--only-tools', 'opencode': 'OPENCODE_CONFIG_CONTENT=', 'zcode': '--mode'}
+        for engine, marker in expected.items():
+            with self.subTest(engine=engine):
+                driver = driver_for({'id': 'participant', 'engine': engine, 'model': 'recorded-model'})
+                argv, body = build_observer_input(driver, 'exact question')
+                self.assertEqual(body, 'exact question')
+                self.assertNotIn(body, argv)
+                if engine != 'zcode':  # ZCode receives its selected model via the credential config.
+                    self.assertIn('recorded-model', str(argv))
+                self.assertTrue(any(arg.startswith(marker) for arg in argv))
+                for bypass in ('--force', '--dangerously-skip-permissions',
+                               '--dangerously-bypass-approvals-and-sandbox', '--skip-permissions-unsafe', '--auto'):
+                    self.assertNotIn(bypass, argv)
 
     def test_question_exact_bytes_survive_delivery_manifest(self):
         question = '解释 "flag"\n不要执行任何动作'
@@ -111,7 +125,7 @@ class ObserverPermissionsTest(unittest.IsolatedAsyncioTestCase):
             graph = Path(temp) / 'shared_graph.db'
             result = build_btw_context_sync(graph_db_path=str(graph), challenge_id='test',
                 challenge_name='test', challenge_category='web', run_meta={'solved': False})
-            self.assertIn('尚未建立', result)
+            self.assertIsNone(__import__('json').loads(result)['evidence'])
             self.assertFalse(graph.exists())
 
     def test_snapshot_failure_does_not_open_graph_for_writing(self):
@@ -119,9 +133,9 @@ class ObserverPermissionsTest(unittest.IsolatedAsyncioTestCase):
             graph = Path(temp) / 'shared_graph.db'
             graph.write_bytes(b'Synthetic malformed database')
             before = graph.read_bytes()
-            with patch('muteki.swarm.shared_graph.SQLiteSharedGraph.open') as writable:
+            from muteki.solver.followup_report import EvidenceReadError
+            with self.assertRaises(EvidenceReadError), patch('muteki.swarm.shared_graph.SQLiteSharedGraph.open') as writable:
                 result = build_btw_context_sync(graph_db_path=str(graph), challenge_id='test',
                     challenge_name='test', challenge_category='web', run_meta={})
-            self.assertTrue('暂时不可读' in result or '读取失败' in result)
             self.assertEqual(graph.read_bytes(), before)
             writable.assert_not_called()
