@@ -233,7 +233,7 @@ if [ "$backend" = local ] || [ "$backend" = both ]; then
   }
   install_npm_engine claude '@anthropic-ai/claude-code@2.1.257'
   install_npm_engine codex '@openai/codex@0.146.0'
-  install_npm_engine pi '@earendil-works/pi-coding-agent@0.84.1'
+  install_npm_engine pi '@earendil-works/pi-coding-agent@1.5.1'
   install_npm_engine kimi '@moonshot-ai/kimi-code@0.40.1'
   install_npm_engine opencode '@opencode/cli@2.0.26'
 
