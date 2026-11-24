@@ -1,0 +1,38 @@
+.run-side-slot {
+  position: relative;
+  flex: 0 0 auto;
+  display: flex;
+  width: var(--run-side-width, 480px);
+  min-width: 0;
+  min-height: 0;
+  border-left: 1px solid var(--line);
+  background: var(--bg);
+}
+.run-side-left .run-side-slot { order: -1; border-left: 0; border-right: 1px solid var(--line); }
+.convo.run-side-open.has-inspector .convo-mainpane { max-width: none; }
+.convo.run-side-open .convo-mainpane { min-width: 0; }
+
+.run-side-max .run-side-slot,
+.run-side-only .run-side-slot { flex: 1 1 auto; width: auto; border-left: 0; border-right: 0; }
+.run-side-max .convo-mainpane,
+.run-side-max .convo-runtime-peer,
+.run-side-only .convo-mainpane,
+.run-side-only .convo-runtime-peer { display: none !important; }
+.run-side-main-only .run-side-slot { display: none; }
+
+.run-side-switch {
+  display: flex;
+  justify-content: center;
+  flex: none;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg);
+}
+
+.run-side-panel { --cx-header-h: 0px; }
+.run-side-panel .cx-context-strip { display: none; }
+
+:root[data-run-side-popout="true"] .workspace-frame { grid-template-columns: minmax(0, 1fr); }
+:root[data-run-side-popout="true"] .workspace-activity-rail,
+:root[data-run-side-popout="true"] .workspace-rail-control { display: none !important; }
+.workspace-frame-content > .run-side-window { height: 100%; }

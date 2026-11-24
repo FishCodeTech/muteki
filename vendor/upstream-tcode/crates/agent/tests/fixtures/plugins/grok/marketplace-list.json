@@ -1,0 +1,17 @@
+[
+  {
+    "name": "mkt",
+    "kind": "local",
+    "source": {
+      "path": "/tmp/tcode-probe-grok/mkt"
+    }
+  },
+  {
+    "name": "tools",
+    "kind": "git",
+    "source": {
+      "url": "file:///tmp/tcode-probe-grok/tools",
+      "branch": null
+    }
+  }
+]

@@ -1,0 +1,61 @@
+# CTF 拿到命令执行 (RCE) / 任意文件读取 (LFI) / 内网入口后的找 Flag 清单
+# 适用场景：已打通 RCE、SSTI、LFI、SQLi 读文件或内网 SSRF，但直接读 /flag 未命中或拿到假 Flag 时按顺序排查。
+
+## 1. 最优先检查：进程环境变量与容器单文件挂载（最高发且最易漏）
+# 出题人常把真 Flag 放进容器启动进程环境变量，或用 Docker 单文件 bind-mount 挂到随机路径：
+/proc/1/environ             # 容器 1 号进程环境变量（用 tr '\0' '\n' 查看）
+/proc/self/environ          # 当前 Web 进程环境变量
+/proc/self/mountinfo        # 详细挂载源信息（直接暴露宿主机单文件挂载到容器内的真实随机路径！）
+/proc/mounts                # 挂载点列表
+/proc/1/cmdline             # 1 号进程启动参数（tr '\0' ' ' 查看）
+/proc/self/cmdline          # 当前进程启动参数
+/proc/self/cwd/flag         # 当前工作目录下的 flag
+
+# 常用一键命令（RCE 场景）：
+#   env; printenv; cat /proc/1/environ /proc/self/environ 2>/dev/null | tr '\0' '\n'
+#   cat /proc/self/mountinfo /proc/mounts
+#   grep -a -r -i 'flag' /proc/*/environ 2>/dev/null | tr '\0' '\n'
+
+## 2. 常见固定文件与目录
+/flag
+/flag.txt
+/flag.php
+/flag_is_here
+/flag/flag.txt
+/root/flag
+/root/flag.txt
+/home/ctf/flag.txt
+/tmp/flag.txt
+/opt/flag.txt
+/srv/flag.txt
+/var/flag.txt
+/run/secrets/flag
+/f1ag
+/FLAG
+/get_flag
+/readflag
+
+## 3. 数据库与家目录凭据横向（拿到 SQLi 文件读或低权限 Shell 时）
+# 若外层库只有 decoy flag 或空表，真 Flag 往往在同机另一数据库实例或内网库：
+/var/lib/postgresql/                        # PG 家目录常藏内网凭据（如 vault_credentials.conf、.pgpass、.psql_history）
+/var/lib/postgresql/vault_credentials.conf
+/var/lib/postgresql/.pgpass
+/root/.my.cnf
+/var/www/html/.env
+/app/.env
+# 拿到内网 PG 凭据后，可用 dblink 或 COPY ... FROM PROGRAM 'PGPASSWORD=... psql -h <内网IP> ...' 横向读取。
+
+## 4. 内网微服务与双层 REST 路由（SSRF / 内网横向场景）
+# 当发现内网 HTTP 服务（如 :5000 / :8000 / :8080）访问 /health 返回 200，但单层路径 (/flag, /api, /v1) 返回 404 时：
+# 不要误判为空壳服务！优先探测双层 REST 路径 /<noun>/<verb>（已内置于 /usr/share/wordlists/ctf-micro/paths.txt）：
+#   /entry/flag, /entry/list, /api/entry/flag, /api/v1/flag, /internal/flag, /admin/flag
+
+## 5. 提权与特权读取（当 /flag 权限为 0400 root:root 且当前为低权限用户时）
+#   find / -perm -4000 -type f 2>/dev/null      # 检查 SUID 二进制（如 /readflag、python、find、perl）
+#   getcap -r / 2>/dev/null                     # 检查 Linux Capabilities（如 cap_dac_read_search）
+#   sudo -l                                     # 检查免密 sudo 规则
+#   crontab -l; cat /etc/crontab /etc/cron*/*   # 检查 root 定时任务执行的可写脚本
+
+## 6. 随机文件名全盘快速检索
+#   find / -maxdepth 3 -iname '*flag*' 2>/dev/null
+#   ls -la / /root /home /tmp /opt /srv /var/www 2>/dev/null

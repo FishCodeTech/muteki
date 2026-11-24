@@ -1,0 +1,49 @@
+[workspace]
+members = [
+    "crates/agent",
+    "crates/core",
+    "crates/protocol",
+    "crates/client",
+    "crates/traverse",
+    "crates/traverse-server",
+    "crates/headless",
+    "crates/web",
+    "crates/services",
+    "crates/runtime",
+    "crates/term",
+    "crates/mcp-host",
+    "crates/preview-mcp",
+    "crates/pull-request-mcp",
+    "crates/orchestrate-mcp",
+    "crates/control-mcp",
+    "crates/computer-use-mcp",
+    "crates/ui",
+    "crates/app",
+    "crates/ios",
+    "crates/platform/gpui-ios",
+    "crates/platform/frame-pacing",
+    "crates/platform/touch",
+    "crates/android",
+]
+exclude = [
+    "crates/platform/gpui-android",
+]
+resolver = "3"
+default-members = ["crates/app"]
+
+# opt-level 3 stays the shipping default on every platform, including the
+# Android APK, although `s`/`z` produce a smaller library: `z` worsened tail
+# frame pacing on a phone and neither was measured on markdown, highlighting or
+# large conversation replay.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+panic = "unwind"
+
+# ndk-stack needs an unstripped library with line information for crash reports.
+[profile.android-release]
+inherits = "release"
+strip = false
+debug = 1

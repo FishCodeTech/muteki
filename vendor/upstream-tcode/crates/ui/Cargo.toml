@@ -1,0 +1,192 @@
+[package]
+name = "tcode-ui"
+version = "0.1.0"
+edition = "2024"
+
+[package.metadata.cargo-machete]
+# Only unifies the gpui-fast feature required by gpui-webview.
+ignored = ["gpui-kit"]
+
+[features]
+default = ["remote", "desktop"]
+# Hosting this machine: the Traverse endpoint, minted invitations and
+# device revocation. Off for wasm targets, which cannot listen or advertise.
+# Client pairing (saved hosts, the pair form, authentication repair) is *not* here:
+# it is shared UI over `tcode_client` and compiles everywhere.
+remote-hosting = ["dep:tcode-traverse", "tcode-traverse/native"]
+# Transitional alias for the pre-split feature name.
+remote = ["remote-hosting"]
+# Aggregate of the narrow native capabilities the desktop binary ships. It gates
+# no product view: every surface below compiles without any of these.
+desktop = [
+    "native-dialogs",
+    "native-preview",
+    "voice",
+    "local-permissions",
+    "pasteboard-image",
+]
+# GPUI's platform file dialogs (`prompt_for_paths` / `prompt_for_new_path`).
+# Guards only the Browse and Save-to-disk actions.
+native-dialogs = []
+# Embedded webview preview backend. Available on macOS, Windows, Linux (X11), Android and iOS; the panel,
+# its URL field, open-externally and copy-URL are always compiled.
+native-preview = [
+    "dep:tcode-traverse",
+    "tcode-traverse/native",
+    "dep:gpui-android",
+    "dep:gpui-webview",
+    "dep:gpui-kit",
+    "dep:wry",
+    "dep:preview-mcp",
+    "dep:async-lock",
+    "dep:objc2-core-foundation",
+    "dep:objc2-core-graphics",
+    "dep:objc2-image-io",
+    "dep:objc2-web-kit",
+    "dep:objc2-ui-kit",
+    "dep:block2",
+    "dep:objc2-foundation",
+    "dep:webview2-com",
+    "dep:webkit2gtk",
+    "dep:gdk",
+    "dep:windows-core",
+    "dep:tempfile",
+]
+# System dictation in the composer, including ClientHost recognizers.
+voice = ["tcode-client/voice"]
+# macOS TCC permission status, grant and relaunch for a *local* attachment.
+local-permissions = ["dep:computer-use-mcp"]
+# Reading an image off the macOS AppKit pasteboard.
+pasteboard-image = ["dep:objc2-foundation"]
+
+[dependencies]
+url = "2"
+percent-encoding = "2"
+agent = { path = "../agent", default-features = false }
+tcode-client = { path = "../client" }
+tcode-core = { path = "../core", default-features = false }
+tcode-protocol = { path = "../protocol", default-features = false }
+qrcode = { version = "0.14", default-features = false }
+gpui = { package = "gpui-fast", version = "0.1.10", default-features = false }
+gpui-base = { version = "0.8.0", features = ["gpui-fast"] }
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "tiff"] }
+base64 = "0.23"
+async-channel = "2"
+chrono = "0.4"
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+futures-lite = "2"
+rushdown = "0.18.0"
+# Pure-Rust Mermaid layout; the SVG it emits goes through GPUI's own image pipeline.
+mermaid-rs-renderer = { version = "0.3.1", default-features = false }
+rust-i18n = "4"
+sys-locale = "0.3"
+syntect = { version = "5.3.0", default-features = false, features = ["parsing", "regex-fancy", "dump-load"] }
+imara-diff = "0.2"
+similar = { version = "3.2", features = ["unicode"] }
+unicode-segmentation = "1"
+unicode-width = "0.2"
+latex-rust = "3.0.1"
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+web-time = "1"
+
+# tcode-traverse reaches iroh, tokio's net stack and platform system calls,
+# none of which build for wasm32-unknown-unknown. Declaring the dependency
+# per-target keeps the browser green even if a wasm-facing crate turns a
+# feature on. `fast-apple-datapath` is the binary's decision (desktop on,
+# iOS off), so it is left to the composition roots.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+tcode-traverse = { path = "../traverse", default-features = false, optional = true }
+reqwest-client = { package = "gpui-pre-reqwest-client", version = "=0.3.9" }
+# Android apps do not have the Unix certificate files used by native-roots discovery.
+reqwest = { package = "gpui-pre-reqwest", version = "=0.12.15", default-features = false, features = ["rustls-tls-webpki-roots"] }
+
+# The preview backend exists only where a system webview can be embedded as a
+# child of the GPUI window, so its whole dependency set is target-scoped.
+[target.'cfg(any(target_os = "macos", target_os = "windows", target_os = "linux", target_os = "ios"))'.dependencies]
+gpui-kit = { version = "0.8.0", default-features = false, features = ["gpui-fast"], optional = true }
+gpui-webview = { version = "0.8.0", features = ["gpui-fast"], optional = true }
+wry = { version = "0.53.3", package = "lb-wry", features = ["mac-proxy"], optional = true }
+raw-window-handle = { version = "0.6", features = ["std"] }
+# Only the Windows WebContext needs it, but Cargo has no per-feature target
+# narrower than this.
+async-lock = { version = "3", optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+computer-use-mcp = { path = "../computer-use-mcp", optional = true }
+block2 = { version = "0.6.2", optional = true }
+objc2 = "0.6.4"
+objc2-app-kit = { version = "0.3.2", features = ["NSAppearance", "NSGraphics", "NSGraphicsContext", "NSImage", "NSImageRep", "NSPasteboard", "NSResponder", "NSGlassEffectView", "NSView", "NSWindow", "objc2-core-graphics"] }
+objc2-foundation = { version = "0.3.2", features = ["NSDictionary", "NSError", "NSString", "NSURLError", "NSURLRequest", "block2"], optional = true }
+
+# The WKWebView snapshot backend, the navigation delegates that remote routing
+# installs and the load-error observer patches, and the iOS frame.
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies.objc2-core-foundation]
+version = "0.3.2"
+features = ["CFCGTypes", "CFData", "CFString"]
+optional = true
+
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies.objc2-core-graphics]
+version = "0.3.2"
+default-features = false
+features = ["std", "CGImage"]
+optional = true
+
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies.objc2-image-io]
+version = "0.3.2"
+features = ["CGImageDestination"]
+optional = true
+
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies.objc2-web-kit]
+version = "0.3.2"
+features = ["WKNavigationDelegate", "WKNavigationAction", "WKFrameInfo", "WKSnapshotConfiguration", "WKWebView"]
+optional = true
+
+# The WebKitGTK load-failure signals behind `preview_status.load_error`. Pinned
+# to the version lb-wry resolves, so both drive the same WebKit objects.
+[target.'cfg(target_os = "linux")'.dependencies]
+webkit2gtk = { version = "=2.0.1", optional = true }
+# The X error trap that keeps a released webview from exiting the process.
+gdk = { version = "0.18.2", optional = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+tempfile = { version = "3", optional = true }
+# Pinned to the version lb-wry resolves, so both drive the same WebView2 objects.
+webview2-com = { version = "0.38.2", optional = true }
+windows-core = { version = "0.61", optional = true }
+
+[dev-dependencies]
+criterion = "0.8"
+gpui = { package = "gpui-fast", version = "0.1.10", default-features = false, features = ["test-support"] }
+gpui_platform = { package = "gpui-fast-platform", version = "0.1.10", features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
+smol = "2"
+tcode-runtime = { path = "../runtime", features = ["test-support"] }
+# dump-create is only needed by examples/sanitize_syntaxes.rs and the syntax-set
+# regression test; the shipped binary keeps the lean dependency feature set.
+syntect = { version = "5.3.0", default-features = false, features = ["parsing", "regex-fancy", "dump-load", "dump-create"] }
+
+# Test fixtures build real session stores and a real native client host; neither
+# is reachable from the shipped library.
+[target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
+tcode-traverse = { path = "../traverse", features = ["native"] }
+tcode-services = { path = "../services" }
+
+[[bench]]
+name = "markdown_perf"
+harness = false
+
+[target.'cfg(any(target_os = "macos", target_os = "windows", target_os = "linux", target_os = "android", target_os = "ios"))'.dependencies]
+preview-mcp = { path = "../preview-mcp", optional = true }
+
+[target.'cfg(target_os = "android")'.dependencies]
+gpui-android = { path = "../platform/gpui-android", optional = true }
+futures = "0.3"
+
+[target.'cfg(target_os = "ios")'.dependencies]
+gpui-ios = { path = "../platform/gpui-ios" }
+objc2 = "0.6.4"
+objc2-foundation = { version = "0.3.2", features = ["NSError", "NSString", "NSURL", "NSURLError", "NSURLRequest", "block2"], optional = true }
+objc2-ui-kit = { version = "0.3.2", default-features = false, features = ["std", "bitflags", "UIImage", "UIResponder", "UIView", "objc2-core-foundation", "objc2-core-graphics"], optional = true }
+block2 = { version = "0.6.2", optional = true }

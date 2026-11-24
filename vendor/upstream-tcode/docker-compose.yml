@@ -1,0 +1,44 @@
+services:
+  tcode:
+    # Pin TCODE_VERSION in .env to a release. TCODE_IMAGE names a local build
+    # instead (docs/docker.md).
+    image: ${TCODE_IMAGE:-ghcr.io/tryanks/tcode-headless}:${TCODE_VERSION:-latest}
+    restart: unless-stopped
+    # Stopping flushes every running agent session first.
+    stop_grace_period: 30s
+    environment:
+      # Run `id -u` / `id -g` on the host. Agents write projects as these IDs.
+      PUID: ${PUID:-1000}
+      PGID: ${PGID:-1000}
+      TZ: ${TZ:-UTC}
+      TCODE_PASSWORD: ${TCODE_PASSWORD:?Set TCODE_PASSWORD in .env}
+      # Installed into the data volume on first start, then updated by each CLI.
+      # Unset means all six; an explicitly empty value means none.
+      TCODE_AGENTS: ${TCODE_AGENTS-claude,codex,pi,opencode,cursor,grok}
+      # Optional API keys, or log in from a Tcode terminal pane (docs/docker.md).
+      # ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      # OPENAI_API_KEY: ${OPENAI_API_KEY}
+      # CURSOR_API_KEY: ${CURSOR_API_KEY}
+      # XAI_API_KEY: ${XAI_API_KEY}
+      # With the optional socket mount, set this to `stat -c %g /var/run/docker.sock`:
+      # DOCKER_GID: ${DOCKER_GID:?Set DOCKER_GID in .env}
+    # The name devices show for this machine. Add `--traverse https://your.instance`
+    # for a self-hosted Traverse, or `--traverse off` for LAN only.
+    command: [serve, --name, "${TCODE_NAME:-NAS}", --browser-listen, "0.0.0.0:47420"]
+    ports:
+      - "47420:47420/tcp" # Password-protected browser app: http://<host>:47420/
+      - "47420:47420/udp" # Native clients: Traverse and direct LAN connections
+    # For Linux LAN/mDNS discovery, replace ports above with host networking:
+    # network_mode: host
+    volumes:
+      # Contains traverse.json (machine key + pairings), threads and CLI logins.
+      # Keep and back up this volume; `down -v` destroys the machine identity.
+      - tcode-data:/data
+      # Add projects in Tcode using paths under /projects.
+      - ${TCODE_PROJECTS:-./projects}:/projects
+      # Optional sibling containers, NOT Docker-in-Docker. Host-root-equivalent:
+      # - /var/run/docker.sock:/var/run/docker.sock
+      # Install a Docker CLI in a derived image; see docs/docker.md.
+
+volumes:
+  tcode-data:

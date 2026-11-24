@@ -1,0 +1,312 @@
+"use client";
+
+import { memo, useContext, useId, useMemo } from "react";
+import { MotionIcon } from "@/components/MotionIcon";
+import { Button, Icon } from "@muteki/ui";
+import type { CollaborationKnowledgeItem } from "@/lib/agentCollaboration";
+import type { BlackboardIntent } from "@/lib/events";
+import type { RunCanvasMode } from "@/lib/swarmProjection";
+import { formatClock } from "@/lib/format";
+import { useT } from "@/lib/i18n";
+import { knowledgeStatusLabel } from "@/lib/statusLabels";
+import { highlight, HighlightQueryContext } from "@/lib/textHighlight";
+import { useCopied } from "@/lib/useCopied";
+
+import { EventStamp } from "./EventStamp";
+import { knowledgeIcon, knowledgeLabel, type Translate } from "./collaborationPresentation";
+
+export function knowledgeVerifierLabel(
+  item: CollaborationKnowledgeItem,
+  actorName: (id?: string) => string,
+  t: Translate,
+): string {
+  if (item.verifierAgentId) return actorName(item.verifierAgentId);
+  if (item.verifier) return t("collab.verifierUnresolved", { verifier: item.verifier });
+  return "";
+}
+
+export function knowledgeProposerLabel(
+  item: CollaborationKnowledgeItem,
+  actorName: (id?: string) => string,
+): string {
+  if (!item.proposerId || item.proposerId === item.agentId) return "";
+  return actorName(item.proposerId);
+}
+
+export function findKnowledge(
+  knowledge: CollaborationKnowledgeItem[],
+  id: string,
+): CollaborationKnowledgeItem | undefined {
+  return knowledge.find((row) => row.id === id);
+}
+
+export function citingKnowledge(
+  item: CollaborationKnowledgeItem,
+  knowledge: CollaborationKnowledgeItem[],
+  intents: BlackboardIntent[],
+): CollaborationKnowledgeItem[] {
+  const cited = new Map<string, CollaborationKnowledgeItem>();
+  for (const row of knowledge) {
+    if (row.id === item.id) continue;
+    if (item.goalId && row.goalId === item.goalId && (item.kind === "goal" || row.kind === "goal")) cited.set(row.id, row);
+    if (typeof item.factSeq === "number" && (row.fromFactSeqs?.includes(item.factSeq) || row.evidenceFactSeqs?.includes(item.factSeq) || row.replacementFactSeq === item.factSeq)) cited.set(row.id, row);
+    if (typeof row.factSeq === "number" && (item.fromFactSeqs?.includes(row.factSeq) || item.evidenceFactSeqs?.includes(row.factSeq) || item.replacementFactSeq === row.factSeq)) cited.set(row.id, row);
+    if (item.intentId && row.intentId === item.intentId) cited.set(row.id, row);
+    if (typeof item.factSeq === "number" && row.factSeq === item.factSeq) cited.set(row.id, row);
+  }
+  if (typeof item.factSeq === "number") {
+    for (const intent of intents) {
+      if (!intent.fromFacts.includes(item.factSeq)) continue;
+      const row = findKnowledge(knowledge, `intent:${intent.id}`);
+      if (row && row.id !== item.id) cited.set(row.id, row);
+    }
+  }
+  return [...cited.values()].sort((a, b) => b.ts - a.ts || a.id.localeCompare(b.id));
+}
+
+export function KnowledgeLink({
+  target,
+  label,
+  onSelect,
+}: {
+  target?: CollaborationKnowledgeItem;
+  label: string;
+  onSelect?: (item: CollaborationKnowledgeItem) => void;
+}) {
+  if (!target || !onSelect) return label;
+  return (
+    <button type="button" className="collab-knowledge-link" onClick={() => onSelect(target)}>
+      {label}
+    </button>
+  );
+}
+
+export function FactSeqLinks({
+  seqs,
+  knowledge,
+  onSelect,
+}: {
+  seqs: number[];
+  knowledge: CollaborationKnowledgeItem[];
+  onSelect: (item: CollaborationKnowledgeItem) => void;
+}) {
+  return (
+    <>
+      {seqs.map((seq, index) => (
+        <span key={seq}>
+          {index > 0 && ", "}
+          <KnowledgeLink target={findKnowledge(knowledge, `fact:${seq}`)} label={`#${seq}`} onSelect={onSelect} />
+        </span>
+      ))}
+    </>
+  );
+}
+
+type KnowledgeRowProps = {
+  item: CollaborationKnowledgeItem;
+  actor: string;
+  selected: boolean;
+  fresh?: boolean;
+  onSelect: (itemId: string) => void;
+  kindLabel?: string;
+  mode?: RunCanvasMode;
+};
+
+function knowledgeRowEqual(prev: KnowledgeRowProps, next: KnowledgeRowProps): boolean {
+  return prev.item.id === next.item.id
+    && prev.item.title === next.item.title
+    && prev.item.kind === next.item.kind
+    && prev.item.status === next.item.status
+    && prev.item.statusKey === next.item.statusKey
+    && prev.item.tone === next.item.tone
+    && prev.item.ts === next.item.ts
+    && prev.actor === next.actor
+    && prev.selected === next.selected
+    && prev.fresh === next.fresh
+    && prev.onSelect === next.onSelect
+    && prev.kindLabel === next.kindLabel
+    && prev.mode === next.mode;
+}
+
+export const KnowledgeRow = memo(function KnowledgeRow({ item, actor, selected, fresh, onSelect, kindLabel, mode }: KnowledgeRowProps) {
+  const t = useT();
+  const q = useContext(HighlightQueryContext);
+  const [copied, copy] = useCopied();
+  const kind = kindLabel ?? knowledgeLabel(item.kind, t, mode);
+  const statusText = item.status ? knowledgeStatusLabel(item, t) : "";
+  const clock = formatClock(item.ts, "—");
+  const describedBy = useId();
+  const statusId = `${describedBy}-status`;
+  const timeId = `${describedBy}-time`;
+  const row = (
+    <button
+      type="button"
+      data-knowledge-id={item.id}
+      className={`collab-knowledge-row tone-${item.tone} ${selected ? "selected" : ""} ${fresh ? "fresh" : ""}`}
+      aria-current={selected ? "true" : undefined}
+      aria-label={t("collab.a11y.knowledgeRow", { kind, title: item.title })}
+      aria-describedby={statusText ? `${statusId} ${timeId}` : timeId}
+      onClick={() => onSelect(item.id)}
+    >
+      <span className="collab-knowledge-icon"><Icon name={knowledgeIcon(item.kind)} size={13} /></span>
+      <span className="collab-knowledge-copy">
+        <span>
+          <b>{kind}</b>
+          {statusText && <small id={statusId} aria-label={t("collab.a11y.knowledgeStatus", { status: statusText })}>{statusText}</small>}
+        </span>
+        <strong>{highlight(item.title, q)}</strong>
+        <small id={timeId} aria-label={t("collab.a11y.knowledgeTime", { time: clock })}>
+          {actor || t("collab.unassigned")} · <EventStamp ts={item.ts} />
+        </small>
+      </span>
+    </button>
+  );
+  if (item.kind !== "flag") return row;
+  return (
+    <div className="collab-knowledge-item">
+      {row}
+      <button
+        type="button"
+        className={`collab-knowledge-flag-copy${copied ? " copied" : ""}`}
+        aria-label={t("common.copyFlagAria", { flag: item.title })}
+        title={t("common.copyFlag")}
+        onClick={() => copy(item.title)}
+      >
+        <MotionIcon active={copied} from="copy" to="check" size={12} />
+      </button>
+    </div>
+  );
+}, knowledgeRowEqual);
+
+export function KnowledgeDetail({
+  item, actor, proposer, verifier, knowledge = [], intents = [],
+  onSelectKnowledge, onOpenFact, onOpenPoc, onOpenAgentKnowledge, onClose,
+  mode,
+}: {
+  item: CollaborationKnowledgeItem;
+  actor: string;
+  proposer?: string;
+  verifier?: string;
+  knowledge?: CollaborationKnowledgeItem[];
+  intents?: BlackboardIntent[];
+  onSelectKnowledge?: (item: CollaborationKnowledgeItem) => void;
+  onOpenFact?: (seq: number) => void;
+  onOpenPoc?: (id: string) => void;
+  onOpenAgentKnowledge?: () => void;
+  onClose?: () => void;
+  mode?: RunCanvasMode;
+}) {
+  const t = useT();
+  const [copied, copy] = useCopied();
+  const pocId = item.kind === "poc" ? item.id.slice(4) : "";
+  const factSeq = item.factSeq;
+  const copyText = item.kind === "flag" ? item.title : (item.detail || item.title);
+  const copyLabel = item.kind === "flag" ? t("common.copyFlag") : t("common.copyShort");
+  const intentTarget = item.intentId ? findKnowledge(knowledge, `intent:${item.intentId}`) : undefined;
+  const factTarget = typeof factSeq === "number" ? findKnowledge(knowledge, `fact:${factSeq}`) : undefined;
+  const cited = useMemo(() => citingKnowledge(item, knowledge, intents), [item, knowledge, intents]);
+  return (
+    <div className={`collab-selected-knowledge tone-${item.tone}`}>
+      <div className="collab-selected-knowledge-head">
+        <span><Icon name={knowledgeIcon(item.kind)} size={14} />{knowledgeLabel(item.kind, t, mode)}</span>
+        <div className="collab-selected-knowledge-tools">
+          {item.status && <b>{knowledgeStatusLabel(item, t)}</b>}
+          {onClose && (
+            <Button
+              size="sm"
+              variant="ghost"
+              iconOnly
+              className="collab-selected-knowledge-close"
+              aria-label={t("collab.action.closeKnowledge")}
+              onClick={onClose}
+            >
+              <Icon name="x" size={12} />
+            </Button>
+          )}
+        </div>
+      </div>
+      <div className="collab-selected-knowledge-content">
+        <strong>{item.title}</strong>
+        {item.detail && item.detail !== item.title && <p>{item.detail}</p>}
+        {item.description && item.description !== item.detail && <p>{item.description}</p>}
+      </div>
+      <dl>
+        <dt>{t("collab.field.agent")}</dt><dd>{actor || t("collab.unassigned")}</dd>
+        {proposer && <><dt>{t("collab.field.proposer")}</dt><dd>{proposer}</dd></>}
+        {item.intentId && (
+          <>
+            <dt>{t("collab.field.intent")}</dt>
+            <dd>
+              <KnowledgeLink
+                target={intentTarget && intentTarget.id !== item.id ? intentTarget : undefined}
+                label={item.intentId}
+                onSelect={onSelectKnowledge}
+              />
+            </dd>
+          </>
+        )}
+        {typeof factSeq === "number" && (
+          <>
+            <dt>{t("collab.field.fact")}</dt>
+            <dd>
+              <KnowledgeLink
+                target={factTarget && factTarget.id !== item.id ? factTarget : undefined}
+                label={`#${factSeq}`}
+                onSelect={onSelectKnowledge}
+              />
+            </dd>
+          </>
+        )}
+        {item.goalId && item.kind !== "goal" && <><dt>{t("collab.field.goal")}</dt><dd><KnowledgeLink target={findKnowledge(knowledge, `goal:${item.goalId}`)} label={item.goalId} onSelect={onSelectKnowledge} /></dd></>}
+        {item.question && <><dt>{t("collab.field.question")}</dt><dd>{item.question}</dd></>}
+        {item.answer && <><dt>{t("collab.field.answer")}</dt><dd>{item.answer}</dd></>}
+        {!!item.fromFactSeqs?.length && <><dt>{t("collab.field.inputs")}</dt><dd>{onSelectKnowledge ? <FactSeqLinks seqs={item.fromFactSeqs} knowledge={knowledge} onSelect={onSelectKnowledge} /> : item.fromFactSeqs.map((seq) => `#${seq}`).join(", ")}</dd></>}
+        {!!item.evidenceFactSeqs?.length && <><dt>{t("collab.field.evidence")}</dt><dd>{onSelectKnowledge ? <FactSeqLinks seqs={item.evidenceFactSeqs} knowledge={knowledge} onSelect={onSelectKnowledge} /> : item.evidenceFactSeqs.map((seq) => `#${seq}`).join(", ")}</dd></>}
+        {!!item.requiresCapabilities?.length && <><dt>{t("collab.field.requiresCapabilities")}</dt><dd>{item.requiresCapabilities.join(", ")}</dd></>}
+        {!!item.requiredPocs?.length && <><dt>{t("collab.knowledge.resource")}</dt><dd>{item.requiredPocs.join(", ")}</dd></>}
+        {item.retirementReason && <><dt>{t("collab.field.retirementReason")}</dt><dd>{item.retirementReason}</dd></>}
+        {item.retiredTs && <><dt>{t("collab.field.retiredAt")}</dt><dd><EventStamp ts={item.retiredTs} /></dd></>}
+        {item.replacementFactSeq !== undefined && <><dt>{t("collab.field.replacement")}</dt><dd><KnowledgeLink target={findKnowledge(knowledge, `fact:${item.replacementFactSeq}`)} label={`#${item.replacementFactSeq}`} onSelect={onSelectKnowledge} /></dd></>}
+        {verifier && <><dt>{t("collab.field.verifier")}</dt><dd>{verifier}</dd></>}
+        {typeof item.confidence === "number" && <><dt>{t("collab.field.confidence")}</dt><dd>{item.confidence.toFixed(2)}</dd></>}
+        {item.witness && <><dt>{t("collab.field.witness")}</dt><dd>{item.witness}</dd></>}
+      </dl>
+      <div className="collab-detail-actions">
+        <Button size="sm" variant="ghost" className={copied ? "copied" : ""} onClick={() => copy(copyText)}>
+          <MotionIcon active={copied} from="copy" to="check" size={12} />{copyLabel}
+        </Button>
+        {typeof factSeq === "number" && onOpenFact && (
+          <Button size="sm" variant="ghost" onClick={() => onOpenFact(factSeq)}>
+            <Icon name="layers" size={12} />{t("collab.action.openEvidence")}
+          </Button>
+        )}
+        {pocId && onOpenPoc && (
+          <Button size="sm" variant="ghost" onClick={() => onOpenPoc(pocId)}>
+            <Icon name="terminal" size={12} />{t("collab.action.openPoc")}
+          </Button>
+        )}
+        {onOpenAgentKnowledge && (
+          <Button size="sm" variant="ghost" onClick={onOpenAgentKnowledge}>
+            <Icon name="arrowRight" size={12} />{t("collab.action.openAgentKnowledge")}
+          </Button>
+        )}
+      </div>
+      {cited.length > 0 && onSelectKnowledge && (
+        <div className="collab-cited">
+          <h4>{t("collab.citedBy")}</h4>
+          <ul className="collab-cited-list">
+            {cited.map((row) => (
+              <li key={row.id}>
+                <KnowledgeLink
+                  target={row}
+                  label={`${knowledgeLabel(row.kind, t, mode)} · ${row.title}`}
+                  onSelect={onSelectKnowledge}
+                />
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </div>
+  );
+}

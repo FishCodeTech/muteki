@@ -1,0 +1,1030 @@
+[
+  {
+    "connector_id": "aws_ec2",
+    "version": "aws-cli.describe-instances.v1",
+    "source_schema": "aws.ec2.describe-instances.response+json",
+    "capabilities": [
+      "query",
+      "read",
+      "paginate"
+    ],
+    "asset_types": {
+      "instance": "cloud_resource"
+    },
+    "field_mapping": {},
+    "pagination": {
+      "kind": "next_token",
+      "reliable_full": "when_all_pages_succeed"
+    },
+    "credentials": {
+      "required": false,
+      "reference_fields": [
+        "credential_ref"
+      ],
+      "permission": "ec2:DescribeInstances"
+    },
+    "cost": {
+      "actual_cost": "unknown_unless_upstream_receipt",
+      "retry": "submitted_unknown_not_replayed"
+    },
+    "runtime": {
+      "kind": "aws_cli",
+      "required_executable": "aws",
+      "hooks": false
+    },
+    "evidence": {
+      "raw_response": true,
+      "stable_source_link": true,
+      "screenshots": false
+    },
+    "config_fields": [
+      {
+        "key": "region",
+        "label": "AWS Region",
+        "kind": "text",
+        "type": "string",
+        "required": true,
+        "default": "us-east-1",
+        "placeholder": "us-east-1"
+      },
+      {
+        "key": "endpoint_url",
+        "label": "Custom EC2 Endpoint URL",
+        "kind": "url",
+        "type": "string",
+        "required": false,
+        "default": null,
+        "placeholder": "https://ec2.us-east-1.amazonaws.com/"
+      },
+      {
+        "key": "account_id",
+        "label": "AWS Account ID",
+        "kind": "text",
+        "type": "string",
+        "required": false,
+        "default": null,
+        "placeholder": "123456789012"
+      },
+      {
+        "key": "profile",
+        "label": "AWS CLI Profile",
+        "kind": "text",
+        "type": "string",
+        "required": false,
+        "default": null,
+        "placeholder": "default"
+      },
+      {
+        "key": "page_size",
+        "label": "Page Size",
+        "kind": "number",
+        "type": "integer",
+        "required": false,
+        "default": 100,
+        "placeholder": "100"
+      },
+      {
+        "key": "max_pages",
+        "label": "Max Pages",
+        "kind": "number",
+        "type": "integer",
+        "required": false,
+        "default": 5,
+        "placeholder": "5"
+      },
+      {
+        "key": "max_items",
+        "label": "Max Items",
+        "kind": "number",
+        "type": "integer",
+        "required": false,
+        "default": 500,
+        "placeholder": "500"
+      },
+      {
+        "key": "timeout",
+        "label": "CLI Timeout (seconds)",
+        "kind": "number",
+        "type": "integer",
+        "required": false,
+        "default": 45,
+        "placeholder": "45"
+      }
+    ]
+  },
+  {
+    "connector_id": "bbot",
+    "version": "source-file.v1",
+    "source_schema": "bbot.typed-events.v3+jsonl",
+    "capabilities": [
+      "import_file",
+      "read"
+    ],
+    "asset_types": {
+      "DNS_NAME": "domain",
+      "IP_ADDRESS": "ip",
+      "OPEN_TCP_PORT": "service",
+      "URL": "http_endpoint",
+      "FINDING": "external_observation"
+    },
+    "field_mapping": {},
+    "pagination": {
+      "kind": "complete_file",
+      "reliable_full": true
+    },
+    "credentials": {
+      "required": false,
+      "reference_fields": []
+    },
+    "cost": {
+      "actual_cost": "not_applicable",
+      "retry": "committed_items_not_repeated"
+    },
+    "runtime": {
+      "kind": "file",
+      "executes_hooks": false
+    },
+    "evidence": {
+      "raw_source": true,
+      "stable_source_link": true,
+      "screenshots": false
+    }
+  },
+  {
+    "connector_id": "bbrf",
+    "version": "source-file.v1",
+    "source_schema": "bbrf.export+jsonl",
+    "capabilities": [
+      "import_file",
+      "read"
+    ],
+    "asset_types": {
+      "domain": "domain",
+      "ip": "ip",
+      "url": "http_endpoint"
+    },
+    "field_mapping": {},
+    "pagination": {
+      "kind": "complete_file",
+      "reliable_full": true
+    },
+    "credentials": {
+      "required": false,
+      "reference_fields": []
+    },
+    "cost": {
+      "actual_cost": "not_applicable",
+      "retry": "committed_items_not_repeated"
+    },
+    "runtime": {
+      "kind": "file",
+      "executes_hooks": false
+    },
+    "evidence": {
+      "raw_source": true,
+      "stable_source_link": true,
+      "screenshots": false
+    }
+  },
+  {
+    "connector_id": "burp",
+    "version": "source-file.v1",
+    "source_schema": "burp.xml+har",
+    "capabilities": [
+      "import_file",
+      "read"
+    ],
+    "asset_types": {
+      "http_exchange": "http_exchange"
+    },
+    "field_mapping": {},
+    "pagination": {
+      "kind": "complete_file",
+      "reliable_full": true
+    },
+    "credentials": {
+      "required": false,
+      "reference_fields": []
+    },
+    "cost": {
+      "actual_cost": "not_applicable",
+      "retry": "committed_items_not_repeated"
+    },
+    "runtime": {
+      "kind": "file",
+      "executes_hooks": false
+    },
+    "evidence": {
+      "raw_source": true,
+      "stable_source_link": true,
+      "screenshots": false
+    }
+  },
+  {
+    "connector_id": "caido",
+    "version": "source-file.v1",
+    "source_schema": "caido.har+jsonl",
+    "capabilities": [
+      "import_file",
+      "read"
+    ],
+    "asset_types": {
+      "http_exchange": "http_exchange"
+    },
+    "field_mapping": {},
+    "pagination": {
+      "kind": "complete_file",
+      "reliable_full": true
+    },
+    "credentials": {
+      "required": false,
+      "reference_fields": []
+    },
+    "cost": {
+      "actual_cost": "not_applicable",
+      "retry": "committed_items_not_repeated"
+    },
+    "runtime": {
+      "kind": "file",
+      "executes_hooks": false
+    },
+    "evidence": {
+      "raw_source": true,
+      "stable_source_link": true,
+      "screenshots": false
+    }
+  },
+  {
+    "connector_id": "cli",
+    "version": "source-file.v1",
+    "source_schema": "cli.json+jsonl+csv",
+    "capabilities": [
+      "import_file",
+      "read"
+    ],
+    "asset_types": {
+      "asset": "source_observation"
+    },
+    "field_mapping": {},
+    "pagination": {
+      "kind": "complete_file",
+      "reliable_full": true
+    },
+    "credentials": {
+      "required": false,
+      "reference_fields": []
+    },
+    "cost": {
+      "actual_cost": "not_applicable",
+      "retry": "committed_items_not_repeated"
+    },
+    "runtime": {
+      "kind": "file",
+      "executes_hooks": false
+    },
+    "evidence": {
+      "raw_source": true,
+      "stable_source_link": true,
+      "screenshots": false
+    }
+  },
+  {
+    "connector_id": "cloud_inventory",
+    "version": "source-file.v1",
+    "source_schema": "cloud.inventory+json+csv",
+    "capabilities": [
+      "import_file",
+      "read"
+    ],
+    "asset_types": {
+      "resource": "cloud_resource"
+    },
+    "field_mapping": {},
+    "pagination": {
+      "kind": "complete_file",
+      "reliable_full": true
+    },
+    "credentials": {
+      "required": false,
+      "reference_fields": []
+    },
+    "cost": {
+      "actual_cost": "not_applicable",
+      "retry": "committed_items_not_repeated"
+    },
+    "runtime": {
+      "kind": "file",
+      "executes_hooks": false
+    },
+    "evidence": {
+      "raw_source": true,
+      "stable_source_link": true,
+      "screenshots": false
+    }
+  },
+  {
+    "connector_id": "external_event",
+    "version": "source-file.v1",
+    "source_schema": "external.source-event.v1",
+    "capabilities": [
+      "receive_event",
+      "idempotent_events",
+      "read"
+    ],
+    "asset_types": {
+      "event": "external_observation"
+    },
+    "field_mapping": {},
+    "pagination": {
+      "kind": "complete_file",
+      "reliable_full": true
+    },
+    "credentials": {
+      "required": false,
+      "reference_fields": []
+    },
+    "cost": {
+      "actual_cost": "not_applicable",
+      "retry": "committed_items_not_repeated"
+    },
+    "runtime": {
+      "kind": "file",
+      "executes_hooks": false
+    },
+    "evidence": {
+      "raw_source": true,
+      "stable_source_link": true,
+      "screenshots": false
+    }
+  },
+  {
+    "connector_id": "fofa",
+    "version": "api-v1.search-all.1",
+    "source_schema": "fofa.search-all.response+json",
+    "capabilities": [
+      "query",
+      "read",
+      "paginate"
+    ],
+    "asset_types": {
+      "host": "service",
+      "ip": "ip",
+      "domain": "domain",
+      "icp": "ownership_candidate"
+    },
+    "field_mapping": {
+      "host": "host",
+      "ip": "ip",
+      "port": "port",
+      "protocol": "protocol",
+      "title": "title",
+      "domain": "domain",
+      "icp": "icp"
+    },
+    "pagination": {
+      "kind": "page",
+      "page_size_max": 10000,
+      "reliable_full": false,
+      "source_delay": "upstream"
+    },
+    "credentials": {
+      "required": true,
+      "reference_fields": [
+        "email_ref",
+        "key_ref"
+      ],
+      "permission": "search"
+    },
+    "cost": {
+      "actual_cost": "unknown_unless_upstream_receipt",
+      "retry": "submitted_unknown_not_replayed",
+      "rate_limit": "upstream"
+    },
+    "runtime": {
+      "kind": "https",
+      "base_url": "https://fofa.info"
+    },
+    "evidence": {
+      "raw_response": true,
+      "stable_source_link": true,
+      "screenshots": false
+    },
+    "config_fields": [
+      {
+        "key": "base_url",
+        "label": "API Base URL",
+        "kind": "url",
+        "type": "string",
+        "required": false,
+        "default": "https://fofa.info",
+        "placeholder": "https://fofa.info"
+      },
+      {
+        "key": "fields",
+        "label": "Return Fields",
+        "kind": "string_list",
+        "type": "array",
+        "required": false,
+        "default": [
+          "host",
+          "ip",
+          "port",
+          "protocol",
+          "title",
+          "domain",
+          "icp"
+        ],
+        "placeholder": "host,ip,port,protocol,title,domain,icp"
+      },
+      {
+        "key": "page_size",
+        "label": "Page Size",
+        "kind": "number",
+        "type": "integer",
+        "required": false,
+        "default": 100,
+        "placeholder": "100"
+      },
+      {
+        "key": "max_pages",
+        "label": "Max Pages",
+        "kind": "number",
+        "type": "integer",
+        "required": false,
+        "default": 5,
+        "placeholder": "5"
+      },
+      {
+        "key": "max_items",
+        "label": "Max Items",
+        "kind": "number",
+        "type": "integer",
+        "required": false,
+        "default": 1000,
+        "placeholder": "1000"
+      }
+    ]
+  },
+  {
+    "connector_id": "github",
+    "version": "repository-read.v1",
+    "source_schema": "github.repository+commit",
+    "capabilities": [
+      "read_repository"
+    ],
+    "asset_types": {
+      "repository": "repository"
+    },
+    "field_mapping": {},
+    "pagination": {
+      "kind": "single_document",
+      "reliable_full": true
+    },
+    "credentials": {
+      "required": false,
+      "reference_fields": [
+        "token_ref"
+      ],
+      "permission": "read_repository"
+    },
+    "cost": {
+      "actual_cost": "unknown_unless_upstream_receipt",
+      "retry": "submitted_unknown_not_replayed"
+    },
+    "runtime": {
+      "kind": "https",
+      "base_url": "https://api.github.com",
+      "self_hosted_base_url_supported": true
+    },
+    "evidence": {
+      "raw_response": true,
+      "stable_source_link": true,
+      "screenshots": false
+    },
+    "config_fields": [
+      {
+        "key": "base_url",
+        "label": "GitHub API Base URL",
+        "kind": "url",
+        "type": "string",
+        "required": false,
+        "default": "https://api.github.com",
+        "placeholder": "https://api.github.com"
+      },
+      {
+        "key": "repository",
+        "label": "Repository (owner/repo)",
+        "kind": "text",
+        "type": "string",
+        "required": false,
+        "default": null,
+        "placeholder": "owner/repo"
+      },
+      {
+        "key": "owner",
+        "label": "Owner",
+        "kind": "text",
+        "type": "string",
+        "required": false,
+        "default": null,
+        "placeholder": "owner"
+      },
+      {
+        "key": "repo",
+        "label": "Repository Name",
+        "kind": "text",
+        "type": "string",
+        "required": false,
+        "default": null,
+        "placeholder": "repo"
+      },
+      {
+        "key": "ref",
+        "label": "Default Branch / Ref",
+        "kind": "text",
+        "type": "string",
+        "required": false,
+        "default": "main",
+        "placeholder": "main"
+      }
+    ]
+  },
+  {
+    "connector_id": "gitlab",
+    "version": "repository-read.v1",
+    "source_schema": "gitlab.repository+commit",
+    "capabilities": [
+      "read_repository"
+    ],
+    "asset_types": {
+      "repository": "repository"
+    },
+    "field_mapping": {},
+    "pagination": {
+      "kind": "single_document",
+      "reliable_full": true
+    },
+    "credentials": {
+      "required": false,
+      "reference_fields": [
+        "token_ref"
+      ],
+      "permission": "read_repository"
+    },
+    "cost": {
+      "actual_cost": "unknown_unless_upstream_receipt",
+      "retry": "submitted_unknown_not_replayed"
+    },
+    "runtime": {
+      "kind": "https",
+      "base_url": "https://gitlab.com",
+      "self_hosted_base_url_supported": true
+    },
+    "evidence": {
+      "raw_response": true,
+      "stable_source_link": true,
+      "screenshots": false
+    },
+    "config_fields": [
+      {
+        "key": "base_url",
+        "label": "GitLab Base URL",
+        "kind": "url",
+        "type": "string",
+        "required": false,
+        "default": "https://gitlab.com",
+        "placeholder": "https://gitlab.com"
+      },
+      {
+        "key": "repository",
+        "label": "Project Path (namespace/project)",
+        "kind": "text",
+        "type": "string",
+        "required": false,
+        "default": null,
+        "placeholder": "group/project"
+      },
+      {
+        "key": "owner",
+        "label": "Namespace / Owner",
+        "kind": "text",
+        "type": "string",
+        "required": false,
+        "default": null,
+        "placeholder": "group"
+      },
+      {
+        "key": "repo",
+        "label": "Project Name",
+        "kind": "text",
+        "type": "string",
+        "required": false,
+        "default": null,
+        "placeholder": "project"
+      },
+      {
+        "key": "ref",
+        "label": "Default Branch / Ref",
+        "kind": "text",
+        "type": "string",
+        "required": false,
+        "default": "main",
+        "placeholder": "main"
+      }
+    ]
+  },
+  {
+    "connector_id": "quake",
+    "version": "api-v3.quake-service.1",
+    "source_schema": "quake.service.response+json",
+    "capabilities": [
+      "query",
+      "read",
+      "paginate"
+    ],
+    "asset_types": {
+      "service": "service",
+      "ip": "ip",
+      "domain": "domain",
+      "app": "product_candidate"
+    },
+    "field_mapping": {
+      "service": "service",
+      "ip": "ip",
+      "port": "port",
+      "transport": "transport",
+      "domain": "domain"
+    },
+    "pagination": {
+      "kind": "offset",
+      "page_size_max": 500,
+      "reliable_full": false,
+      "source_delay": "upstream"
+    },
+    "credentials": {
+      "required": true,
+      "reference_fields": [
+        "token_ref"
+      ],
+      "permission": "quake_service_search"
+    },
+    "cost": {
+      "actual_cost": "unknown_unless_upstream_receipt",
+      "retry": "submitted_unknown_not_replayed",
+      "rate_limit": "upstream"
+    },
+    "runtime": {
+      "kind": "https",
+      "base_url": "https://quake.360.net"
+    },
+    "evidence": {
+      "raw_response": true,
+      "stable_source_link": true,
+      "screenshots": false
+    },
+    "config_fields": [
+      {
+        "key": "base_url",
+        "label": "API Base URL",
+        "kind": "url",
+        "type": "string",
+        "required": false,
+        "default": "https://quake.360.net",
+        "placeholder": "https://quake.360.net"
+      },
+      {
+        "key": "page_size",
+        "label": "Page Size",
+        "kind": "number",
+        "type": "integer",
+        "required": false,
+        "default": 100,
+        "placeholder": "100"
+      },
+      {
+        "key": "max_pages",
+        "label": "Max Pages",
+        "kind": "number",
+        "type": "integer",
+        "required": false,
+        "default": 5,
+        "placeholder": "5"
+      },
+      {
+        "key": "max_items",
+        "label": "Max Items",
+        "kind": "number",
+        "type": "integer",
+        "required": false,
+        "default": 500,
+        "placeholder": "500"
+      }
+    ]
+  },
+  {
+    "connector_id": "reconftw",
+    "version": "source-file.v1",
+    "source_schema": "reconftw.assets+jsonl",
+    "capabilities": [
+      "import_file",
+      "read"
+    ],
+    "asset_types": {
+      "domain": "domain",
+      "ip": "ip",
+      "url": "http_endpoint",
+      "service": "service"
+    },
+    "field_mapping": {},
+    "pagination": {
+      "kind": "complete_file",
+      "reliable_full": true
+    },
+    "credentials": {
+      "required": false,
+      "reference_fields": []
+    },
+    "cost": {
+      "actual_cost": "not_applicable",
+      "retry": "committed_items_not_repeated"
+    },
+    "runtime": {
+      "kind": "file",
+      "executes_hooks": false
+    },
+    "evidence": {
+      "raw_source": true,
+      "stable_source_link": true,
+      "screenshots": false
+    }
+  },
+  {
+    "connector_id": "scopesentry",
+    "version": "source-file.v1",
+    "source_schema": "scopesentry.export+json",
+    "capabilities": [
+      "import_file",
+      "read",
+      "query_when_endpoint_configured"
+    ],
+    "asset_types": {
+      "domain": "domain",
+      "service": "service",
+      "app": "app_candidate",
+      "miniprogram": "miniprogram_candidate"
+    },
+    "field_mapping": {},
+    "pagination": {
+      "kind": "complete_file",
+      "reliable_full": true
+    },
+    "credentials": {
+      "required": false,
+      "reference_fields": []
+    },
+    "cost": {
+      "actual_cost": "not_applicable",
+      "retry": "committed_items_not_repeated"
+    },
+    "runtime": {
+      "kind": "file",
+      "executes_hooks": false
+    },
+    "evidence": {
+      "raw_source": true,
+      "stable_source_link": true,
+      "screenshots": false
+    },
+    "config_fields": [
+      {
+        "key": "query_enabled",
+        "label": "Enable Online Query",
+        "kind": "boolean",
+        "type": "boolean",
+        "required": false,
+        "default": false,
+        "placeholder": "false"
+      },
+      {
+        "key": "base_url",
+        "label": "ScopeSentry Base URL",
+        "kind": "url",
+        "type": "string",
+        "required": false,
+        "default": null,
+        "placeholder": "https://scopesentry.example.com"
+      },
+      {
+        "key": "endpoints",
+        "label": "Verified Asset Query Endpoints",
+        "kind": "json",
+        "type": "object",
+        "required": false,
+        "default": {},
+        "placeholder": "{\"domain\":\"/api/assets/domain\"}"
+      },
+      {
+        "key": "page_size",
+        "label": "Page Size",
+        "kind": "number",
+        "type": "integer",
+        "required": false,
+        "default": 100,
+        "placeholder": "100"
+      },
+      {
+        "key": "max_pages",
+        "label": "Max Pages",
+        "kind": "number",
+        "type": "integer",
+        "required": false,
+        "default": 5,
+        "placeholder": "5"
+      },
+      {
+        "key": "max_items",
+        "label": "Max Items",
+        "kind": "number",
+        "type": "integer",
+        "required": false,
+        "default": 500,
+        "placeholder": "500"
+      }
+    ]
+  },
+  {
+    "connector_id": "shodan",
+    "version": "api.shodan-host-search.1",
+    "source_schema": "shodan.host-search.response+json",
+    "capabilities": [
+      "query",
+      "read",
+      "paginate"
+    ],
+    "asset_types": {
+      "matches": "service",
+      "ip_str": "ip",
+      "domains": "domain_candidates"
+    },
+    "field_mapping": {
+      "matches": "matches",
+      "ip_str": "ip",
+      "port": "port",
+      "transport": "transport",
+      "domains": "domains"
+    },
+    "pagination": {
+      "kind": "page",
+      "page_size_max": 100,
+      "reliable_full": false,
+      "source_delay": "upstream"
+    },
+    "credentials": {
+      "required": true,
+      "reference_fields": [
+        "key_ref"
+      ],
+      "permission": "host_search"
+    },
+    "cost": {
+      "actual_cost": "unknown_unless_upstream_receipt",
+      "retry": "submitted_unknown_not_replayed",
+      "rate_limit": "upstream"
+    },
+    "runtime": {
+      "kind": "https",
+      "base_url": "https://api.shodan.io"
+    },
+    "evidence": {
+      "raw_response": true,
+      "stable_source_link": true,
+      "screenshots": false
+    },
+    "config_fields": [
+      {
+        "key": "base_url",
+        "label": "API Base URL",
+        "kind": "url",
+        "type": "string",
+        "required": false,
+        "default": "https://api.shodan.io",
+        "placeholder": "https://api.shodan.io"
+      },
+      {
+        "key": "page_size",
+        "label": "Page Size",
+        "kind": "number",
+        "type": "integer",
+        "required": false,
+        "default": 100,
+        "placeholder": "100"
+      },
+      {
+        "key": "max_pages",
+        "label": "Max Pages",
+        "kind": "number",
+        "type": "integer",
+        "required": false,
+        "default": 5,
+        "placeholder": "5"
+      },
+      {
+        "key": "max_items",
+        "label": "Max Items",
+        "kind": "number",
+        "type": "integer",
+        "required": false,
+        "default": 500,
+        "placeholder": "500"
+      }
+    ]
+  },
+  {
+    "connector_id": "zoomeye",
+    "version": "api.host-search.1",
+    "source_schema": "zoomeye.host-search.response+json",
+    "capabilities": [
+      "query",
+      "read",
+      "paginate"
+    ],
+    "asset_types": {
+      "data": "service",
+      "ip": "ip",
+      "site": "domain_candidate",
+      "app": "product_candidate"
+    },
+    "field_mapping": {
+      "data": "data",
+      "ip": "ip",
+      "port": "port",
+      "site": "site",
+      "app": "app"
+    },
+    "pagination": {
+      "kind": "page",
+      "page_size_max": 100,
+      "reliable_full": false,
+      "source_delay": "upstream"
+    },
+    "credentials": {
+      "required": true,
+      "reference_fields": [
+        "key_ref"
+      ],
+      "permission": "host_search"
+    },
+    "cost": {
+      "actual_cost": "unknown_unless_upstream_receipt",
+      "retry": "submitted_unknown_not_replayed",
+      "rate_limit": "upstream"
+    },
+    "runtime": {
+      "kind": "https",
+      "base_url": "https://api.zoomeye.org"
+    },
+    "evidence": {
+      "raw_response": true,
+      "stable_source_link": true,
+      "screenshots": false
+    },
+    "config_fields": [
+      {
+        "key": "base_url",
+        "label": "API Base URL",
+        "kind": "url",
+        "type": "string",
+        "required": false,
+        "default": "https://api.zoomeye.org",
+        "placeholder": "https://api.zoomeye.org"
+      },
+      {
+        "key": "page_size",
+        "label": "Page Size",
+        "kind": "number",
+        "type": "integer",
+        "required": false,
+        "default": 100,
+        "placeholder": "100"
+      },
+      {
+        "key": "max_pages",
+        "label": "Max Pages",
+        "kind": "number",
+        "type": "integer",
+        "required": false,
+        "default": 5,
+        "placeholder": "5"
+      },
+      {
+        "key": "max_items",
+        "label": "Max Items",
+        "kind": "number",
+        "type": "integer",
+        "required": false,
+        "default": 500,
+        "placeholder": "500"
+      }
+    ]
+  }
+]

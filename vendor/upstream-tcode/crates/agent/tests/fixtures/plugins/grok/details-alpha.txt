@@ -1,0 +1,10 @@
+alpha-e84495d9
+  path: /tmp/tcode-probe-grok/home/.grok/installed-plugins/alpha-e84495d9
+  kind: local: /private/tmp/tcode-probe-grok/mkt/plugins/alpha
+  source: mkt
+  installed: 2026-10-03T07:22:24.112923+00:00
+  updated: 2026-10-03T07:22:24.112923+00:00
+  plugins (1):
+    alpha v1.0.0
+  description: Skill, command, SessionStart hook and an unreachable HTTP MCP server
+  components: 1 skill dir(s), 1 command dir(s), 0 agent dir(s), hooks, MCP servers

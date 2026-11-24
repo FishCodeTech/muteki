@@ -1,0 +1,49 @@
+[
+  {
+    "status": "installed",
+    "name": "alpha",
+    "repo_key": "alpha-e84495d9",
+    "version": "1.0.0",
+    "path": "/tmp/tcode-probe-grok/home/.grok/installed-plugins/alpha-e84495d9",
+    "source": "/private/tmp/tcode-probe-grok/mkt/plugins/alpha",
+    "marketplace": "mkt"
+  },
+  {
+    "status": "installed",
+    "name": "epsilon",
+    "repo_key": "multi-0b1623cc",
+    "version": "0.1.0",
+    "path": "/tmp/tcode-probe-grok/home/.grok/installed-plugins/multi-0b1623cc",
+    "source": "/tmp/tcode-probe-grok/multi",
+    "marketplace": null
+  },
+  {
+    "status": "installed",
+    "name": "delta",
+    "repo_key": "multi-0b1623cc",
+    "version": "1.0.0",
+    "path": "/tmp/tcode-probe-grok/home/.grok/installed-plugins/multi-0b1623cc",
+    "source": "/tmp/tcode-probe-grok/multi",
+    "marketplace": null
+  },
+  {
+    "status": "installed",
+    "name": "zeta",
+    "repo_key": "zeta-49137176",
+    "version": "0.1.0",
+    "path": "/tmp/tcode-probe-grok/home/.grok/installed-plugins/zeta-49137176",
+    "source": "/private/tmp/tcode-probe-grok/home/.grok/marketplace-cache/f86a7344487eb091/plugins/zeta",
+    "marketplace": "tools"
+  },
+  {
+    "status": "available",
+    "name": "beta",
+    "version": "0.1.0",
+    "description": "Skill only",
+    "marketplace": "mkt",
+    "skill_count": 1,
+    "has_hooks": false,
+    "has_agents": false,
+    "has_mcp": false
+  }
+]

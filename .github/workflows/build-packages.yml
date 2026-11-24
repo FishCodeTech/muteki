@@ -1,0 +1,167 @@
+name: build-packages
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Commit or tag to package (defaults to the triggering commit)
+        type: string
+        default: ""
+      upload_packages:
+        description: Retain downloadable packages (release/manual runs)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TARGET_DIR: .cache/target
+  CARGO_BUILD_JOBS: "4"
+  RUSTC_WRAPPER: ""
+  NEXT_TELEMETRY_DISABLED: "1"
+
+jobs:
+  native:
+    if: github.repository == 'FishCodeTech/muteki'
+    name: ${{ matrix.platform }}-${{ matrix.arch }} packages
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: darwin
+            arch: arm64
+            runner: macos-15
+          - platform: linux
+            arch: amd64
+            runner: ubuntu-24.04
+          - platform: linux
+            arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    environment:
+      name: ${{ startsWith(github.ref, 'refs/tags/v') && 'macos-release' || 'package-validation' }}
+    steps:
+      - name: Require the triggering tag commit for signed builds
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          PACKAGE_REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$PACKAGE_REF" && "$PACKAGE_REF" != "$GITHUB_SHA" ]]; then
+            echo "Signed packages must use the triggering tag commit" >&2
+            exit 1
+          fi
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+      - name: Import release signing identity
+        if: runner.os == 'macOS' && startsWith(github.ref, 'refs/tags/v')
+        id: signing
+        env:
+          CERTIFICATE_P12: ${{ secrets.RELEASE_MACOS_CERTIFICATE_P12 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.RELEASE_MACOS_CERTIFICATE_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "$CERTIFICATE_P12" || -z "$CERTIFICATE_PASSWORD" ]]; then
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "Signed macOS desktop archive skipped because the protected signing identity is not configured." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          umask 077
+          certificate="$RUNNER_TEMP/muteki-signing.p12"
+          trap 'rm -f "$certificate"' EXIT
+          printf '%s' "$CERTIFICATE_P12" | base64 --decode > "$certificate"
+          password=$(openssl rand -base64 32)
+          keychain="$RUNNER_TEMP/muteki-signing.keychain-db"
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          security import "$certificate" -k "$keychain" -P "$CERTIFICATE_PASSWORD" -T /usr/bin/codesign >/dev/null
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$password" "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain"
+          echo "available=true" >> "$GITHUB_OUTPUT"
+      - name: Install Linux native dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential pkg-config cmake libssl-dev libdav1d-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Record Rust version
+        id: rust
+        shell: bash
+        run: echo "version=$(rustc --version | cut -d ' ' -f 2)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            .cache/target
+          key: rust-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.version }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: rust-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.version }}-
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/frontend/package-lock.json
+      - run: npm --prefix apps/frontend ci --no-audit --no-fund
+      - run: npm --prefix apps/frontend run build
+      - name: Build native Rust release
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == macOS ]]; then
+            cargo build --locked --workspace --release
+          else
+            cargo build --locked -p muteki-server --release
+          fi
+      - name: Package standalone Web release
+        run: node scripts/package-web.mjs --skip-build
+      - name: Start the actual extracted Web release
+        shell: bash
+        run: node scripts/smoke-web-release.mjs dist/web-releases/Muteki-Web-*.tar.gz
+      - name: Package and verify macOS desktop app
+        if: runner.os == 'macOS' && startsWith(github.ref, 'refs/tags/v') && steps.signing.outputs.available == 'true'
+        run: |
+          node scripts/package-macos.mjs --skip-build --zip
+          codesign --verify --deep --strict dist/Muteki.app
+      - name: Build and start the Linux Web container
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          asset=$(basename dist/web-releases/Muteki-Web-*.tar.gz)
+          docker build -f docker/web/Dockerfile --build-arg "RELEASE_ASSET=$asset" -t muteki-web:ci dist/web-releases
+          bash scripts/smoke-web-container.sh muteki-web:ci
+      - name: Write archive checksums
+        shell: bash
+        run: |
+          for asset in dist/web-releases/*.tar.gz dist/*.zip; do
+            [[ -f "$asset" ]] || continue
+            (cd "$(dirname "$asset")" && shasum -a 256 "$(basename "$asset")") > "$asset.sha256"
+          done
+      - uses: actions/upload-artifact@v7.0.2
+        if: inputs.upload_packages
+        with:
+          name: muteki-package-${{ matrix.platform }}-${{ matrix.arch }}
+          retention-days: 3
+          path: |
+            dist/web-releases/Muteki-Web-*.tar.gz*
+            dist/Muteki-*.zip*
+          if-no-files-found: error
+      - name: Save startup diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: startup-logs-${{ matrix.platform }}-${{ matrix.arch }}
+          retention-days: 7
+          path: .cache/ci-logs/
+          include-hidden-files: true
+          if-no-files-found: ignore
+      - name: Remove release signing keychain
+        if: always() && runner.os == 'macOS'
+        run: |
+          keychain="$RUNNER_TEMP/muteki-signing.keychain-db"
+          if [[ -f "$keychain" ]]; then security delete-keychain "$keychain"; fi

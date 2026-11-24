@@ -1,0 +1,106 @@
+.cx-root :focus:not(:focus-visible),
+.cx-portal :focus:not(:focus-visible) {
+  outline: none;
+}
+
+.cx-root :focus-visible,
+.cx-portal :focus-visible {
+  outline: 2px solid var(--cx-focus);
+  outline-offset: 2px;
+}
+
+#main-content:focus,
+#conversation-main-content:focus,
+#chat-main-content:focus,
+#src-main-content:focus,
+#settings-main:focus,
+.workspace-frame-content:focus,
+.cx-root :is(.cx-scroll, .cx-settings-content, [data-cx-layer], [data-cx-focus-scope], [role="dialog"], [role="tabpanel"], [role="menu"], [role="listbox"]):focus,
+.cx-portal :is(.cx-scroll, .cx-settings-content, [data-cx-layer], [data-cx-focus-scope], [role="dialog"], [role="tabpanel"], [role="menu"], [role="listbox"]):focus {
+  outline: none;
+}
+
+.cx-root :is([role="menuitem"], [role="menuitemcheckbox"], [role="menuitemradio"]):focus,
+.cx-portal :is([role="menuitem"], [role="menuitemcheckbox"], [role="menuitemradio"]):focus {
+  outline: none;
+}
+
+.cx-root :is(input:where(:not([type="checkbox"], [type="radio"], [type="range"], [type="file"], [type="color"])), textarea, select):focus,
+.cx-portal :is(input:where(:not([type="checkbox"], [type="radio"], [type="range"], [type="file"], [type="color"])), textarea, select):focus,
+:where(input:not([type="checkbox"], [type="radio"], [type="range"], [type="file"], [type="color"]), textarea, select):focus {
+  outline: none;
+  border-color: var(--cx-field-focus);
+}
+:is(.cx-root, .cx-portal, body) .cx-field:focus,
+:is(.cx-root, .cx-portal, body) .cx-field:focus-within:not(input, textarea, select) {
+  border-color: var(--cx-field-focus);
+  box-shadow: 0 0 0 3px var(--cx-field-ring);
+}
+.cx-root [aria-invalid="true"]:focus,
+.cx-portal [aria-invalid="true"]:focus {
+  border-color: var(--cx-danger);
+}
+.cx-root .cx-slider:focus-visible,
+.cx-portal .cx-slider:focus-visible {
+  outline: none;
+}
+
+.cx-root .cx-prompt-editor:focus,
+.cx-portal .cx-prompt-editor:focus {
+  outline: none;
+  box-shadow: none;
+}
+
+.cx-root ::selection,
+.cx-portal ::selection {
+  color: var(--cx-fg);
+  background: var(--cx-text-selection);
+}
+
+.workspace-frame[data-conversation-layout="true"] .skip-link:focus {
+  outline-color: var(--cx-focus);
+}
+.workspace-frame[data-conversation-layout="true"] .workspace-nav nav > a.active {
+  background: var(--cx-selected);
+}
+.workspace-frame[data-conversation-layout="true"] .workspace-nav nav > a.active::after {
+  background: var(--cx-fg-2);
+}
+.workspace-frame[data-conversation-layout="true"] .workspace-nav nav > a.active svg {
+  color: var(--cx-fg-2);
+}
+
+:is(.cx-root, .cx-portal) [role="checkbox"]:is([aria-checked="true"], [aria-checked="mixed"]) {
+  border-color: var(--cx-fg);
+  background: var(--cx-fg);
+  color: var(--cx-bg);
+}
+:is(.cx-root, .cx-portal) input:is([type="checkbox"], [type="radio"]) {
+  accent-color: var(--cx-fg-2);
+}
+:is(.cx-root, .cx-portal) :is([role="checkbox"], [role="radio"]):focus-visible {
+  box-shadow: none;
+}
+:is(.cx-root, .cx-portal) [role="radio"][data-state="checked"] {
+  border-color: var(--cx-fg);
+}
+:is(.cx-root, .cx-portal) [role="radio"][data-state="checked"] > span {
+  background: var(--cx-fg);
+}
+:is(.cx-root, .cx-portal) [data-state="focused"]:has(> input) {
+  border-color: var(--cx-field-focus);
+  box-shadow: none;
+}
+
+.cx-root .conversation-message-highlight {
+  outline: none;
+  background: var(--cx-selected);
+  animation: cx-message-highlight-fade 2.8s ease-out;
+}
+.cx-root :is(.ai-message.is-cite-highlight, .ai-message .is-cite-highlight, [data-message-id].is-cite-highlight) {
+  outline: none;
+}
+@keyframes cx-message-highlight-fade {
+  from { background: var(--cx-text-selection); }
+  to { background: transparent; }
+}

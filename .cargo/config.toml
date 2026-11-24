@@ -1,0 +1,13 @@
+[build]
+target-dir = ".cache/target"
+rustc-wrapper = "sccache"
+jobs = 4
+
+[env]
+MACOSX_DEPLOYMENT_TARGET = "14.0"
+SCCACHE_DIR = { value = ".cache/sccache", relative = true }
+SCCACHE_CACHE_SIZE = "8G"
+SCCACHE_SERVER_UDS = { value = ".cache/sccache.sock", relative = true }
+
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "link-arg=-zstack-size=8388608", "--cfg", 'getrandom_backend="custom"']

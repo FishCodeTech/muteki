@@ -16,7 +16,9 @@ into $MUTEKI_BLACKBOARD_INGRESS_DIR and the owning host validates + applies them
 its initial graph context is already present in the prompt.
 
 Ordinary Worker usage:
-  blackboard.py context                        # complete role-scoped live view
+  blackboard.py query --id fact_001           # full object or explicit oversized descriptor
+  blackboard.py query --type event --search TEXT --cursor 0  # bounded history page
+  blackboard.py context                        # bounded current Step and source evidence
   blackboard.py submit-fact "<title>" "<content>" # overwriteable draft
   blackboard.py commit-step                    # publish draft and finish Step
   blackboard.py submit-flag '<flag>'             # the only Flag submission API
@@ -36,9 +38,19 @@ import tempfile
 import time
 import uuid
 
+try:
+    _env_file = Path(__file__).resolve().parent / "env.json"
+    if _env_file.is_file():
+        for _k, _v in json.loads(_env_file.read_text(encoding="utf-8")).items():
+            if isinstance(_v, str) and _v:
+                os.environ.setdefault(_k, _v)
+except Exception:
+    pass
+
 _ACTOR = os.environ.get("MUTEKI_WORKER_ID", "worker")
 _INTENT_ID = os.environ.get("MUTEKI_INTENT_ID", "").strip()
 _TARGET_EPOCH = os.environ.get("MUTEKI_TARGET_EPOCH", "1").strip() or "1"
+_EXECUTION_GENERATION = int(os.environ.get("MUTEKI_EXECUTION_GENERATION", "1") or "1")
 _AUTONOMOUS_PROFILE = (
     os.environ.get("MUTEKI_BLACKBOARD_PROFILE", "").strip().casefold()
     == "autonomous"
@@ -49,11 +61,11 @@ _CHALLENGE_MODE = (
 )
 
 _SOLVE_COMMANDS = (
-    {"context", "read-artifact", "submit-fact", "commit-step", "mark-deadend", "request-input", "save-poc"}
+    {"query", "context", "read-artifact", "submit-fact", "commit-step", "mark-deadend", "request-input", "save-poc"}
     | ({"recent-evidence", "submit-report"} if _CHALLENGE_MODE == "pentest" else set())
     | ({"submit-flag"} if _CHALLENGE_MODE == "ctf" else set())
     if _CHALLENGE_MODE in {"ctf", "pentest"}
-    else {"context", "write-fact", "mark-deadend", "request-input", "save-poc", "submit-flag"}
+    else {"query", "context", "write-fact", "mark-deadend", "request-input", "save-poc", "submit-flag"}
 )
 
 if _CHALLENGE_MODE == "ctf" and os.environ.get("MUTEKI_TARGET_RESTART_AVAILABLE") == "1":
@@ -62,16 +74,16 @@ if _CHALLENGE_MODE == "ctf" and os.environ.get("MUTEKI_TARGET_RESTART_AVAILABLE"
 _ROLE_COMMANDS = {
     "solve": _SOLVE_COMMANDS,
     "verifier": (
-        {"context", "read-artifact", "submit-fact", "commit-step", "mark-deadend", "save-poc"}
+        {"query", "context", "read-artifact", "submit-fact", "commit-step", "mark-deadend", "save-poc"}
         | ({"recent-evidence", "submit-report"} if _CHALLENGE_MODE == "pentest" else set())
         if _CHALLENGE_MODE in {"ctf", "pentest"}
-        else {"context", "write-fact", "mark-deadend", "save-poc"}
+        else {"query", "context", "write-fact", "mark-deadend", "save-poc"}
     ),
     "review": {
-        "context", "review-finding", "challenge-fact", "merge-fact",
+        "query", "context", "read-artifact", "commit-step", "mark-deadend", "review-finding", "challenge-fact", "merge-fact",
         "reject-fact", "revalidate-fact",
     },
-    "respond": {"context"},
+    "respond": {"query", "context"},
 }
 for _commands in (_ROLE_COMMANDS["solve"], _ROLE_COMMANDS["verifier"], _ROLE_COMMANDS["review"]):
     _commands.update({"mcp-tools", "mcp-schema", "mcp-call"})
@@ -87,7 +99,6 @@ def _db_path() -> str:
 
 
 def _conn() -> sqlite3.Connection:
-    # Post-solve respond receives read-only board access.
     path = os.path.abspath(_db_path())
     c = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=10)
     c.execute("PRAGMA query_only=ON")
@@ -128,11 +139,6 @@ def _retired_fact_seqs(c: sqlite3.Connection) -> set:
 
 
 def _challenge_id(c: sqlite3.Connection) -> str:
-    # Pick the first NON-EMPTY challenge_id. Some events are written with an empty
-    # challenge_id, and a bare `LIMIT 1` could grab one of those — then claim's
-    # `WHERE challenge_id=?` matched nothing and always returned LOST even for an
-    # open intent. Fall back to the intents table (those rows reliably carry the run
-    # id), then to "" as a last resort.
     row = c.execute(
         "SELECT challenge_id FROM events "
         "WHERE challenge_id IS NOT NULL AND challenge_id != '' LIMIT 1"
@@ -154,7 +160,7 @@ def read_facts(verified_only: bool) -> None:
     out = []
     for seq, payload, verified, conf in c.execute(q).fetchall():
         if int(seq) in retired:
-            continue  # rejected/merged/superseded by review — not evidence
+            continue
         if verified_only and not verified:
             continue
         d = json.loads(payload)
@@ -169,9 +175,6 @@ def read_facts(verified_only: bool) -> None:
 
 
 def read_flags() -> None:
-    """Flags teammates have already recovered. On a MULTI-FLAG challenge, read
-    this before submitting so you don't re-hunt one a teammate already found —
-    go after the ones NOT listed here."""
     c = _conn()
     rows = c.execute(
         "SELECT payload, kind FROM events "
@@ -184,7 +187,7 @@ def read_flags() -> None:
         if kind == "flag_found" and f not in found:
             found.append(f)
         elif kind == "flag_invalidated" and f in found:
-            found.remove(f)  # a false positive was retracted
+            found.remove(f)
     if not found:
         print("(no flags recovered yet — you may be the first)")
         return
@@ -200,9 +203,6 @@ def submit_flag(flag: str) -> None:
         and os.environ.get("MUTEKI_PLATFORM_CONFIRMATION_REQUIRED") != "1"
     ):
         return
-    # The first receipt only records the local candidate.  The hosted runner
-    # submits it to the platform independently; wait briefly for that distinct
-    # verdict so the current model turn can react without losing its session.
     deadline = time.monotonic() + 8.0
     while time.monotonic() < deadline:
         request_id = _write_request("platform_verdict", {"flag": str(flag)})
@@ -269,6 +269,8 @@ def _write_request(operation: str, payload: dict) -> str:
         "protocol": "muteki-blackboard-v2",
         "request_id": request_id,
         "operation": operation,
+        "worker_id": _ACTOR,
+        "execution_generation": _EXECUTION_GENERATION,
         "created_at": time.time(),
     }
     body.update(payload)
@@ -303,7 +305,7 @@ def _await_request_result(request_id: str, timeout_s: float = 30.0) -> dict | No
         except FileNotFoundError:
             pass
         except (OSError, ValueError):
-            pass  # partially written — retry next tick
+            pass
         if time.time() >= deadline:
             return None
         time.sleep(0.2)
@@ -462,8 +464,6 @@ def list_intents() -> None:
     select_cols = ["intent_id", "goal"]
     for optional in ("worker_class", "route_hash", "branch_id"):
         select_cols.append(optional if optional in cols else "''")
-    # only dispatch_state='active' intents are claimable; resume/retired/closed are
-    # held back (the column is absent on old DBs → no filter, same as before).
     where = "status='open'"
     if "dispatch_state" in cols:
         where += " AND dispatch_state='active'"
@@ -485,7 +485,6 @@ def list_intents() -> None:
             meta.append(f"branch={branch_id}")
         suffix = f" [{' '.join(meta)}]" if meta else ""
         print(f"- {iid}: {goal}{suffix}")
-
 
 
 def write_fact(text: str, verified: bool, witness: str = "", *,
@@ -630,7 +629,7 @@ def refresh_context() -> None:
     if result is None:
         _request_timeout()
     if not result.get("ok"):
-        print(str(result.get("detail") or "context unavailable"), file=sys.stderr)
+        print(str(result.get("error") or result.get("detail") or "context unavailable"), file=sys.stderr)
         sys.exit(2)
     print(str(result.get("content") or "(no scoped context available)"))
 
@@ -691,15 +690,12 @@ def _norm_activity_key(key: str) -> str:
 
 
 def claim_activity(key: str, lease_s: float = 600.0) -> None:
-    """P4: claim a high-cost activity (e.g. 'nmap:8.130.96.176'). WON = go ahead;
-    LOST = a teammate is already doing it, AVOID redoing."""
     claim_id = _write_request("claim_activity", {"key": key})
     _print_claim_verdict(_await_request_result(claim_id))
     return
 
 
 def list_activities() -> None:
-    """P4: in-progress activities (lease not expired) a teammate is doing now."""
     c = _conn()
     cid = _challenge_id(c)
     now = time.time()
@@ -727,8 +723,6 @@ def _normalize_resource_key(key: str) -> str:
 
 def claim_resource(resource_key: str, scope: str = "activity",
                    risk_class: str = "", lease_s: float = 600.0) -> None:
-    """E: claim a shared RESOURCE (exclusive site/account/listener). WON = exclusive
-    access granted; LOST = a teammate holds it — do not run conflicting work."""
     claim_id = _write_request("claim_resource", {
         "resource_key": resource_key, "scope": scope,
         "risk_class": risk_class})
@@ -737,7 +731,6 @@ def claim_resource(resource_key: str, scope: str = "activity",
 
 
 def release_resource(resource_key: str) -> None:
-    """E: release a resource lock this worker holds (owner-fenced, best-effort)."""
     claim_id = _write_request("release_resource",
                             {"resource_key": resource_key})
     result = _await_request_result(claim_id)
@@ -748,7 +741,6 @@ def release_resource(resource_key: str) -> None:
 
 
 def read_resource_locks() -> None:
-    """E: active resource locks a teammate holds now (avoid conflicting work)."""
     c = _conn()
     cid = _challenge_id(c)
     now = time.time()
@@ -770,7 +762,6 @@ def read_resource_locks() -> None:
 
 
 def read_directives() -> None:
-    """B: operator directives the swarm must respect (highest priority guidance)."""
     c = _conn()
     cid = _challenge_id(c)
     if not _has_table(c, "operator_directives"):
@@ -790,7 +781,6 @@ def read_directives() -> None:
 
 
 def directive_status(directive_id: str) -> None:
-    """B: delivery status of one operator directive."""
     c = _conn()
     cid = _challenge_id(c)
     if not _has_table(c, "operator_directives"):
@@ -809,8 +799,6 @@ def directive_status(directive_id: str) -> None:
 
 
 def _read_guard(fn, *args) -> None:
-    """Ordinary-mode board reads degrade gracefully: an unreadable DB prints a
-    stderr note and empty output instead of crashing the worker's turn."""
     try:
         fn(*args)
     except sqlite3.OperationalError as exc:
@@ -819,7 +807,7 @@ def _read_guard(fn, *args) -> None:
 
 def main() -> None:
     def _reg(name: str):
-        if name not in _ROLE_COMMANDS.get(_ROLE, {"context"}):
+        if name not in _ROLE_COMMANDS.get(_ROLE, {"query", "context"}):
             return None
         return sub.add_parser(name)
 
@@ -925,6 +913,13 @@ def main() -> None:
     if p is not None:
         p.add_argument("fact_seq", type=int)
         p.add_argument("--reason", required=True)
+    p = _reg("query")
+    if p is not None:
+        p.add_argument("--current", action=argparse.BooleanOptionalAction, default=None)
+        for field in ("id", "type", "status", "related", "search", "sources-of", "artifact-id"):
+            p.add_argument("--" + field)
+        for field in ("cursor", "limit", "offset", "length", "after-seq"):
+            p.add_argument("--" + field, type=int)
     _reg("context")
     _reg("recent-evidence")
     p = _reg("read-artifact")
@@ -1045,6 +1040,16 @@ def main() -> None:
         reject_fact(args.fact_seq, args.reason)
     elif args.cmd == "revalidate-fact":
         revalidate_fact(args.fact_seq, args.reason)
+    elif args.cmd == "query":
+        payload = {key: getattr(args, key) for key in ("id", "type", "status", "related", "search", "cursor", "limit", "offset", "length", "after_seq", "sources_of", "artifact_id", "current") if getattr(args, key) is not None}
+        request_id = _write_request("board_query", payload)
+        result = _await_request_result(request_id)
+        if result is None:
+            _request_timeout()
+        if not result.get("ok"):
+            print(str(result.get("error") or result.get("detail") or "query failed"), file=sys.stderr)
+            sys.exit(2)
+        print(str(result.get("content")))
     elif args.cmd == "context":
         refresh_context()
     elif args.cmd == "recent-evidence":

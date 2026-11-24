@@ -1,0 +1,9 @@
+{"method":"turn/started","params":{"threadId":"thread-1","turn":{"id":"turn-1","items":[],"itemsView":{"type":"full"},"status":"inProgress","error":null,"startedAt":1,"completedAt":null,"durationMs":null}}}
+{"method":"item/started","params":{"threadId":"thread-1","turnId":"turn-1","item":{"type":"fileChange","id":"patch-1","changes":[{"path":"/tmp/probe-codex/hello.txt","kind":{"type":"add"},"diff":"hi\n"}],"status":"inProgress"},"startedAtMs":1}}
+{"id":41,"method":"item/fileChange/requestApproval","params":{"threadId":"thread-1","turnId":"turn-1","itemId":"patch-1","startedAtMs":2,"reason":null,"grantRoot":null}}
+{"method":"item/agentMessage/delta","params":{"threadId":"thread-1","turnId":"turn-1","itemId":"message-1","delta":"PONG"}}
+{"method":"item/reasoning/summaryTextDelta","params":{"threadId":"thread-1","turnId":"turn-1","itemId":"reasoning-1","delta":"Checking"}}
+{"method":"item/commandExecution/outputDelta","params":{"threadId":"thread-1","turnId":"turn-1","itemId":"command-1","delta":"ok\n"}}
+{"method":"thread/tokenUsage/updated","params":{"threadId":"thread-1","turnId":"turn-1","tokenUsage":{"total":{"totalTokens":123,"inputTokens":100,"cachedInputTokens":20,"outputTokens":23,"reasoningOutputTokens":3},"last":{"totalTokens":12,"inputTokens":8,"cachedInputTokens":2,"outputTokens":4,"reasoningOutputTokens":1},"modelContextWindow":200000}}}
+{"method":"item/completed","params":{"threadId":"thread-1","turnId":"turn-1","item":{"type":"fileChange","id":"patch-1","changes":[{"path":"/tmp/probe-codex/hello.txt","kind":{"type":"add"},"diff":"hi\n"}],"status":"completed"},"completedAtMs":3}}
+{"method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-1","items":[],"itemsView":{"type":"full"},"status":"completed","error":null,"startedAt":1,"completedAt":2,"durationMs":1000}}}

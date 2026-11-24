@@ -1,0 +1,121 @@
+{
+  "extends": ["next/core-web-vitals", "next/typescript"],
+  "ignorePatterns": ["lib/contracts/openapi.ts", "next-env.d.ts", ".next*/**", "out/**"],
+  "rules": {
+    "@typescript-eslint/no-explicit-any": "off",
+    "@typescript-eslint/no-unused-vars": ["warn", { "ignoreRestSiblings": true }],
+    "no-restricted-imports": [
+      "error",
+      {
+        "paths": [
+          {
+            "name": "playwright",
+            "message": "Playwright is banned in this repo. Web E2E must use kimi-webbridge and Desktop E2E must use cua-driver (see .agents/skills/verify/SKILL.md)."
+          },
+          {
+            "name": "@playwright/test",
+            "message": "Playwright is banned in this repo. Web E2E must use kimi-webbridge and Desktop E2E must use cua-driver (see .agents/skills/verify/SKILL.md)."
+          },
+          {
+            "name": "playwright-core",
+            "message": "Playwright is banned in this repo. Web E2E must use kimi-webbridge and Desktop E2E must use cua-driver (see .agents/skills/verify/SKILL.md)."
+          },
+          {
+            "name": "playwright-chromium",
+            "message": "Playwright is banned in this repo. Web E2E must use kimi-webbridge and Desktop E2E must use cua-driver (see .agents/skills/verify/SKILL.md)."
+          },
+          {
+            "name": "react-aria",
+            "message": "Removed HeroUI/React Aria dependency is banned by #498. Use @muteki/ui primitives."
+          },
+          {
+            "name": "react-aria-components",
+            "message": "Removed HeroUI/React Aria dependency is banned by #498. Use @muteki/ui primitives."
+          },
+          {
+            "name": "tailwind-variants",
+            "message": "Removed HeroUI dependency is banned by #498. Use @muteki/ui primitives."
+          },
+          {
+            "name": "tw-animate-css",
+            "message": "Removed HeroUI dependency is banned by #498. Use @muteki/ui CSS utilities."
+          },
+          {
+            "name": "input-otp",
+            "message": "Removed HeroUI dependency is banned by #498. Use @muteki/ui primitives."
+          },
+          {
+            "name": "lucide-react",
+            "message": "Use <Icon name=... /> from @muteki/ui instead of raw lucide-react."
+          },
+          {
+            "name": "shiki",
+            "message": "Import engine facades from @muteki/ui/engines/* instead of raw third-party engines."
+          },
+          {
+            "name": "katex",
+            "message": "Import engine facades from @muteki/ui/engines/* instead of raw third-party engines."
+          },
+          {
+            "name": "react-markdown",
+            "message": "Import engine facades from @muteki/ui/engines/* instead of raw third-party engines."
+          },
+          {
+            "name": "remark-gfm",
+            "message": "Import engine facades from @muteki/ui/engines/* instead of raw third-party engines."
+          },
+          {
+            "name": "remark-math",
+            "message": "Import engine facades from @muteki/ui/engines/* instead of raw third-party engines."
+          },
+          {
+            "name": "remark-parse",
+            "message": "Import engine facades from @muteki/ui/engines/* instead of raw third-party engines."
+          },
+          {
+            "name": "remark-rehype",
+            "message": "Import engine facades from @muteki/ui/engines/* instead of raw third-party engines."
+          },
+          {
+            "name": "unified",
+            "message": "Import engine facades from @muteki/ui/engines/* instead of raw third-party engines."
+          },
+          {
+            "name": "@tanstack/react-virtual",
+            "message": "Import engine facades from @muteki/ui/engines/* instead of raw third-party engines."
+          }
+        ],
+        "patterns": [
+          {
+            "group": ["@playwright/*"],
+            "message": "Playwright is banned in this repo. Web E2E must use kimi-webbridge and Desktop E2E must use cua-driver (see .agents/skills/verify/SKILL.md)."
+          },
+          {
+            "group": [
+              "@heroui/*",
+              "@react-aria/*",
+              "@react-stately/*",
+              "@react-types/*",
+              "@internationalized/*",
+              "@radix-ui/*"
+            ],
+            "message": "Removed HeroUI/React Aria/Radix dependency is banned by #498. Use @muteki/ui primitives."
+          },
+          {
+            "group": ["@ui-sdk/*"],
+            "message": "Use @muteki/ui primitives instead of raw @ui-sdk/*."
+          },
+          {
+            "group": [
+              "shiki/*",
+              "katex/*",
+              "@xterm/*",
+              "@codemirror/*"
+            ],
+            "message": "Import engine facades from @muteki/ui/engines/* instead of raw third-party engines."
+          }
+        ]
+      }
+    ]
+  }
+}

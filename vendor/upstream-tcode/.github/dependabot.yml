@@ -1,0 +1,32 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: daily
+    open-pull-requests-limit: 10
+    # One grouped pull request for routine bumps; majors stay separate so a
+    # breaking update is reviewed on its own.
+    groups:
+      cargo-minor-and-patch:
+        update-types: ["minor", "patch"]
+    ignore:
+      # crates/ui pins webview2-com 0.38 / windows-core 0.61 to the versions
+      # lb-wry 0.53 resolves so both sides share the same WebView2 COM types.
+      # Lift these once lb-wry moves to webview2-com 0.39 / windows-core 0.62.
+      - dependency-name: windows-core
+        update-types: ["version-update:semver-minor"]
+      - dependency-name: webview2-com
+        update-types: ["version-update:semver-minor"]
+      # crates/platform/gpui-ios caps libc below 0.2.190, which gates dyld
+      # bindings and in6_ifreq to macOS (#668). Lift with that cap.
+      - dependency-name: libc
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: daily
+    open-pull-requests-limit: 10
+    groups:
+      github-actions:
+        patterns: ["*"]

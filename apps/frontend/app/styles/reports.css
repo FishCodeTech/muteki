@@ -1,0 +1,59 @@
+
+.reports-list-pane {
+  position: relative;
+}
+@media (min-width: 1024px) {
+  .reports-split-grid {
+    grid-template-columns: var(--reports-list-width, 280px) minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr);
+  }
+  .reports-list-pane::after {
+    content: "";
+    position: absolute;
+    inset: 16px 0 16px auto;
+    width: 1px;
+    pointer-events: none;
+    background: linear-gradient(
+      to bottom,
+      transparent,
+      var(--cx-border-subtle) 40px,
+      var(--cx-border-subtle) calc(100% - 40px),
+      transparent
+    );
+  }
+}
+
+.report-editor-area {
+  display: block;
+  width: 100%;
+  height: 100%;
+  background: var(--cx-bg);
+  color: var(--cx-fg);
+  font-family: var(--cx-font-mono);
+  font-size: 13px;
+  line-height: 1.75;
+}
+.report-editor-area .cm-editor { height: 100%; }
+.report-editor-area .cm-editor.cm-focused { outline: 0; }
+.report-editor-area .cm-editor .cm-scroller { font: inherit; overflow: auto; }
+.report-editor-area .cm-editor .cm-content { padding: 16px 0 48px; caret-color: var(--cx-accent); }
+.report-editor-area .cm-editor .cm-lineWrapping { min-width: 0; white-space: pre-wrap; word-break: normal; overflow-wrap: anywhere; }
+.report-editor-area .cm-editor .cm-line { padding: 0 24px; }
+.report-editor-area[data-centered="true"] .cm-editor .cm-content {
+  max-width: 820px;
+  width: 100%;
+  margin: 0 auto;
+  padding: 16px 24px 56px;
+}
+@media (min-width: 640px) {
+  .report-editor-area[data-centered="true"] .cm-editor .cm-content {
+    padding: 16px 40px 56px;
+  }
+}
+.report-editor-area[data-centered="true"] .cm-editor .cm-line { padding: 0; }
+.report-editor-area .cm-editor .cm-placeholder { color: var(--cx-fg-4); }
+.report-editor-area[data-disabled] { opacity: 0.6; }
+.report-editor-area ::selection { background: var(--cx-text-selection); }
+
+.report-prose { --cx-msg-fs: 15px; }
+.report-prose img.cx-md-img { max-width: 100%; height: auto; }

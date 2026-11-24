@@ -13,33 +13,33 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/FishCodeTech/muteki/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-blue.svg" alt="License"></a>
-  <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-≥3.13-3776AB.svg?logo=python&logoColor=white" alt="Python"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-blue.svg" alt="License"></a>
+  <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/backend-Rust-000000.svg?logo=rust&logoColor=white" alt="Rust backend"></a>
   <a href="https://github.com/FishCodeTech/muteki/stargazers"><img src="https://img.shields.io/github/stars/FishCodeTech/muteki?style=social" alt="Stars"></a>
-  <a href="https://atomgit.com/FishCodeTech/muteki"><img src="https://atomgit.com/FishCodeTech/muteki/star/badge.svg" alt="AtomGit Star"></a>
+  <a href="https://atomgit.com/FishCodeTech/muteki"><img src="https://atomgit.com/FishCodeTech/muteki/star/badge.svg" alt="AtomGit project mirror"></a>
   <a href="https://github.com/FishCodeTech/muteki/issues"><img src="https://img.shields.io/github/issues/FishCodeTech/muteki" alt="Issues"></a>
   <a href="https://github.com/FishCodeTech/muteki/pulls"><img src="https://img.shields.io/github/issues-pr/FishCodeTech/muteki" alt="PRs"></a>
-  <img src="https://img.shields.io/badge/NYU_CTF_Bench-200%2F200_solved-brightgreen" alt="Benchmark">
-  <img src="https://img.shields.io/badge/engines-8_active_CLIs-orange" alt="Eight available CLI engines; DeepSeek Harness is registered but temporarily unavailable">
+  <img src="https://img.shields.io/badge/NYU_CTF_Bench_(Python)-200%2F200_solved-brightgreen" alt="Benchmark">
+  <img src="https://img.shields.io/badge/engines-9_CLIs-orange" alt="Nine CLI engines; availability depends on credentials and runtime">
 </p>
 
 <p align="center">
-  <strong>English</strong> · <a href="README_CN.md">简体中文</a> · <a href="CHANGELOG.md">Changelog</a> · <a href="DISCLAIMER.md">Disclaimer (中文)</a> · <a href="docs/development.md">Dev build guide</a>
+  <strong>English</strong> · <a href="README_CN.md">简体中文</a> · <a href="https://github.com/FishCodeTech/muteki/blob/v0.4.7/CHANGELOG.md">Python changelog</a> · <a href="DISCLAIMER.md">Disclaimer (中文)</a> · <a href="#development">Dev build guide</a>
 </p>
 
 <p align="center">
-  <a href="https://www.star-history.com/#fishcodetech/muteki&amp;Date">
+  <a href="https://www.star-history.com/#FishCodeTech/muteki&amp;Date">
     <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=fishcodetech/muteki&amp;type=Date&amp;theme=dark">
-      <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=fishcodetech/muteki&amp;type=Date">
-      <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=fishcodetech/muteki&amp;type=Date">
+      <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=FishCodeTech/muteki&amp;type=Date&amp;theme=dark">
+      <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=FishCodeTech/muteki&amp;type=Date">
+      <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=FishCodeTech/muteki&amp;type=Date">
     </picture>
   </a>
 </p>
 
 ---
 
-**無敵 · Project Muteki** is an open-source, multi-agent security framework built with Remix Engineering. A Coordinator schedules different Agent engines toward one goal, manages their context, and lets them collaborate through shared evidence. The current Worker engines are Claude, Codex, Cursor, Pi, OMP, Kimi, Grok, and OpenCode. The project will keep expanding beyond CTF toward a broader Agent workbench.
+**無敵 · Project Muteki** is an open-source, multi-agent security framework built with Remix Engineering. A Coordinator schedules different Agent engines toward one goal, manages their context, and lets them collaborate through shared evidence. The current Worker engines are Claude, Codex, Cursor, Pi, OMP, Kimi, Grok, OpenCode, and Droid. The project will keep expanding beyond CTF toward a broader Agent workbench.
 
 > ## ⚠️ Read before running
 >
@@ -73,34 +73,41 @@ After a month of engineering work, tuning, and fixes, Muteki is open source with
 
 ---
 
-## Release notes
+## Repositories and versions
 
-The current version is **0.4.7**. See [CHANGELOG.md](CHANGELOG.md) for new features, behavior changes, removals, and upgrade notes.
+| Location | Purpose |
+| --- | --- |
+| [FishCodeTech/muteki](https://github.com/FishCodeTech/muteki) | Public source, releases and user issues; use this address for sharing, stars and public feedback |
+| [AtomGit](https://atomgit.com/FishCodeTech/muteki) | Project mirror; check its actual content for synchronization status |
 
-The [0.4.7 release](https://github.com/FishCodeTech/muteki/releases/tag/v0.4.7) includes a macOS desktop app for Apple silicon and Intel, with a bundled local service and support for remote Muteki services. Windows and Linux desktop packages are not included. Web and container deployments remain available.
+The current public release is [v0.5.0](https://github.com/FishCodeTech/muteki/releases/tag/v0.5.0). It moves the main application from the Python/FastAPI and Electron stack used by v0.4.7 to the Rust service, Next.js frontend and native macOS shell in this repository.
 
-The macOS packages are ad-hoc signed and are not notarized. Published 0.4.1 desktop installs need a manual first install of 0.4.2 because they do not include the update screen. In 0.4.2, global settings can check and install official releases after GitHub SHA-256 and strict signature verification. Local candidate updates require a stable Developer ID signature.
+Existing managed v0.4.7 Web installations can upgrade through the stable command. The updater verifies the compatibility bundle and the platform-specific native package before switching the installation:
 
----
+```bash
+muteki upgrade v0.5.0
+```
 
-## Quick start
+## Rust development quick start
 
 > **Start with the CTF or penetration-testing workspace.** Both appear on the home page by default. Conversation and competition workspaces are optional and can be enabled in appearance settings as described below.
 
 ### 1. Prepare the environment and start the Web app
 
-You need [uv](https://docs.astral.sh/uv/), Python 3.13 or newer, and Node.js/npm. For local solving, install and sign in to at least one supported Agent CLI. `./init.sh` syncs Python dependencies; the first Web start installs and builds the frontend. The shortest manual path is:
+Install **Node.js 22/npm**, a **stable Rust toolchain with edition 2024 support**, and **sccache**. The repository Cargo wrapper requires sccache. Native build dependencies include a C/C++ toolchain, CMake, pkg-config and dav1d; Linux also needs OpenSSL development headers. See the platform dependency steps in [the release workflow](.github/workflows/build-packages.yml). For local solving, install and sign in to at least one supported Agent CLI.
 
 ```bash
 git clone https://github.com/FishCodeTech/muteki.git
 cd muteki
-./init.sh
-./run.sh web
+npm --prefix apps/frontend ci
+node scripts/cargo.mjs build -p muteki-server --release -j 1
+npm --prefix apps/frontend run build
+node scripts/dev.mjs --web --release --skip-build
 ```
 
-Open **http://127.0.0.1:3001**. The backend defaults to port `8000`; both bind to loopback by default. The first frontend build and service initialization may take a while. Use the addresses and readiness output shown in the terminal. Stop the service with `Ctrl+C`.
+Open **http://127.0.0.1:3101**. The Rust API defaults to `127.0.0.1:8100`; the frontend proxies API calls. No Python Web service or `uv` environment is needed to start this Rust Web app. First-time compilation can take a while. `Ctrl+C` stops the services started by this command; an already-running service it reused is kept.
 
-![Current Web home page with the single-challenge workspace shown by default](./assets/readme-cn-home.png)
+![Single-challenge home page from the earlier UI](./assets/readme-cn-home.png)
 
 ### 2. Complete the minimum configuration
 
@@ -123,68 +130,54 @@ On **Single task**, enter the challenge name, original description, target URL, 
 
 Only run challenges and targets you own or are authorized to test. Workers can execute commands and access target services.
 
-## Recommended runtime and tool installation
+## Runtime choices and Worker tools
 
-The project has been tested on **macOS 26** and **Ubuntu 24.04**. On Windows, we recommend running Muteki inside an Ubuntu 24.04 VMware virtual machine.
-
-| Runtime | Where Muteki and Workers run | Tool setup |
+| Runtime | Application and Worker location | Status / setup |
 | --- | --- | --- |
-| **macOS local** | Web and Workers on the Mac | Run `./ctf-tools/setup.sh` for native CTF tools |
-| **macOS + Docker** | Web on the Mac; Workers in Docker | Pull the full Worker image, which includes the CTF toolchain |
-| **Ubuntu 24.04 local** | Web and Workers on Ubuntu | Use the installer with `--with-ctf-tools`, or run `./ctf-tools/setup-ubuntu.sh` |
-| **Windows + VMware** | Windows hosts the VM and browser; Muteki and Workers run inside Ubuntu 24.04 | Run the Ubuntu installer in the VM |
+| **macOS local** | Rust Web or desktop app; host CLI Workers | Apple silicon build and real model flows exercised; install CLIs and security tools separately |
+| **macOS + Docker Desktop** | App on the Mac; Linux Worker containers | Shared/per-Run execution exercised; prepare the curated Worker image and injectable credentials |
+| **Linux Web / Compose** | Rust Web plus an independent Runner | Native Ubuntu 24.04 arm64 exercised; native amd64 model execution is not yet certified |
+| **Windows** | Use a Linux environment appropriate to your setup | No native Windows desktop package or end-to-end Windows/Docker Desktop acceptance is claimed |
 
-### 1. macOS local
+### Curated Kali Worker image
 
-Install Homebrew, Node.js/npm, and the Agent CLI you intend to use. Sign in using that vendor's CLI, then run from the repository root:
-
-```bash
-./init.sh
-export PATH="$HOME/.local/bin:$PATH"  # If newly installed uv is not yet on PATH
-./ctf-tools/setup.sh
-./run.sh web
-```
-
-The setup script uses [`ctf-tools/Brewfile`](ctf-tools/Brewfile), prepares Python/Ruby tool environments, and creates command entry points. It **does not sign in to Agent CLIs**. Select Local under **Single-task settings → Runtime environment**. When `ctf-tools/.ready` exists, `run.sh` loads its tool paths automatically. See [`ctf-tools/README.md`](ctf-tools/README.md) for optional large dictionaries and knowledge copied from the Worker image. To refresh only existing tool links, run `./ctf-tools/setup.sh --link-only`. macOS native tools and those inside the Kali image are not identical.
-
-### 2. macOS with Docker Workers
-
-Install and start Docker Desktop, then run:
+The default Worker recipe contains nine CLIs and a curated CTF/security toolchain, with heavy specialist dependencies in an optional layer. ZCode is not included. To build the local `muteki-worker:latest` image:
 
 ```bash
-./init.sh
-docker pull ghcr.io/fishcodetech/muteki-worker:latest
-./run.sh web
+./docker/worker/build.sh
 ```
 
-Select Container under **Single-task settings → Runtime environment**. Check that Docker and the Worker image are available, then bind **injectable credentials** to the selected Workers. Host CLI logins are not automatically copied into containers. The full image already contains the CTF toolchain, so `ctf-tools/setup.sh` is not needed on the Mac for this mode. The Web app stays on the Mac; Docker starts Workers per run.
+This is an optional Docker image build, separate from building the Web app. It downloads dependencies and needs Python 3 for capability generation; Go is used when installed, otherwise the script uses a Go builder container. The release workflow verifies the curated and optional specialist variants on their native architectures. Do not assume an older registry `latest` tag contains the new Rust-compatible image.
 
-### 3. Ubuntu 24.04 local
+### Shared or per-Run containers
 
-```bash
-git clone https://github.com/FishCodeTech/muteki.git
-cd muteki
-./scripts/install-ubuntu.sh --backend local --preflight
-./scripts/install-ubuntu.sh --backend local --with-ctf-tools
-./scripts/install-ubuntu.sh --backend local --check
-```
+A shared pool can execute multiple Runs in one compatible container. Each Run has its own workspace and process lifecycle; stopping one should leave its neighbors running. Per-Run mode uses a separate container for each Run. Shared mode is not an OS security boundary between untrusted tasks; image, network, privileges and credential trust domains determine pool compatibility.
 
-The installer prepares application dependencies, Node.js, the Web service, and local Worker CLIs; it calls `ctf-tools/setup-ubuntu.sh` for the available CTF tools. Agent CLIs still need their own login or configured credentials. By default it creates `muteki-web.service`, stores the Web password in `~/.config/muteki/ubuntu.env`, and serves the UI on port `3001`. Optional apt packages may be unavailable on some mirrors or architectures; the script reports those individually.
+The execution node recommends concurrency from its resources. You can use the recommendation, set manual limits, or explicitly disable scheduling concurrency limits. Disabling this limit does not remove separately configured CPU/memory quotas, task budgets or authorization rules. Excess work queues visibly when limits are enabled. Pausing processes does not release their memory.
 
-If Muteki is already installed and running, you can install just the local CTF tools with `./ctf-tools/setup-ubuntu.sh` after ensuring `uv` is available. That script has only been tested on Ubuntu 24.04; other Linux distributions may need changes. Once `ctf-tools/.ready` exists, `./run.sh web` loads the tool paths.
+### Independent Runner
 
-### 4. Windows with an Ubuntu VMware guest
+Web handles task policy and records; the Runner controls Docker and Worker processes. In Compose, only the Runner mounts the Docker socket. Remote Runner registration, authenticated TLS/WSS, file transfer and reconnect logic are implemented; external NAT/VPS and all failure windows are not fully certified. Release workflow results record the package, container and runtime checks performed for each version.
 
-Create an **Ubuntu 24.04** VM, clone the repository inside it, and run the same installer commands there:
+### Remote Runner
 
-```bash
-git clone https://github.com/FishCodeTech/muteki.git
-cd muteki
-./scripts/install-ubuntu.sh --backend local --with-ctf-tools
-./scripts/install-ubuntu.sh --backend local --check
-```
+Manage remote nodes in **Settings → CTF Worker → Execution nodes**:
 
-Muteki, Agent CLIs, CTF tools, and run data stay inside Ubuntu. Open `http://<VM-IP>:3001` from Windows and use the Web password saved in the VM's `~/.config/muteki/ubuntu.env`. If VMware NAT prevents access to the VM IP, configure port forwarding or use a suitable virtual network. The backend API still listens only on the VM loopback address by default.
+1. Turn on the remote node listener, enter a listen address (for example `0.0.0.0:7443`) and the public URL nodes can reach (for example `https://203.0.113.10:7443`), then save. The change applies immediately. On first use Web generates a private CA and a server certificate in its data directory; the public URL's host name or IP is included in the certificate. The page shows the CA fingerprint and offers `ca.pem` for download. A listener configured with `--runner-tls-listen/--runner-tls-cert/--runner-tls-key` can only be changed on the command line and is read-only in the page.
+2. Under "Enroll a node", enter a name and lifetime (at most 15 minutes) to create single-use commands. They contain the token and the CA fingerprint, and the Runner trusts only that CA. The commands are shown once; keep them out of shared shell history.
+3. On the remote machine (Docker and the same `muteki-server` version are required), run the commands from the page:
+
+   ```bash
+   printf '%s' '<token>' | muteki-server runner enroll --state-dir "$HOME/.muteki-runner" \
+     --server https://203.0.113.10:7443 --ca-sha256 <fingerprint> --token-file /dev/stdin
+   muteki-server runner --remote --state-dir "$HOME/.muteki-runner"
+   ```
+
+   If the node reaches Web through a proxy, set `HTTPS_PROXY=http://proxy:port` (HTTP CONNECT proxies only); `NO_PROXY` is honoured. `muteki-server runner status --state-dir ...` prints the local identity, credential expiry and the proxy in use.
+4. Once the node is online, select it as the execution node under Runtime; remote nodes run container Workers only. The node list supports drain (no new work; running work continues), activate, credential rotation, revocation and deletion. Each node has its own concurrency settings.
+5. After a rotation the page shows an install command once (`muteki-server runner install-credential --state-dir ... --credential-file /dev/stdin`); run it on the node and restart the Runner. A revoked identity cannot be restored: issue a new enrollment token and use `runner enroll ... --replace`.
+
+Workers over a node's concurrency limit queue, and the run page shows them as queued; work for an offline node waits for it to reconnect. Revocation invalidates the node session immediately and is permanent. Turning off "Search tools" when dispatching disables built-in search/fetch for Claude and Codex (Pi has none); other engines refuse to start rather than run with search enabled. This is separate from the container network policy.
 
 ## Configuration guide
 
@@ -201,21 +194,15 @@ Muteki, Agent CLIs, CTF tools, and run data stay inside Ubuntu. Open `http://<VM
 
 ### Supported Worker engines
 
-The UI can configure Claude Code, Codex, Cursor, Pi, OMP, Kimi, Grok, and OpenCode. Whether each one works depends on installation, vendor login, and the chosen runtime. DeepSeek Harness is registered but cannot currently be selected as a Worker because its CLI does not provide the required structured provider capabilities. Follow each vendor's installation and login instructions.
+The curated Worker registry lists **Claude Code, Codex, Cursor, Pi, OMP, Kimi, Grok, OpenCode and Droid**. Installation versions are defined in [`docker/worker-common/engines.json`](docker/worker-common/engines.json). A listed or installed CLI still needs compatible credentials, a working model and the correct runtime; it is not evidence that every vendor/model combination has been verified.
 
-Pi chat uses the installed Pi CLI through its native RPC protocol, following the [T3 Code Pi integration](https://github.com/pingdotgg/t3code/tree/main/packages/provider-pi). It does not install a separate Pi SDK or ACP bridge. Thinking levels come from the selected model's RPC metadata and are checked against the effective setting. The composer provides supervised, auto-accept-edits, and full-access modes through a tool-call approval extension. These modes control Pi tool calls and are not an operating-system sandbox. Existing Pi ACP records remain readable; select Pi RPC to start a new session.
+Configure **Pi + Ollama** by adding an OpenAI-compatible endpoint (for example `http://127.0.0.1:11434/v1` for a host CLI, or `http://host.docker.internal:11434/v1` inside Docker), choosing a model that Ollama actually serves, and testing the connection in the selected environment. A remote Runner needs an endpoint reachable from that node; its `localhost` is not the Web machine. Bind the endpoint/model to the Pi Worker and configure the Planner separately. Save both configurations before starting a task.
 
-If the page says **Needs self-check** or **No usable credential**, test the account under Agent credentials, then check the Worker's account, model, and runtime binding. Self-check sends a real model request and may incur usage.
+If the page says **Needs self-check** or **No usable credential**, test the account, then check the Worker's account, model and runtime binding. Self-check sends a real model request and may incur usage.
 
 ### Model price feed
 
-Muteki's usage overview reads the public [model-prices](https://github.com/jiayuqi7813/model-prices) feed. Its GitHub Actions workflow synchronizes LiteLLM, models.dev, Cursor's official model prices, Devin's public SWE-2 list prices, and official Grok Build Fast prices every day at **03:17 UTC / 11:17 Asia/Shanghai** and publishes one [prices.json](https://raw.githubusercontent.com/jiayuqi7813/model-prices/main/prices.json). Muteki checks this feed when loading usage, caches it for 24 hours, and keeps the last valid prices if an update fails. The feed includes its generation time and source metadata; snapshots older than 48 hours are shown as cached prices.
-
-Cursor, Devin, and Grok Build use their own price namespaces. Grok Build's `grok-4.7-build-fast` uses its published Fast tariff, including the rate above 200,000 prompt tokens, rather than the standard Grok API price. Cursor standard, Fast, and long-context prices stay separate; Auto and requests without enough tier information remain unpriced. Pi, OMP, OpenCode, and other configurable engines use the serving provider's model prices, not one flat price for the Agent.
-
-Under **Settings → Agents and endpoints → Model pricing**, detect exact model IDs, confirm catalog mappings, or create, edit, and delete custom rates. Rates use USD per million tokens and can be scoped to a credential and provider. An explicit `0` is a zero rate; blank cache rates are unknown. Daily catalog refreshes preserve custom rates. Chat, CTF, and Pentest cost views share the same pricing results while retaining captured usage for audit. Tool estimates, catalog estimates, and custom estimates are labeled separately; a price table never supplies missing token measurements.
-
-Prices are public list-price estimates, not subscription bills or guaranteed relay prices. Provider-qualified model entries remain separate, missing prices are not replaced with zero, and upstream changes may take time to reach the daily feed. This feed supplies usage estimates; it does not replace the separate execution-budget pricing rules.
+Muteki uses the public [model-prices](https://github.com/jiayuqi7813/model-prices) catalog for usage estimates and caches valid catalog data for 24 hours. Configure mappings and custom rates in **Settings → Agents and endpoints → Model pricing**. Rates use USD per million tokens; an explicit zero rate differs from an unknown price. Missing usage is not fabricated from a price table. Public estimates are not subscription bills or guaranteed relay charges.
 
 ## Solving a challenge
 
@@ -253,7 +240,7 @@ If a Worker asks for input, answer in the pending card, provide the needed resou
 - **Copy the Flag and verify it on the challenge platform.**
 - **Mark false positive:** If the platform rejects a candidate, mark that specific Flag as a false positive (`×` on its row does the same). For multi-Flag runs, select the candidate first. This reopens solving.
 - **Continue solving:** Restart the swarm on the finished run while preserving its existing evidence.
-- **Ask / Generate writeup:** Ask the solving Worker a follow-up or generate a report. On success, the report appears in the conversation and in `sessions/<run-id>/workspace/writeup.md` (or under your custom `MUTEKI_SESSIONS_ROOT`). Generation summarizes the run's full context and can take time.
+- **Ask / Generate writeup:** Ask the solving Worker a follow-up or generate a report. On success, the report appears in the conversation and in `sessions/<run-id>/writeup.md` under the selected Rust state directory. Generation summarizes the run's full context and can take time.
 
 ## Additional workspaces under test
 
@@ -277,49 +264,58 @@ Open **Settings → Extensions** (or Extensions on the home page when all worksp
 
 ![Extension settings with install preview and plugin list](./assets/readme-cn-extensions.png)
 
-## Deployment and updates
+## Deployment, data and development
 
 ### Local Web service
 
 ```bash
-./run.sh web                         # API :8000 and UI :3001
-./run.sh web --backend-only          # API only
-./run.sh web --ui-port 3002          # Different UI port
-./run.sh web --rebuild-ui            # Rebuild after changing UI source
+node scripts/dev.mjs --web --release --skip-build  # Existing production build, UI :3101
+node scripts/dev.mjs --hot --web                   # Frontend hot preview, UI :3103
 ```
 
-Copy [`.env.example`](.env.example) to `.env` at the repository root for `MUTEKI_*` settings; exported shell variables take precedence. Keep secrets only in ignored locations such as `.env` and `state/_secrets/`. If binding Web to a non-loopback address, set `MUTEKI_WEB_PASSWORD` first or the backend will refuse to start.
+`MUTEKI_STATE_DIR` selects the private state root; source development defaults to `.state`. A packaged macOS app uses its application data directory. Credentials and run records belong in private data, not the repository or application bundle. Python state is not automatically converted by changing branches.
+
+For LAN exposure, set an access password, `MUTEKI_WEB_TLS_CERT` and `MUTEKI_WEB_TLS_KEY` to your HTTPS certificate/key paths, then use `node scripts/dev.mjs --web --release --skip-build --host 0.0.0.0`. Configure `MUTEKI_WEB_PASSWORD` in the environment or access settings before exposing the service. Restart a reused backend if its access configuration needs to change. Open the Web UI over HTTPS and trust the issuing CA on clients. The API stays on loopback; direct non-loopback HTTP API binds are rejected.
 
 ### Docker Compose
 
-Compose starts the FastAPI and Next.js control plane. The Docker daemon starts Workers on demand. Prepare Docker and the Worker image, then set an absolute host data path and Web password:
+Prepare a **Linux** Web image and a Worker image matching the intended version/architecture. `muteki-web:latest` and `muteki-worker:latest` below are local image names, not a promise that a registry tag is current. The Web image is packaged from a Linux Web release with [`docker/web/Dockerfile`](docker/web/Dockerfile); release packaging is defined in [the workflow](.github/workflows/build-packages.yml).
 
 ```bash
-docker pull ghcr.io/fishcodetech/muteki-worker:latest
+MUTEKI_WEB_TLS_CERT=/absolute/path/to/cert.pem \
+MUTEKI_WEB_TLS_KEY=/absolute/path/to/key.pem \
 MUTEKI_HOST_DATA_ROOT=/opt/muteki/data \
+MUTEKI_WEB_IMAGE=muteki-web:latest \
+MUTEKI_WORKER_IMAGE=muteki-worker:latest \
 MUTEKI_WEB_PASSWORD='replace-with-a-strong-password' \
-  docker compose up --build
+  docker compose -f docker-compose.web.yml up -d --wait
 ```
 
-The UI remains at `http://localhost:3001` by default. `MUTEKI_HOST_DATA_ROOT` must be an absolute host path shared by the control plane and Workers. The macOS Docker Desktop path has been exercised; Windows Compose has not been verified end to end on real hardware. See [`.env.example`](.env.example) and [SECURITY.md](SECURITY.md) for more settings and runtime boundaries.
+Open `https://127.0.0.1:3101` using a certificate valid for the chosen hostname. Web and Runner share the absolute host data root, while Web has no Docker socket. Drain active Workers before upgrading or rolling back; retain data and the previous image digests. Linux arm64 and Docker Desktop arm64 acceptance do not certify every other platform.
 
-### Application updates and rollback
+### Development
+
+After installing frontend dependencies, use `node scripts/dev.mjs --hot --web` for browser preview. On macOS, `node scripts/dev.mjs --hot` opens the desktop development window. Frontend updates use port `3103` and `.next-dev`; Rust changes require rebuilding and restarting the backend. Use a separate `MUTEKI_STATE_DIR` when development should not share your normal data.
+
+For a macOS desktop package:
 
 ```bash
-./run.sh upgrade --check   # Check the latest stable release
-./run.sh install            # Set up a managed installation
-muteki upgrade v0.4.7       # Install this release
-muteki rollback             # Return to the previous installed release
-muteki version              # Show version and installation kind
+node scripts/cargo.mjs build --workspace --release -j 1
+npm --prefix apps/frontend run build
+node scripts/package-macos.mjs --skip-build
 ```
 
-**Single-task settings → System update** provides the same operations. Preserve `.env`, `sessions/`, and `state/` during upgrades. Do not commit run records or credentials.
+The output is `dist/Muteki.app`. The package includes Node, the frontend and the Rust service. Current local packages are ad-hoc signed, not Developer ID signed or notarized. Do not assume the older Python release's platform matrix or updater behavior applies to a newly built Rust package.
+
+For a standalone Web release on the target macOS/Linux platform, build the server/frontend as above and run `node scripts/package-web.mjs --skip-build`. The archive is written under `dist/web-releases/`. The old `./init.sh`, `./run.sh`, `ctf-tools/` and Python Ubuntu installer belong to the archived branch.
+
+Native Linux Web releases require system shared libraries. On Ubuntu 24.04, install `sudo apt-get install libdav1d7 libstdc++6`; other distributions need compatible glibc, dav1d and C++ runtimes. Check missing libraries with `ldd bin/muteki-server`. The Web Docker image includes these runtimes.
 
 ## Troubleshooting
 
 | Symptom | Check first |
 | --- | --- |
-| Page does not open | The address and ports printed by `./run.sh web`; Node/npm, first UI build, and `state/_logs/backend.log` / `state/_logs/ui.log` |
+| Page does not open | The address printed by the launcher; Node/npm, Rust binary, Next build, and terminal error output |
 | No usable Worker | CLI installation and login, Agent credential test, enabled Worker lineup, account and model binding |
 | Container run fails to start | Docker service, Worker image, container credentials, network/VPN, and Runtime environment settings |
 | Planner test fails | Endpoint, model, key/Base URL, and network; a working Worker CLI does not configure the Planner |
@@ -329,16 +325,16 @@ muteki version              # Show version and installation kind
 
 ## Project and participation
 
-- **Code map:** `muteki/` holds the backend core; `apps/web/` is FastAPI; `apps/web/ui/` is Next.js; `docker/` contains image configuration.
+- **Code map:** `crates/server/` is the Rust API/Runner; `crates/desktop/` is the desktop shell; `apps/frontend/` is Next.js; `cmd/runtime-agent/` manages container processes; `docker/` contains image recipes.
 - **Issues:** Report bugs and documentation problems in [GitHub Issues](https://github.com/FishCodeTech/muteki/issues), with reproduction steps, version, and redacted logs. Report security vulnerabilities privately as described in [SECURITY.md](SECURITY.md).
 - **License:** [GNU AGPL-3.0](LICENSE). External Agent CLIs and model services have their own licenses, terms, and charges.
 
 ## Future work
 
-- [ ] Rework pentest mode
-- [ ] Add a source-code vulnerability discovery mode
-- [ ] Expand the integrated Agent chat experience
-- [ ] Make the product fully plugin-based
+- Expand native amd64, Windows and external proxy/NAT acceptance coverage.
+- Continue improving Pentest and source-code security workflows.
+- Extend the integrated Agent chat and plugin ecosystem.
+- Verify more failure/recovery windows and cross-version data migrations.
 
 ## Acknowledgements
 

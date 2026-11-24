@@ -24,13 +24,20 @@ CTF challenges. Understand the trust model before you run it.
 
 ### What Muteki does NOT promise
 
-- **It does not isolate malicious challenges.** Strong sandboxing (malicious-code
-  isolation, microVM/Firecracker, untrusted-input confinement) is an explicit
-  **non-goal / accepted risk** of this project — not a missing feature. The worker
-  executes content returned by the challenge target with privileges (the worker user
-  has `NOPASSWD` sudo so it can install tools / change the system while solving), and
-  the in-container control channel is explicitly **not** a security boundary against
-  the worker.
+- **It does not isolate malicious challenges.** The default Docker runtime is not a malicious-code or microVM isolation guarantee. Two worker
+  privilege modes exist: the **default** mode starts the container with
+  `--security-opt no-new-privileges=true`, so although the image ships a
+  `kali ALL=(ALL) NOPASSWD:ALL` sudo entry it cannot be used to elevate —
+  the worker runs as unprivileged `kali`. An explicit **elevated** mode
+  (`worker_privilege=elevated`) is the operator opt-in that keeps that
+  unrestricted passwordless sudo: the worker can install tools, change the
+  system and read every file and credential inside the container.
+  The in-container control channel is explicitly **not** a security boundary
+  against the worker.
+- **Workers in one container share a trust domain.** All Workers of a Run (and,
+  with shared container scope, of every Run in that pool) run as the same system
+  user. They can read each other's projected credentials and working files. Do not
+  put mutually untrusted accounts or Runs into the same Run or shared pool.
 - **The container worker backend is NOT a security sandbox.** Its purpose is a
   consistent Kali/CTF toolchain, a VPS / standalone-machine deployment form, and
   runtime-dependency / workspace / credential-mount isolation — **not** containment of
@@ -48,22 +55,14 @@ the worker, and isolate accordingly.
 
 ### Other things to be aware of
 
-- **Flag verification trust assumption.** The provenance gate (`muteki/solver/gate.py`)
+- **Flag verification trust assumption.** The provenance checks in `crates/server/src/runs/`
   guards against the *model hallucinating* a flag — it does **not** guard against a
   *malicious challenge fabricating* a format-matching flag. For competitive use, verify
   accepted flags against the contest scoreboard, and prefer high-entropy flag formats
   (e.g. `flag{<sha256>}`) over short, brute-forceable ones.
-- **Credentials.** Muteki reads engine credentials (OAuth tokens / API keys / the
-  codex `auth.json`) from the macOS Keychain or environment and projects them into the
-  worker environment. These are passed to the proprietary engine CLIs
-  (`claude` / `codex` / `cursor-agent`), which transmit data to their
-  respective providers (Anthropic / OpenAI / Cursor). Credential stores live under
-  gitignored paths (`state/_secrets/`, `.env`) and are never committed; verify your
-  own deployment keeps them out of version control.
-- **Control plane.** In container mode the in-container supervisor dials back to a
-  host-local control receiver (`127.0.0.1`, default port `9100`, per-run token). This
-  is part of normal operation; be aware the control receiver listens on host loopback
-  when deploying on a shared host.
+- **Credentials.** Host CLIs and selected accounts supply model credentials. Keep the Rust state directory (`MUTEKI_STATE_DIR`) and account projections private and out of version control. Container Workers need explicitly injectable credentials; a host CLI login is not automatically shared. Selected providers and CLIs may transmit prompts and files to their services.
+- **Control plane.** Web delegates container control to an independent Runner. The local connection uses controlled IPC; remote nodes use authenticated TLS/WSS and execution leases. Only the Compose Runner service mounts the Docker socket. The Runner remains a privileged host component; its access must be restricted. Authentication does not make a shared Worker container a strong sandbox. Runtime selection and platform support require their own verification through the published workflow results.
+- **Remote Runner TLS.** The remote node listener uses a private CA generated per installation (`<state>/remote-runner-tls/`); enrollment commands pin its SHA-256 fingerprint, and the Runner trusts only that CA, not the system roots. Enrollment tokens are single-use and expire within 15 minutes; node credentials last 30 days and can be rotated or revoked from the settings page. Anyone holding the CA key or a node credential can impersonate that side; keep the state directory private. Expose the listener only on networks that need it.
 
 ## Supported Versions
 

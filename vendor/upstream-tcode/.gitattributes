@@ -1,0 +1,3 @@
+/crates/headless/container/entrypoint.sh text eol=lf
+/crates/headless/container/profile.sh text eol=lf
+/crates/web/build.sh text eol=lf

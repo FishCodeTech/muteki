@@ -1,0 +1,8 @@
+[profile.default]
+# Keep nextest's 200 ms threshold, but do not accept leaked output handles as a pass.
+leak-timeout = { period = "200ms", result = "fail" }
+
+[[profile.default.overrides]]
+# This otherwise starts near the end and leaves the other test workers idle.
+filter = 'test(=highlight::tests::shipped_syntax_set_compiles_under_active_regex_backend)'
+priority = 100

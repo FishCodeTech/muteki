@@ -1,0 +1,85 @@
+[package]
+name = "muteki-server"
+version = "0.5.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+default-run = "muteki-server"
+
+[features]
+verify-props = ["dep:proptest"]
+
+[[bin]]
+name = "muteki-server"
+path = "src/main.rs"
+
+[[bin]]
+name = "muteki-verify-props"
+path = "src/bin/verify_props.rs"
+required-features = ["verify-props"]
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+csv = "1"
+axum = { version = "0.8", features = ["multipart", "ws"] }
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10.4"
+clap = { version = "4", features = ["derive"] }
+futures-util = "0.3"
+regex = "1"
+caseless = "=0.2.2"
+roxmltree = "0.20"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "gzip", "brotli", "deflate", "socks"] }
+rusqlite = { version = "0.32", features = ["bundled", "backup"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+schemars = "1"
+sha2 = "0.10"
+ring = "0.17"
+libc = "0.2"
+hmac = "0.12"
+scrypt = "0.11"
+getrandom = "0.2"
+fs2 = "0.4"
+tempfile = "3"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+webpki-roots = "1"
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+agent = { path = "../../vendor/upstream-tcode/crates/agent", default-features = false, features = ["process"] }
+smol = "2"
+tcode-core = { path = "../../vendor/upstream-tcode/crates/core", default-features = false }
+tcode-control-core = { package = "tcode-core", git = "https://github.com/Tryanks/tcode", rev = "ee22483c402f5f05350e60ac513d33ee9347df26", default-features = false }
+tcode-control-agent = { package = "agent", git = "https://github.com/Tryanks/tcode", rev = "ee22483c402f5f05350e60ac513d33ee9347df26", default-features = false }
+tcode-control-services = { package = "tcode-services", git = "https://github.com/Tryanks/tcode", rev = "ee22483c402f5f05350e60ac513d33ee9347df26" }
+tcode-control-mcp = { package = "control-mcp", git = "https://github.com/Tryanks/tcode", rev = "ee22483c402f5f05350e60ac513d33ee9347df26" }
+tcode-control-protocol = { package = "tcode-protocol", git = "https://github.com/Tryanks/tcode", rev = "ee22483c402f5f05350e60ac513d33ee9347df26", default-features = false }
+term = { path = "../../vendor/upstream-tcode/crates/term" }
+async-channel = "2"
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["fs"] }
+serde_yaml = "0.9"
+jsonc-parser = { version = "0.34", features = ["serde"] }
+unicode-normalization = "0.1"
+unicode-casefold = "0.2"
+httparse = "1.10"
+encoding_rs = "0.8"
+parking_lot = "0.12"
+jsonschema = { version = "0.33", default-features = false }
+semver = "1"
+url = "2"
+toml = "0.8"
+zip = { version = "2.4", default-features = false, features = ["deflate"] }
+tar = "0.4"
+walkdir = "2"
+flate2 = "1"
+zstd = "0.13"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "ico"] }
+rcgen = { version = "0.14.10", default-features = false, features = ["ring", "pem", "crypto"] }
+proptest = { version = "1", optional = true }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+image = { version = "0.25.10", default-features = false, features = ["avif-native"] }

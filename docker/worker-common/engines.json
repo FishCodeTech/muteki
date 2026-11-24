@@ -1,0 +1,53 @@
+[
+  {
+    "engine": "claude",
+    "binary": "claude",
+    "version": "2.1.318",
+    "npm_package": "@anthropic-ai/claude-code"
+  },
+  {
+    "engine": "codex",
+    "binary": "codex",
+    "version": "0.166.0",
+    "npm_package": "@openai/codex"
+  },
+  {
+    "engine": "cursor",
+    "binary": "/home/kali/.local/bin/cursor-agent",
+    "version": "2026.10.22-27dcf5f"
+  },
+  {
+    "engine": "pi",
+    "binary": "pi",
+    "version": "1.5.0",
+    "npm_package": "@earendil-works/pi-coding-agent"
+  },
+  {
+    "engine": "omp",
+    "binary": "/home/kali/.local/bin/omp",
+    "version": "18.15.0"
+  },
+  {
+    "engine": "kimi",
+    "binary": "kimi",
+    "version": "2.4.1",
+    "npm_package": "@moonshot-ai/kimi-code"
+  },
+  {
+    "engine": "grok",
+    "binary": "/home/kali/.grok/bin/grok",
+    "version": "1.0.77"
+  },
+  {
+    "engine": "opencode",
+    "binary": "opencode",
+    "version": "2.2.5",
+    "npm_package": "@opencode/cli"
+  },
+  {
+    "engine": "droid",
+    "binary": "droid",
+    "version": "1.6.0",
+    "npm_package": "droid"
+  }
+]

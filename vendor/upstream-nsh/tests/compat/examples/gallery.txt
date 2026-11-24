@@ -1,0 +1,92 @@
+# Opens every demo of the index in turn (pushed screens stay mounted, so
+# the index stays tappable), and uses a few.
+expect Gallery
+expect Stocks
+expect A live watchlist and a stock: candles, depth, the tape, a tick every 50 ms
+prop label:Stocks accessibilityLabel Stocks
+frame label:Stocks 1 1 356 78
+tap text:AI Chat
+expect How can I help?
+expect A simulated assistant: every reply is scripted and streamed locally.
+tap text:Photos
+expect Photo stream
+expect 1,000 photos
+expect Ridge 0001
+tap text:Lists
+expect Viewable items (at least half shown)
+expect 90 items, 3 columns
+tap text:Scrolling
+expect Settled on page 1
+expect Revenue · 1 of 5
+tap text:Collapsing header
+expect Recent
+expect 160 entries, by week
+expect Week 1
+tap text:Navigation
+expect Native stack
+expect 0 presses popped
+tap text:Form
+expect keyboardDismissMode while dragging
+expect 0/6
+tap text:Gestures
+expect Pan, pinch and rotation
+expect 0 taps
+prop label:"Tiny dot" hitSlop top=30 right=30 bottom=30 left=30
+tap label:Tiny dot
+expect 1 taps
+tap text:Physics
+expect Drag me
+prop label:"Draggable card" accessibilityLabel Draggable card
+tap text:Animations
+expect Native motion
+expect Animated.stagger
+tap text:Canvas
+expect Turbine 3 load
+expect 7,296 rpm
+tap text:Styles
+expect Continuous corners ease into the edges
+expect 44 · 6 · 28 · 0 pt, clockwise
+tap text:Tailwind
+expect This screen, styled with classes
+expect Pressed 0×
+tap text:Pressed 0×
+expect Pressed 1×
+tap text:Text
+expect Spans and links
+expect ♥ 3
+expect nothing yet
+tap text:Images
+expect Resize modes
+expect logo@2x.png, tinted natively
+tap text:Components
+expect Press feedback
+expect None yet
+tap text:Fades while pressed
+expect Fading tile
+tap text:Lights up while pressed
+expect Underlay tile
+tap label:Disable the third tile
+expect Takes no presses
+tap text:Open a sheet
+expect A sheet
+tap text:Close
+absent A sheet
+tap text:Web and video
+expect Post to the page
+tap text:System
+expect Updates when the window, insets or keyboard change
+expect 390 × 844 pt
+tap text:Storage
+expect Counted each time this demo opens
+tap text:Stocks
+expect Composite
+covers [props] accessibilityLabel
+covers [props] hitSlop
+covers [events] onPress
+covers [nsh] signal
+covers [nsh/base] createNavStack
+covers [nsh/base] NavStack
+covers [nsh/base] NavPage
+covers [nsh/base] Dialog
+covers [nsh/base] Button
+covers [nsh] Storage

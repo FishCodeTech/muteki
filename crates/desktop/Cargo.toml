@@ -1,0 +1,29 @@
+[package]
+name = "muteki-desktop"
+version = "0.5.0"
+edition = "2024"
+
+[dependencies]
+nsh-core = { path = "../../vendor/upstream-nsh/crates/nsh-core", default-features = false }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "stream", "rustls-tls"] }
+base64 = "0.22"
+uuid = { version = "1", features = ["v4"] }
+tokio = { version = "1", features = ["full"] }
+axum = { version="0.8",features=["ws"] }
+futures-util="0.3"
+tokio-tungstenite={version="0.28",features=["rustls-tls-webpki-roots"]}
+chrono = "0.4"
+sha2 = "0.10"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+miniz_oxide = "0.8"
+ctrlc = { version = "3.4", features = ["termination"] }
+nsh-platform-macos = { path = "../../vendor/upstream-nsh/crates/nsh-platform-macos", default-features = false }
+objc2 = "0.6.5"
+block2 = "0.6.2"
+dispatch2 = "0.3.1"
+
+[build-dependencies]
+cc = "1"

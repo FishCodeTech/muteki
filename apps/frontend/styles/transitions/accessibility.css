@@ -1,0 +1,340 @@
+@keyframes muteki-reduced-fade {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+@keyframes muteki-reduced-fade-out {
+  from { opacity: 1; }
+  to { opacity: 0; }
+}
+@keyframes muteki-reduced-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.45; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --distance-micro: 0px;
+    --distance-small: 0px;
+    --distance-base: 0px;
+    --distance-medium: 0px;
+    --distance-large: 0px;
+    --scale-large: 1;
+    --scale-medium: 1;
+    --scale-small: 1;
+    --scale-tiny: 1;
+    --toast-scale: 1;
+    --stack-scale: 1;
+    --flag-pulse-scale: 1;
+    --icon-swap-start-scale: 1;
+    --panel-open-dur: 0.01ms;
+    --panel-close-dur: 0.01ms;
+    --stagger-dur: 150ms;
+    --reveal-dur: 150ms;
+    --modal-open-dur: 150ms;
+    --modal-close-dur: 100ms;
+    --dropdown-open-dur: 120ms;
+    --dropdown-close-dur: 80ms;
+  }
+  html, *, *::before, *::after {
+    scroll-behavior: auto !important;
+  }
+  ::view-transition-group(*), ::view-transition-old(*), ::view-transition-new(*) {
+    animation-duration: 0.01ms !important;
+    animation-delay: 0ms !important;
+  }
+  :is([data-slot="dialog-content"], [data-slot="drawer-content"], [data-slot="popover-content"], [data-slot="menu-content"], [data-slot="select-content"], [data-slot="tooltip-content"], [data-slot="hover-card-content"])[data-open]:not([data-instant]):not([data-warm="true"]),
+  .t-texts-reveal,
+  .t-page-slide,
+  .t-skeleton-reveal,
+  .coord-bubble,
+  .coord-bubble:not(.digest):not(.answer),
+  .wlane,
+  .artifact-view,
+  .welcome-hero,
+  .welcome-examples,
+  .pentest-page,
+  .pentest-loading-card,
+  .collab-agent-node.entering,
+  .collab-coordinator-card.entering,
+  .cx-enter,
+  .cx-enter-soft,
+  .cx-pop,
+  .cx-diff-in,
+  .cx-reveal,
+  .cx-source-chip,
+  .cx-stack-in,
+  .cx-animate-in,
+  .cx-timeline-done,
+  .workspace-home-hero,
+  .workspace-home-grid,
+  .workspace-home-recent {
+    animation: muteki-reduced-fade 150ms ease both;
+  }
+  :is([data-slot="dialog-content"], [data-slot="drawer-content"], [data-slot="popover-content"], [data-slot="menu-content"], [data-slot="select-content"], [data-slot="tooltip-content"], [data-slot="hover-card-content"])[data-ending-style]:not([data-instant="true"]) {
+    animation: muteki-reduced-fade-out 100ms ease both;
+  }
+  [data-slot="accordion-panel"],
+  [data-slot="accordion-item"]:not([data-open]) [data-slot="accordion-panel"] {
+    transition: opacity 120ms linear;
+  }
+  [data-slot="accordion-panel"][data-starting-style],
+  [data-slot="accordion-panel"][data-ending-style] {
+    height: var(--accordion-panel-height, auto);
+    opacity: 0;
+  }
+  .ai-conv-sidebar,
+  .ai-conv-sidebar > .cx-sidebar-nav,
+  .rail,
+  .rail-body,
+  .cx-panel-aside,
+  .cx-panel-aside::before,
+  .cx-panel-aside > div > div,
+  .artifact {
+    transition: none !important;
+  }
+  .cx-press:active,
+  .cx-press:active::after,
+  :is(.desktop-window, html:has(.desktop-window) .cx-portal) .cx-press:not([data-cx-nav-row]):not([data-variant="link"]):not([data-variant="unstyled"]):not([class*="after:"]):active:not(:disabled):not([aria-disabled="true"])::after,
+  .desktop-window :is(.insp-tab, .newsolve, .icon-btn, .thread-item, .artifact-head .tabs button, .suggest button, .suggest-card, .evi-sort-btn, .menu .mi):active:not(:disabled)::after,
+  .desktop-window .workspace-activity-rail .workspace-rail-control:active:not(:disabled)::after,
+  .desktop-window .cx-sidebar-nav [data-cx-nav-row]:active::after,
+  .desktop-window .cx-sidebar-nav .cx-press:not([data-cx-nav-row]):active:not(:disabled):not([aria-disabled="true"])::after,
+  .desktop-window .cx-sidebar-nav .cx-sb-new:active:not(:disabled):not([aria-disabled="true"])::after,
+  .ai-conv-sidebar.cx-sidebar .cx-sb-new:active,
+  .insp-tab:active,
+  .newsolve:active:not(:disabled),
+  .icon-btn:active,
+  .artifact-head .tabs button:active,
+  .suggest button:active,
+  .suggest-card:active,
+  .thread-item:active,
+  .evi-sort-btn:active,
+  .menu .mi:active:not(:disabled),
+  .cx-slider:active::-webkit-slider-thumb,
+  [class*="active:scale-"]:active,
+  [class*="pressed=true]:scale-"][data-pressed="true"],
+  .workspace-home-card:hover,
+  .workspace-home-card:hover .workspace-home-action svg,
+  .suggest button:hover,
+  .suggest-card:hover,
+  .cx-stack-mark:hover {
+    transform: none !important;
+    scale: 1 !important;
+  }
+  .cx-spin,
+  .spinner,
+  .src-spin,
+  .rt-spin,
+  .pentest-spin,
+  .animate-spin,
+  .t-skeleton,
+  .cx-pulse-dot,
+  .cx-skeleton,
+  .pentest-skeleton,
+  .cx-working-glyph:not([data-paused]) > i,
+  .animate-pulse,
+  .cx-skeleton::after,
+  .pentest-skeleton::after {
+    animation: muteki-reduced-pulse 2.2s ease-in-out infinite !important;
+    transform: none;
+  }
+}
+
+html[data-motion="reduce"] {
+  --distance-micro: 0px;
+  --distance-small: 0px;
+  --distance-base: 0px;
+  --distance-medium: 0px;
+  --distance-large: 0px;
+  --scale-large: 1;
+  --scale-medium: 1;
+  --scale-small: 1;
+  --scale-tiny: 1;
+  --toast-scale: 1;
+  --stack-scale: 1;
+  --flag-pulse-scale: 1;
+  --icon-swap-start-scale: 1;
+  --panel-open-dur: 0.01ms;
+  --panel-close-dur: 0.01ms;
+  --stagger-dur: 150ms;
+  --reveal-dur: 150ms;
+  --modal-open-dur: 150ms;
+  --modal-close-dur: 100ms;
+  --dropdown-open-dur: 120ms;
+  --dropdown-close-dur: 80ms;
+}
+html[data-motion="reduce"],
+html[data-motion="reduce"] *,
+html[data-motion="reduce"] *::before,
+html[data-motion="reduce"] *::after {
+  scroll-behavior: auto !important;
+}
+html[data-motion="reduce"]::view-transition-group(*),
+html[data-motion="reduce"]::view-transition-old(*),
+html[data-motion="reduce"]::view-transition-new(*) {
+  animation-duration: 0.01ms !important;
+  animation-delay: 0ms !important;
+}
+html[data-motion="reduce"] :is([data-slot="dialog-content"], [data-slot="drawer-content"], [data-slot="popover-content"], [data-slot="menu-content"], [data-slot="select-content"], [data-slot="tooltip-content"], [data-slot="hover-card-content"])[data-open]:not([data-instant]):not([data-warm="true"]),
+html[data-motion="reduce"] .t-texts-reveal,
+html[data-motion="reduce"] .t-page-slide,
+html[data-motion="reduce"] .t-skeleton-reveal,
+html[data-motion="reduce"] .coord-bubble,
+html[data-motion="reduce"] .coord-bubble:not(.digest):not(.answer),
+html[data-motion="reduce"] .wlane,
+html[data-motion="reduce"] .artifact-view,
+html[data-motion="reduce"] .welcome-hero,
+html[data-motion="reduce"] .welcome-examples,
+html[data-motion="reduce"] .pentest-page,
+html[data-motion="reduce"] .pentest-loading-card,
+html[data-motion="reduce"] .collab-agent-node.entering,
+html[data-motion="reduce"] .collab-coordinator-card.entering,
+html[data-motion="reduce"] .cx-enter,
+html[data-motion="reduce"] .cx-enter-soft,
+html[data-motion="reduce"] .cx-pop,
+html[data-motion="reduce"] .cx-diff-in,
+html[data-motion="reduce"] .cx-reveal,
+html[data-motion="reduce"] .cx-source-chip,
+html[data-motion="reduce"] .cx-stack-in,
+html[data-motion="reduce"] .cx-animate-in,
+html[data-motion="reduce"] .cx-timeline-done,
+html[data-motion="reduce"] .workspace-home-hero,
+html[data-motion="reduce"] .workspace-home-grid,
+html[data-motion="reduce"] .workspace-home-recent {
+  animation: muteki-reduced-fade 150ms ease both;
+}
+html[data-motion="reduce"] :is([data-slot="dialog-content"], [data-slot="drawer-content"], [data-slot="popover-content"], [data-slot="menu-content"], [data-slot="select-content"], [data-slot="tooltip-content"], [data-slot="hover-card-content"])[data-ending-style]:not([data-instant="true"]) {
+  animation: muteki-reduced-fade-out 100ms ease both;
+}
+html[data-motion="reduce"] [data-slot="accordion-panel"],
+html[data-motion="reduce"] [data-slot="accordion-item"]:not([data-open]) [data-slot="accordion-panel"] {
+  transition: opacity 120ms linear;
+}
+html[data-motion="reduce"] [data-slot="accordion-panel"][data-starting-style],
+html[data-motion="reduce"] [data-slot="accordion-panel"][data-ending-style] {
+  height: var(--accordion-panel-height, auto);
+  opacity: 0;
+}
+html[data-motion="reduce"] .ai-conv-sidebar,
+html[data-motion="reduce"] .ai-conv-sidebar > .cx-sidebar-nav,
+html[data-motion="reduce"] .rail,
+html[data-motion="reduce"] .rail-body,
+html[data-motion="reduce"] .cx-panel-aside,
+html[data-motion="reduce"] .cx-panel-aside::before,
+html[data-motion="reduce"] .cx-panel-aside > div > div,
+html[data-motion="reduce"] .artifact {
+  transition: none !important;
+}
+html[data-motion="reduce"] .cx-press:active,
+html[data-motion="reduce"] .cx-press:active::after,
+html[data-motion="reduce"] :is(.desktop-window, html:has(.desktop-window) .cx-portal) .cx-press:not([data-cx-nav-row]):not([data-variant="link"]):not([data-variant="unstyled"]):not([class*="after:"]):active:not(:disabled):not([aria-disabled="true"])::after,
+html[data-motion="reduce"] .desktop-window :is(.insp-tab, .newsolve, .icon-btn, .thread-item, .artifact-head .tabs button, .suggest button, .suggest-card, .evi-sort-btn, .menu .mi):active:not(:disabled)::after,
+html[data-motion="reduce"] .desktop-window .workspace-activity-rail .workspace-rail-control:active:not(:disabled)::after,
+html[data-motion="reduce"] .desktop-window .cx-sidebar-nav [data-cx-nav-row]:active::after,
+html[data-motion="reduce"] .desktop-window .cx-sidebar-nav .cx-press:not([data-cx-nav-row]):active:not(:disabled):not([aria-disabled="true"])::after,
+html[data-motion="reduce"] .desktop-window .cx-sidebar-nav .cx-sb-new:active:not(:disabled):not([aria-disabled="true"])::after,
+html[data-motion="reduce"] .ai-conv-sidebar.cx-sidebar .cx-sb-new:active,
+html[data-motion="reduce"] .insp-tab:active,
+html[data-motion="reduce"] .newsolve:active:not(:disabled),
+html[data-motion="reduce"] .icon-btn:active,
+html[data-motion="reduce"] .artifact-head .tabs button:active,
+html[data-motion="reduce"] .suggest button:active,
+html[data-motion="reduce"] .suggest-card:active,
+html[data-motion="reduce"] .thread-item:active,
+html[data-motion="reduce"] .evi-sort-btn:active,
+html[data-motion="reduce"] .menu .mi:active:not(:disabled),
+html[data-motion="reduce"] .cx-slider:active::-webkit-slider-thumb,
+html[data-motion="reduce"] [class*="active:scale-"]:active,
+html[data-motion="reduce"] [class*="pressed=true]:scale-"][data-pressed="true"],
+html[data-motion="reduce"] .workspace-home-card:hover,
+html[data-motion="reduce"] .workspace-home-card:hover .workspace-home-action svg,
+html[data-motion="reduce"] .suggest button:hover,
+html[data-motion="reduce"] .suggest-card:hover,
+html[data-motion="reduce"] .cx-stack-mark:hover {
+  transform: none !important;
+  scale: 1 !important;
+}
+html[data-motion="reduce"] .cx-spin,
+html[data-motion="reduce"] .spinner,
+html[data-motion="reduce"] .src-spin,
+html[data-motion="reduce"] .rt-spin,
+html[data-motion="reduce"] .pentest-spin,
+html[data-motion="reduce"] .animate-spin,
+html[data-motion="reduce"] .t-skeleton,
+html[data-motion="reduce"] .cx-pulse-dot,
+html[data-motion="reduce"] .cx-skeleton,
+html[data-motion="reduce"] .pentest-skeleton,
+html[data-motion="reduce"] .cx-working-glyph:not([data-paused]) > i,
+html[data-motion="reduce"] .animate-pulse,
+html[data-motion="reduce"] .cx-skeleton::after,
+html[data-motion="reduce"] .pentest-skeleton::after {
+  animation: muteki-reduced-pulse 2.2s ease-in-out infinite !important;
+  transform: none;
+}
+html[data-motion="reduce"] .cx-working-glyph[data-paused] > i {
+  animation: none !important;
+  opacity: 0.35;
+  transform: none;
+}
+html[data-motion="reduce"] .muteki-text-shimmer {
+  animation: none !important;
+}
+
+[data-instant="true"],
+[data-instant="true"]::before,
+[data-instant="true"]::after,
+[data-instant="true"] > .cx-sidebar-nav,
+[data-instant="true"] .rail-body,
+.cx-panel-aside[data-instant="true"] > div > div,
+html[data-instant="true"] *,
+html[data-instant="true"] *::before,
+html[data-instant="true"] *::after {
+  transition: none !important;
+  animation: none !important;
+}
+
+html[data-page-hidden="true"] *,
+html[data-page-hidden="true"] *::before,
+html[data-page-hidden="true"] *::after,
+[data-offscreen="true"],
+[data-offscreen="true"] *,
+[data-offscreen="true"] *::before,
+[data-offscreen="true"] *::after {
+  animation-play-state: paused !important;
+}
+
+html[data-page-hidden="true"] :is(
+  [data-slot="dialog-backdrop"],
+  [data-slot="dialog-content"],
+  [data-slot="drawer-backdrop"],
+  [data-slot="drawer-content"],
+  [data-slot="popover-content"],
+  [data-slot="menu-content"],
+  [data-slot="select-content"],
+  [data-slot="tooltip-content"],
+  [data-slot="hover-card-content"]
+) {
+  animation-play-state: running !important;
+}
+
+html.theme-switching,
+html.theme-switching *,
+html.theme-switching *::before,
+html.theme-switching *::after {
+  transition: none !important;
+}
+
+:where(a, button, input, textarea, select, summary, [tabindex]:not([tabindex="-1"])):focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+:where(button, input, textarea, select)[disabled] { cursor: not-allowed; }
+:where(input, textarea, select) { accent-color: var(--accent); }
+@media (forced-colors: active) {
+  :where(a, button, input, textarea, select, summary, [tabindex]:not([tabindex="-1"])):focus-visible { outline-color: Highlight; }
+  :where([aria-current="page"], [aria-selected="true"]) { outline: 1px solid Highlight; }
+}
+@media (pointer: coarse) {
+  :where(input, textarea, select) { font-size: max(16px, 1em); }
+  :where(.workspace-nav-tools button, .workspace-mobile-links a, .workspace-mobile-utilities a, .workspace-mobile-utilities button, .settings-hub-menu) { min-height: 44px; min-width: 44px; }
+}

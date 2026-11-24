@@ -1,66 +1,70 @@
-# Project Muteki 版本化生产部署。
-#
-# 公开默认镜像仓库是 ghcr.io/fishcodetech。
-# Git / GHCR 标签带 v，例如 v0.4.7。
-# 私有 GHCR 需要先 docker login ghcr.io，并设置 MUTEKI_IMAGE_REGISTRY。
-#
-# MUTEKI_IMAGE_REGISTRY=ghcr.io/fishcodetech \
-# MUTEKI_RELEASE_VERSION=v0.4.7 \
-# MUTEKI_HOST_DATA_ROOT=/opt/muteki/data \
-# MUTEKI_WEB_PASSWORD=... docker compose -f docker-compose.release.yml up -d --wait
-
-name: muteki
-
-networks:
-  muteki_net:
-    name: ${MUTEKI_WORKER_NETWORK:-muteki_net}
+name: ${MUTEKI_COMPOSE_PROJECT:-muteki}
 
 services:
-  web-api:
-    image: ${MUTEKI_IMAGE_REGISTRY:-ghcr.io/fishcodetech}/muteki-web:${MUTEKI_RELEASE_VERSION:-v0.4.7}
-    networks: [muteki_net]
-    ports:
-      - "${MUTEKI_API_PORT:-8000}:8000"
+  runner:
+    image: ${MUTEKI_WEB_IMAGE:?set the exact versioned MUTEKI_WEB_IMAGE}
+    entrypoint: ["/opt/muteki/bin/muteki-server", "runner"]
+    command: ["--state-dir", "${MUTEKI_HOST_DATA_ROOT}/state"]
+    restart: unless-stopped
+    stop_signal: SIGINT
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ${MUTEKI_HOST_DATA_ROOT:?set MUTEKI_HOST_DATA_ROOT to an absolute host path}:${MUTEKI_HOST_DATA_ROOT}
     environment:
-      MUTEKI_DEPLOYMENT_MODE: "compose"
-      MUTEKI_IN_CONTAINER: "1"
-      MUTEKI_CONTROL_BIND: "0.0.0.0"
-      MUTEKI_CONTROL_HOST: "web-api"
-      MUTEKI_WORKER_NETWORK: "${MUTEKI_WORKER_NETWORK:-muteki_net}"
-      MUTEKI_HOST_DATA_ROOT: "${MUTEKI_HOST_DATA_ROOT}"
-      MUTEKI_CONTAINER_DATA_ROOT: "${MUTEKI_HOST_DATA_ROOT}"
-      MUTEKI_SESSIONS_ROOT: "${MUTEKI_HOST_DATA_ROOT}/sessions"
-      MUTEKI_STATE_ROOT: "${MUTEKI_HOST_DATA_ROOT}/state"
-      MUTEKI_COORDINATOR_CONTROL_ROOT: "${MUTEKI_HOST_DATA_ROOT}/state/control"
-      MUTEKI_WEB_BIND: "0.0.0.0"
-      MUTEKI_WEB_PASSWORD: "${MUTEKI_WEB_PASSWORD:?set MUTEKI_WEB_PASSWORD}"
-      MUTEKI_WORKER_IMAGE: "${MUTEKI_IMAGE_REGISTRY:-ghcr.io/fishcodetech}/muteki-worker:${MUTEKI_RELEASE_VERSION:-v0.4.7}"
-      MUTEKI_WORKER_IMAGE_VERSION: "${MUTEKI_RELEASE_VERSION:-v0.4.7}"
-      MUTEKI_RELEASE_REPOSITORY: "${MUTEKI_RELEASE_REPOSITORY:-FishCodeTech/muteki}"
-      MUTEKI_IMAGE_REGISTRY: "${MUTEKI_IMAGE_REGISTRY:-ghcr.io/fishcodetech}"
-      MUTEKI_GITHUB_TOKEN: "${MUTEKI_GITHUB_TOKEN:-}"
-      MUTEKI_UPDATE_MANIFEST_URL: "${MUTEKI_UPDATE_MANIFEST_URL:-}"
-      MUTEKI_DEEPSEEK_API_KEY: "${MUTEKI_DEEPSEEK_API_KEY:-}"
-      MUTEKI_DEEPSEEK_BASE_URL: "${MUTEKI_DEEPSEEK_BASE_URL:-https://api.deepseek.com/v1}"
-      MUTEKI_LLM_TRUST_ENV: "${MUTEKI_LLM_TRUST_ENV:-0}"
+      MUTEKI_STATE_DIR: ${MUTEKI_HOST_DATA_ROOT}/state
+      MUTEKI_CONTROL_BIND: 0.0.0.0
+      MUTEKI_CONTROL_CONNECT_HOST: runner
+      MUTEKI_WORKER_NETWORK: ${MUTEKI_WORKER_NETWORK:-${COMPOSE_PROJECT_NAME:-muteki}_web_net}
+      MUTEKI_WORKER_IMAGE: ${MUTEKI_WORKER_IMAGE:?set the exact versioned MUTEKI_WORKER_IMAGE}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks: [worker]
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/api/health"]
+      test: ["CMD", "curl", "-fsS", "--unix-socket", "${MUTEKI_HOST_DATA_ROOT}/state/runner/control.sock", "http://localhost/v1/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  web:
+    image: ${MUTEKI_WEB_IMAGE:?set the exact versioned MUTEKI_WEB_IMAGE}
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${MUTEKI_WEB_PORT:-3101}:3101"
+    volumes:
+      - ${MUTEKI_HOST_DATA_ROOT:?set MUTEKI_HOST_DATA_ROOT to an absolute host path}:${MUTEKI_HOST_DATA_ROOT}
+      - ${MUTEKI_HOST_DATA_ROOT}/state/runner:${MUTEKI_HOST_DATA_ROOT}/state/runner:ro
+    depends_on:
+      runner:
+        condition: service_healthy
+    environment:
+      MUTEKI_DEPLOYMENT_MODE: compose
+      MUTEKI_INSTALL_ROOT: ${MUTEKI_HOST_DATA_ROOT}/install
+      MUTEKI_STATE_DIR: ${MUTEKI_HOST_DATA_ROOT}/state
+      MUTEKI_UI_HOST: 0.0.0.0
+      MUTEKI_API_PORT: "8100"
+      MUTEKI_UI_PORT: "3101"
+      MUTEKI_WEB_TLS_CERT: /run/secrets/web_tls_cert
+      MUTEKI_WEB_TLS_KEY: /run/secrets/web_tls_key
+      MUTEKI_WEB_PASSWORD: ${MUTEKI_WEB_PASSWORD:?set MUTEKI_WEB_PASSWORD}
+      MUTEKI_RUNNER_SOCKET: ${MUTEKI_HOST_DATA_ROOT}/state/runner/control.sock
+      MUTEKI_WORKER_NETWORK: ${MUTEKI_WORKER_NETWORK:-${COMPOSE_PROJECT_NAME:-muteki}_web_net}
+      MUTEKI_WORKER_IMAGE: ${MUTEKI_WORKER_IMAGE:?set the exact versioned MUTEKI_WORKER_IMAGE}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks: [worker]
+    secrets: [web_tls_cert, web_tls_key]
+    healthcheck:
+      test: ["CMD", "curl", "-fkSs", "https://127.0.0.1:3101/api/health"]
       interval: 10s
       timeout: 5s
       retries: 12
-    restart: unless-stopped
 
-  ui:
-    image: ${MUTEKI_IMAGE_REGISTRY:-ghcr.io/fishcodetech}/muteki-ui:${MUTEKI_RELEASE_VERSION:-v0.4.7}
-    networks: [muteki_net]
-    ports:
-      - "${MUTEKI_UI_PORT:-3001}:3001"
-    environment:
-      MUTEKI_BACKEND: "http://web-api:8000"
-    depends_on:
-      web-api:
-        condition: service_healthy
-    restart: unless-stopped
+networks:
+  worker:
+    name: ${MUTEKI_WORKER_NETWORK:-${COMPOSE_PROJECT_NAME:-muteki}_web_net}
+
+secrets:
+  web_tls_cert:
+    file: ${MUTEKI_WEB_TLS_CERT:?set MUTEKI_WEB_TLS_CERT}
+  web_tls_key:
+    file: ${MUTEKI_WEB_TLS_KEY:?set MUTEKI_WEB_TLS_KEY}

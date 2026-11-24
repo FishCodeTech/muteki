@@ -1,0 +1,61 @@
+{
+  "installed": [
+    {
+      "id": "alpha@tcode-probe",
+      "version": "1.0.0",
+      "scope": "user",
+      "enabled": true,
+      "installPath": "/tmp/tcode-probe/claude-home/.claude/plugins/cache/tcode-probe/alpha/1.0.0",
+      "installedAt": "2026-10-03T02:13:48.097Z",
+      "lastUpdated": "2026-10-03T02:13:48.097Z",
+      "mcpServers": {
+        "alpha-dead": {
+          "type": "http",
+          "url": "http://127.0.0.1:9/mcp"
+        }
+      },
+      "projectEnabled": true
+    },
+    {
+      "id": "alpha@tcode-probe",
+      "version": "1.0.0",
+      "scope": "project",
+      "enabled": true,
+      "installPath": "/tmp/tcode-probe/claude-home/.claude/plugins/cache/tcode-probe/alpha/1.0.0",
+      "installedAt": "2026-10-03T02:13:50.068Z",
+      "lastUpdated": "2026-10-03T02:13:50.068Z",
+      "projectPath": "/private/tmp/tcode-probe/proj",
+      "mcpServers": {
+        "alpha-dead": {
+          "type": "http",
+          "url": "http://127.0.0.1:9/mcp"
+        }
+      },
+      "projectEnabled": true
+    },
+    {
+      "id": "beta@tcode-probe",
+      "version": "0.1.0",
+      "scope": "project",
+      "enabled": true,
+      "installPath": "/tmp/tcode-probe/claude-home/.claude/plugins/cache/tcode-probe/beta/0.1.0",
+      "installedAt": "2026-10-03T02:13:49.458Z",
+      "lastUpdated": "2026-10-03T02:13:49.458Z",
+      "projectPath": "/private/tmp/tcode-probe/proj",
+      "projectEnabled": true
+    }
+  ],
+  "available": [
+    {
+      "pluginId": "gamma@tcode-probe",
+      "name": "gamma",
+      "description": "Command-source plugin",
+      "marketplaceName": "tcode-probe",
+      "source": {
+        "source": "command",
+        "command": "echo /tmp/tcode-probe/gamma-src",
+        "timeout": 30
+      }
+    }
+  ]
+}

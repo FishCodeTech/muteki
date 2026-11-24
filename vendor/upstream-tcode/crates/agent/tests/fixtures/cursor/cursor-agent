@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Stands in for `cursor-agent` in tests. `--version` and `status` answer from
+# fixtures; anything else relays stdio to the test listening on
+# 127.0.0.1:$TCODE_STAND_IN_PORT, after a first line with the arguments.
+case "$1" in
+--version)
+	echo "2026.10.01-e373342"
+	exit 0
+	;;
+status)
+	cat "$TCODE_STAND_IN_STATUS"
+	exit 0
+	;;
+esac
+exec 3<>"/dev/tcp/127.0.0.1/$TCODE_STAND_IN_PORT"
+printf '%s\n' "$*" >&3
+cat <&3 &
+exec cat >&3

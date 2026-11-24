@@ -1,0 +1,6 @@
+{"type":"system","subtype":"init","session_id":"fixture-session","model":"claude-opus-5"}
+{"type":"system","subtype":"status","status":"compacting"}
+{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"manual","pre_tokens":500260}}
+{"type":"stream_event","event":{"type":"message_start","message":{"id":"request-three","usage":{"input_tokens":20,"cache_read_input_tokens":30,"cache_creation_input_tokens":10,"output_tokens":0}}}}
+{"type":"stream_event","event":{"type":"message_delta","usage":{"output_tokens":5}}}
+{"type":"result","uuid":"result-two","subtype":"error_during_execution","is_error":true,"result":"Interrupted test turn","usage":{"input_tokens":20,"cache_read_input_tokens":30,"cache_creation_input_tokens":10,"output_tokens":5}}

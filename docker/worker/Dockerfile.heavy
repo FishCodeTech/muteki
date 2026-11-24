@@ -1,0 +1,36 @@
+ARG WORKER_IMAGE=muteki-worker:latest
+FROM ${WORKER_IMAGE}
+USER root
+ARG TARGETARCH
+ARG MINIFORGE_VERSION=26.9.4-2
+ARG SAGE_VERSION=10.9
+ARG ANGR_VERSION=10.0.5
+ARG VOLATILITY_VERSION=2.28.2
+RUN set -eu; \
+    case "$TARGETARCH" in \
+      amd64) arch=x86_64; checksum=bbaf16b3897da24c4be50315934ba74848f617b4495982841d6a0a60e0edbbdf ;; \
+      arm64) arch=aarch64; checksum=1adf18b530e4ffb00886ce6d5bd2eb1fa6311d2f14709b13bd154d8cd98d94c8 ;; \
+      *) echo "Unsupported heavy Worker architecture: $TARGETARCH" >&2; exit 2 ;; \
+    esac; \
+    curl -fsSL --connect-timeout 15 --max-time 600 --retry 3 \
+      "https://github.com/conda-forge/miniforge/releases/download/${MINIFORGE_VERSION}/Miniforge3-${MINIFORGE_VERSION}-Linux-${arch}.sh" \
+      -o /tmp/miniforge.sh; \
+    printf '%s  /tmp/miniforge.sh\n' "$checksum" | sha256sum -c -; \
+    bash /tmp/miniforge.sh -b -p /opt/conda; \
+    rm /tmp/miniforge.sh; \
+    /opt/conda/bin/conda install -y --override-channels -c conda-forge "python=3.13" "sage=${SAGE_VERSION}"; \
+    /opt/conda/bin/conda list --explicit > /opt/muteki/heavy-conda-packages.txt; \
+    /opt/conda/bin/conda clean --all -y; \
+    ln -s /opt/conda/bin/sage /usr/local/bin/sage
+RUN sage -c 'assert list(factor(15)) == [(3, 1), (5, 1)]; print(version())'
+RUN /opt/conda/bin/python -m venv /opt/muteki/heavy-python && \
+    /opt/muteki/heavy-python/bin/pip install --no-cache-dir \
+      "angr==${ANGR_VERSION}" "volatility3==${VOLATILITY_VERSION}" && \
+    /opt/muteki/heavy-python/bin/pip freeze > /opt/muteki/heavy-python-packages.txt && \
+    /opt/muteki/heavy-python/bin/python -c 'import angr, volatility3; print(angr.__version__)' && \
+    ln -s /opt/muteki/heavy-python/bin/vol /usr/local/bin/vol && vol --help >/dev/null && \
+    python3 /opt/muteki/capabilities.py && \
+    printf '\n## Optional specialist tools\nSageMath is available as `sage`. Use `/opt/muteki/heavy-python/bin/python` for angr and Volatility3 Python APIs; `vol` runs the Volatility3 CLI. Their isolated dependencies do not replace system Python.\n' >> /opt/muteki/AGENTS.md && \
+    cp /opt/muteki/AGENTS.md /opt/muteki/CLAUDE.md
+LABEL io.muteki.image.flavor="heavy" \
+      org.opencontainers.image.description="Curated Worker plus optional SageMath, angr and Volatility3"

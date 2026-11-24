@@ -1,0 +1,8 @@
+[
+  {
+    "name": "claude-plugins-official",
+    "source": "github",
+    "repo": "anthropics/claude-plugins-official",
+    "installLocation": "/Users/tryanks/.claude/plugins/marketplaces/claude-plugins-official"
+  }
+]

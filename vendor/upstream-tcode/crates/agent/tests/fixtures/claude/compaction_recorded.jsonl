@@ -1,0 +1,2 @@
+{"type":"system","subtype":"status","status":"compacting"}
+{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"manual","pre_tokens":19555,"post_tokens":2948,"cumulative_dropped_tokens":16607,"duration_ms":24455}}

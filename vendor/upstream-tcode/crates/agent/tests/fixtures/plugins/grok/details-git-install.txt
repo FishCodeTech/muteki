@@ -1,0 +1,8 @@
+multi-b1627a84
+  path: /tmp/tcode-probe-grok-git/home/.grok/installed-plugins/multi-b1627a84
+  kind: git: file:///tmp/tcode-probe-grok/multi
+  installed: 2026-10-03T08:53:48.955178+00:00
+  updated: 2026-10-03T08:53:48.955178+00:00
+  plugins (2):
+    epsilon v0.1.0 (subdir: epsilon)
+    delta v1.0.1 (subdir: delta)

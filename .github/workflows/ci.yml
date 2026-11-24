@@ -1,113 +1,186 @@
 name: ci
 
 on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main, muteki-rust]
   workflow_dispatch:
+    inputs:
+      full_packages:
+        description: Build and start packages on all three native platforms
+        type: boolean
+        default: false
+      upload_packages:
+        description: Keep downloadable native packages for three days
+        type: boolean
+        default: false
 
 permissions:
   contents: read
-  pull-requests: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
-  checks:
-    name: CI checks
-    # Fail closed without a cutoff. Re-runs cannot spend a second attempt.
-    if: ${{ github.run_attempt == 1 && github.run_number <= fromJSON(vars.MUTEKI_CI_LAST_RUN_NUMBER || '0') }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
+  changes:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.scope.outputs.code }}
+      packages: ${{ steps.scope.outputs.packages }}
     steps:
-      - uses: actions/checkout@v7
-        id: checkout
-
-      # Keep detection and checks on one runner: every separate job rounds up
-      # to a billable minute, even when path detection takes only seconds.
-      - name: Detect relevant changes
-        if: ${{ github.event_name != 'workflow_dispatch' }}
-        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
-        id: filter
+      - uses: actions/checkout@v7.0.1
         with:
-          # PRs use the full PR file list; pushes compare the entire pushed range.
-          base: ${{ github.event.before || github.event.repository.default_branch }}
-          filters: |
-            python:
-              - 'muteki/**'
-              - 'tests/**'
-              - 'apps/**/*.py'
-              - 'scripts/**'
-              - 'apps/web/ui/lib/contracts/**'
-              - 'pyproject.toml'
-              - 'uv.lock'
-              - '.python-version'
-              - '.github/workflows/ci.yml'
-              - '.github/actions/**'
-            web:
-              - 'apps/web/ui/**'
-              - 'apps/desktop/**'
-              - 'scripts/check_conversation_selection.cjs'
-              - '.github/workflows/ci.yml'
-              - '.github/actions/**'
-
-      - name: Set up uv and Python
-        if: ${{ github.event_name == 'workflow_dispatch' || steps.filter.outputs.python == 'true' }}
-        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
-        with:
-          version: "0.12.5"
-          python-version: "3.13"
-          enable-cache: true
-          cache-dependency-glob: uv.lock
-
-      - name: Install locked Python dependencies
-        if: ${{ github.event_name == 'workflow_dispatch' || steps.filter.outputs.python == 'true' }}
-        run: uv sync --frozen
-
-      - name: Run Python regression tests
-        if: ${{ github.event_name == 'workflow_dispatch' || steps.filter.outputs.python == 'true' }}
-        run: uv run --frozen python -m unittest discover -s tests -q
-
-      - name: Check generated API contracts
-        if: ${{ github.event_name == 'workflow_dispatch' || steps.filter.outputs.python == 'true' }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Select checks for this change
+        id: scope
+        env:
+          REPOSITORY: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          FULL_PACKAGES: ${{ inputs.full_packages || inputs.upload_packages || false }}
+        shell: bash
         run: |
-          uv run --frozen python scripts/gen_contracts_ts.py --check
-          uv run --frozen python scripts/gen_openapi.py --check
+          set -euo pipefail
+          code=false
+          if [[ "$EVENT" == workflow_dispatch ]]; then
+            code=true
+          else
+            if [[ "$BASE_SHA" == 0000000000000000000000000000000000000000 ]]; then
+              BASE_SHA=$(git hash-object -t tree /dev/null)
+            fi
+            git diff --name-only -z "$BASE_SHA" "$HEAD_SHA" > "$RUNNER_TEMP/changed-paths"
+            while IFS= read -r -d '' path; do
+              case "$path" in
+                docs/*|README.md|AGENTS.md|CHANGELOG.md|CONTRIBUTING.md|SECURITY.md|LICENSE|LICENSE.*) ;;
+                *) code=true; break ;;
+              esac
+            done < "$RUNNER_TEMP/changed-paths"
+          fi
+          packages=false
+          if [[ "$REPOSITORY" == FishCodeTech/muteki && "$code" == true && "$EVENT" == workflow_dispatch && "$FULL_PACKAGES" == true ]]; then
+            packages=true
+          fi
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          echo "packages=$packages" >> "$GITHUB_OUTPUT"
+      - name: Pre-PR verification stamp gate
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          MUTEKI_VERIFY_GATE_MODE: ${{ vars.MUTEKI_VERIFY_GATE_MODE || 'observe' }}
+        run: node scripts/verify/pr_gate.mjs --ci
 
-      - name: Import product entry points
-        if: ${{ github.event_name == 'workflow_dispatch' || steps.filter.outputs.python == 'true' }}
-        run: uv run --frozen python -c 'import muteki.cli, apps.web.server'
-
-      # Keep reporting frontend failures when a Python check fails, while
-      # respecting cancellation and the frontend's own dependency chain.
-      - name: Set up Node.js
-        id: node
-        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && (github.event_name == 'workflow_dispatch' || steps.filter.outputs.web == 'true') }}
-        uses: actions/setup-node@v7
+  frontend:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    name: Frontend and API contracts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7.0.1
         with:
-          node-version: "20"
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version: "22"
           cache: npm
-          cache-dependency-path: apps/web/ui/package-lock.json
-
-      - name: Install locked UI dependencies
-        id: ui-deps
-        if: ${{ !cancelled() && steps.node.outcome == 'success' }}
-        working-directory: apps/web/ui
-        run: npm ci
-
-      - name: Check shared settings and client preferences
-        if: ${{ !cancelled() && steps.ui-deps.outcome == 'success' }}
+          cache-dependency-path: apps/frontend/package-lock.json
+      - run: npm --prefix apps/frontend ci --no-audit --no-fund
+      - run: npm --prefix apps/frontend run typecheck
+      - run: npm --prefix apps/frontend run lint
+      - run: python3 scripts/generate_frontend_contracts.py --check
+      - run: pipx install uv
+      - name: Resolve the comment ratchet baseline
+        id: comments
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before || 'HEAD^' }}
+        shell: bash
         run: |
-          node --test apps/desktop/test/policy.test.cjs
-          node scripts/check_conversation_selection.cjs
-          node --test apps/web/ui/tests/btw-history.cjs
+          set -euo pipefail
+          base="$BASE_SHA"
+          if ! git cat-file -e "$base:crates/server/Cargo.toml" 2>/dev/null; then
+            base=HEAD
+          fi
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+      - run: node scripts/lint_rules.mjs
+        env:
+          MUTEKI_COMMENT_BASE: ${{ steps.comments.outputs.base }}
+      - run: node scripts/verify/props_frontend.mjs
 
-      - name: Check TypeScript
-        id: typecheck
-        if: ${{ !cancelled() && steps.ui-deps.outcome == 'success' }}
-        working-directory: apps/web/ui
-        run: ./node_modules/.bin/tsc --noEmit
+  rust:
+    name: Rust server check
+    needs: changes
+    if: needs.changes.outputs.code == 'true' && needs.changes.outputs.packages != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      CARGO_TARGET_DIR: .cache/target-check
+      RUSTC_WRAPPER: ""
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Linux native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential pkg-config cmake libssl-dev libdav1d-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Record Rust version
+        id: rust
+        shell: bash
+        run: echo "version=$(rustc --version | cut -d ' ' -f 2)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            .cache/target-check
+          key: rust-check-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.version }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: rust-check-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.version }}-
+      - run: cargo clippy --locked -p muteki-server -- -A clippy::all -D clippy::disallowed_methods
 
-      - name: Build production UI
-        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
-        working-directory: apps/web/ui
-        run: npm run build
+  packages:
+    needs: [changes, frontend]
+    if: needs.changes.outputs.packages == 'true'
+    uses: ./.github/workflows/build-packages.yml
+    with:
+      upload_packages: ${{ inputs.upload_packages || false }}
+
+  checks:
+    name: checks
+    if: always()
+    needs: [changes, frontend, rust, packages]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require the selected checks
+        env:
+          CHANGES: ${{ needs.changes.result }}
+          CODE: ${{ needs.changes.outputs.code }}
+          FULL: ${{ needs.changes.outputs.packages }}
+          FRONTEND: ${{ needs.frontend.result }}
+          RUST: ${{ needs.rust.result }}
+          PACKAGES: ${{ needs.packages.result }}
+        run: |
+          set -euo pipefail
+          test "$CHANGES" = success
+          if [[ "$CODE" == true ]]; then
+            test "$FRONTEND" = success
+            if [[ "$FULL" == true ]]; then
+              test "$PACKAGES" = success
+              test "$RUST" = skipped
+            else
+              test "$RUST" = success
+              test "$PACKAGES" = skipped
+            fi
+          else
+            test "$FRONTEND" = skipped
+            test "$RUST" = skipped
+            test "$PACKAGES" = skipped
+          fi

@@ -1,0 +1,22 @@
+/target
+.idea/
+
+# Generated native mobile host output.
+/crates/ios/host/build/
+/crates/ios/host/lib/
+/crates/ios/host/*.xcodeproj/
+/crates/android/host/app/build/
+/crates/android/host/build/
+/crates/android/host/.gradle/
+/crates/android/host/app/src/main/jniLibs/
+/crates/android/host/local.properties
+/crates/android/host/*.jks
+/crates/android/host/*.keystore
+
+# Generated browser bundle.
+/crates/web/dist/
+
+/tmp/
+
+# macOS Finder metadata.
+.DS_Store

@@ -1,0 +1,57 @@
+{
+  "name": "muteki-command-deck",
+  "version": "0.5.0",
+  "private": true,
+  "type": "module",
+  "description": "Project Muteki web command deck — a conversation-first frontend with a live agent collaboration map, evidence views, worker controls, and HITL operations.",
+  "scripts": {
+    "dev": "next dev -H 127.0.0.1 -p 3101",
+    "build": "next build",
+    "start": "next start -H 127.0.0.1 -p 3101",
+    "lint": "eslint . --ext .js,.mjs,.ts,.tsx",
+    "props": "node ../../scripts/verify/props_frontend.mjs",
+    "contracts:check": "python3 ../../scripts/generate_frontend_contracts.py --check",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@codemirror/commands": "^6.11.1",
+    "@codemirror/state": "^6.7.6",
+    "@codemirror/view": "^6.43.15",
+    "@muteki/ui": "file:../../packages/muteki-ui",
+    "@tanstack/react-virtual": "^3.14.13",
+    "@ui-sdk/core": "0.1.0-beta.13",
+    "@ui-sdk/react": "0.1.0-beta.13",
+    "@xterm/addon-fit": "^0.10.0",
+    "@xterm/xterm": "^5.5.0",
+    "@xyflow/react": "^12.11.0",
+    "chroma-js": "^3.2.0",
+    "clsx": "^2.1.1",
+    "katex": "0.18.9",
+    "lucide-react": "^1.34.0",
+    "motion": "^13.4.4",
+    "next": "15.5.28",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1",
+    "remark-math": "6.0.0",
+    "shiki": "^4.4.3",
+    "tailwind-merge": "^3.7.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4.3.3",
+    "@types/chroma-js": "^3.1.3",
+    "@types/node": "^20.14.0",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "eslint": "^8.57.1",
+    "eslint-config-next": "15.5.28",
+    "fast-check": "^4.10.3",
+    "react-test-renderer": "19.2.8",
+    "tailwindcss": "^4.3.3",
+    "typescript": "^5.5.3"
+  },
+  "overrides": {
+    "postcss": "8.5.26"
+  }
+}

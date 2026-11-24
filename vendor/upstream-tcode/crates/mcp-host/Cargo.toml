@@ -1,0 +1,15 @@
+[package]
+name = "mcp-host"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+async-channel = "2"
+axum = "0.8"
+log = "0.4"
+rmcp = { version = "3.0", features = [
+    "server",
+    "transport-streamable-http-server",
+] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time"] }
+uuid = { version = "1", features = ["v4"] }

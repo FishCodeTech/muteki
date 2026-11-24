@@ -1,0 +1,26 @@
+[package]
+name = "gpui-android"
+version = "0.3.7"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+description = "Android platform backend for gpui-fast (Vulkan via gpui_wgpu)"
+
+[dependencies]
+gpui-mobile-pacing = { path = "../frame-pacing" }
+gpui-mobile-touch = { path = "../touch" }
+gpui = { package = "gpui-fast", version = "0.1.10", default-features = false }
+gpui_wgpu = { package = "gpui-fast-wgpu", version = "0.1.10" }
+anyhow = "1"
+log = "0.4"
+parking_lot = "0.12"
+futures = "0.3"
+raw-window-handle = "0.6"
+smallvec = "1"
+unicode-segmentation = "1"
+
+[target.'cfg(target_os = "android")'.dependencies]
+android-activity = { version = "0.6", features = ["native-activity"] }
+jni = "0.22"
+ndk = { version = "0.9", features = ["nativewindow"] }
+uuid = { version = "1", features = ["v5"] }

@@ -1,0 +1,23 @@
+[package]
+name = "tcode-ios"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "tcode_ios"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+gpui = { package = "gpui-fast", version = "0.1.10", default-features = false }
+gpui-ios = { path = "../platform/gpui-ios" }
+log = "0.4"
+tcode-client = { path = "../client" }
+# No default features: `fast-apple-datapath` (iroh's Apple UDP fast path,
+# on for macOS) uses private Apple APIs and stays off on iOS. That holds only
+# while this crate is built alone, as CI and build.sh do; a workspace-wide
+# build unifies the desktop's features into it.
+tcode-traverse = { path = "../traverse", default-features = false, features = ["native"] }
+tcode-ui = { path = "../ui", default-features = false, features = ["voice", "native-preview"] }
+async-channel = "2"
+dirs = "7"

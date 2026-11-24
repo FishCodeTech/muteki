@@ -1,0 +1,7 @@
+{
+  "status": "unauthenticated",
+  "isAuthenticated": false,
+  "hasAccessToken": false,
+  "hasRefreshToken": false,
+  "message": "Not logged in"
+}

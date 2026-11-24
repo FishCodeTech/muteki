@@ -1,0 +1,52 @@
+
+:root {
+  --ui-bg-canvas: var(--bg, #0d0f12);
+  --ui-bg-surface: var(--panel, #14171c);
+  --ui-bg-elevated: var(--panel2, #1a1e24);
+  --ui-bg-sunken: var(--panel3, #0a0c0e);
+  --ui-bg-overlay: var(--cx-overlay, var(--panel, #161920));
+
+  --ui-fg-primary: var(--bright, #f4f5f7);
+  --ui-fg-secondary: var(--text, #c8cdd6);
+  --ui-fg-muted: var(--muted, #8e96a4);
+  --ui-fg-subtle: var(--dim, #6b7280);
+
+  --ui-border-subtle: var(--line, rgba(255, 255, 255, 0.08));
+  --ui-border-strong: var(--line2, rgba(255, 255, 255, 0.16));
+
+  --ui-accent: var(--accent, #5b8cff);
+  --ui-accent-fg: var(--on-accent, #ffffff);
+  --ui-accent-soft: var(--accent-soft, color-mix(in srgb, var(--ui-accent) 14%, transparent));
+  --ui-accent-line: var(--accent-line, color-mix(in srgb, var(--ui-accent) 36%, transparent));
+
+  --ui-success: var(--green, #22c55e);
+  --ui-warning: var(--amber, #f59e0b);
+  --ui-danger: var(--red, #ef4444);
+  --ui-info: var(--blue, #38bdf8);
+
+  --ui-focus: var(--focus-ring, var(--ui-accent));
+
+  --ui-sheen: inset 0 1px 0 color-mix(in srgb, white 7%, transparent);
+  --ui-sheen-strong: inset 0 1px 0 color-mix(in srgb, white 12%, transparent);
+
+  --ui-radius-xs: 4px;
+  --ui-radius-sm: 6px;
+  --ui-radius-md: 8px;
+  --ui-radius-lg: 12px;
+  --ui-radius-xl: 14px;
+
+  --ui-ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --ui-ease-drawer: cubic-bezier(0.32, 0.72, 0, 1);
+  --ui-dur-fast: 160ms;
+  --ui-dur-normal: 240ms;
+  --ui-dur-slow: 340ms;
+  --ui-dur-exit-fast: 110ms;
+  --ui-dur-exit-normal: 140ms;
+  --ui-dur-exit-slow: 240ms;
+}
+
+:root[data-theme="light"],
+.light {
+  --ui-sheen: inset 0 1px 0 color-mix(in srgb, white 75%, transparent);
+  --ui-sheen-strong: inset 0 1px 0 color-mix(in srgb, white 90%, transparent);
+}

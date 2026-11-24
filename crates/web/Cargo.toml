@@ -1,0 +1,16 @@
+[package]
+name = "muteki-web"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+muteki-ui = { path = "../ui" }
+nsh-core = { path = "../../vendor/upstream-nsh/crates/nsh-core", default-features = false }
+nsh-base = { path = "../../vendor/upstream-nsh/crates/nsh-base", default-features = false }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+nsh-platform-web = { path = "../../vendor/upstream-nsh/crates/nsh-platform-web", default-features = false }

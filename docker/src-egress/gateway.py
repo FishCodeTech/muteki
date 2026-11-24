@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import hashlib
+import ipaddress
 import json
 import os
 import signal
@@ -139,8 +140,27 @@ def local_addresses():
     return addrs
 
 
+def dns_nameservers():
+    try:
+        lines = Path("/etc/resolv.conf").read_text().splitlines()
+    except OSError:
+        return set()
+    nameservers = set()
+    for line in lines:
+        fields = line.split("#", 1)[0].split()
+        if len(fields) != 2 or fields[0] != "nameserver":
+            continue
+        try:
+            address = ipaddress.ip_address(fields[1])
+        except ValueError:
+            continue
+        nameservers.add((socket.AF_INET if address.version == 4 else socket.AF_INET6, str(address)))
+    return nameservers
+
+
 def apply(policy):
     local_addrs = local_addresses()
+    resolvers = dns_nameservers()
     resolved = []
     inspection_mode = policy.get("inspection_requirements", {}).get("mode", "off")
     target_entries = []
@@ -152,6 +172,19 @@ def apply(policy):
     for host, port, protocol in excluded_endpoints(policy):
         for family, address in addresses(host):
             excluded_entries.append((family, address, port, protocol))
+    upstream_entries = []
+    upstream_cfg = policy.get("upstream_proxies") or {}
+    if upstream_cfg.get("enabled"):
+        for node in upstream_cfg.get("nodes") or []:
+            uhost = str(node.get("host") or "").strip()
+            try:
+                uport = int(node.get("port") or 0)
+            except (TypeError, ValueError):
+                uport = 0
+            if uhost and 1 <= uport <= 65535:
+                for family, address in addresses(uhost):
+                    upstream_entries.append((family, address, uport))
+                    resolved.append({"host": uhost, "address": address, "port": uport, "protocol": "tcp", "purpose": "upstream-proxy"})
     for family, table in ((socket.AF_INET, "iptables"), (socket.AF_INET6, "ip6tables")):
         active_a = subprocess.run([table, "-C", "OUTPUT", "-j", "SRC_EGRESS_A"], capture_output=True).returncode == 0
         next_chain = "SRC_EGRESS_B" if active_a else "SRC_EGRESS_A"
@@ -163,9 +196,13 @@ def apply(policy):
         run(table, "-A", next_chain, "-o", "lo", "-j", "ACCEPT")
         for addr in sorted(local_addrs.get(family, set())):
             run(table, "-A", next_chain, "-d", addr, "-p", "tcp", "--dport", "18080", "-j", "ACCEPT")
-        if family == socket.AF_INET:
-            run(table, "-A", next_chain, "-d", "127.0.0.11", "-p", "udp", "--dport", "53", "-j", "ACCEPT")
-            run(table, "-A", next_chain, "-d", "127.0.0.11", "-p", "tcp", "--dport", "53", "-j", "ACCEPT")
+        for resolver_family, resolver in sorted(resolvers):
+            if resolver_family == family:
+                for protocol in ("udp", "tcp"):
+                    run(table, "-A", next_chain, "-d", resolver, "-p", protocol, "--dport", "53", "-j", "ACCEPT")
+        for u_family, address, uport in upstream_entries:
+            if u_family == family:
+                run(table, "-A", next_chain, "-m", "owner", "--uid-owner", str(PROXY_UID), "-d", address, "-p", "tcp", "--dport", str(uport), "-j", "ACCEPT")
         subprocess.run([table, "-t", "nat", "-N", next_nat], capture_output=True)
         run(table, "-t", "nat", "-F", next_nat)
         run(table, "-t", "nat", "-A", next_nat, "-m", "owner", "--uid-owner", str(PROXY_UID), "-j", "RETURN")
@@ -176,10 +213,17 @@ def apply(policy):
             if t_family != family:
                 continue
             run(table, "-A", next_chain, "-d", address, "-p", protocol, "--dport", str(port), "-j", "ACCEPT")
-            if inspection_mode in {"record", "enforce"} and purpose == "test-target" and inspection_selected(policy, original_target):
+            loopback = False
+            try:
+                loopback = ipaddress.ip_address(address).is_loopback
+            except ValueError:
+                loopback = False
+            if purpose == "test-target" and (
+                loopback or (inspection_mode in {"record", "enforce"} and inspection_selected(policy, original_target))
+            ):
                 run(table, "-t", "nat", "-A", next_nat, "-d", address, "-p", "tcp", "--dport", str(port), "-j", "REDIRECT", "--to-ports", "18080")
         run(table, "-A", next_chain, "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT")
-        run(table, "-A", next_chain, "-j", "REJECT")
+        run(table, "-A", next_chain, "-j", "REJECT" if policy.get("network_mode") == "enforced" else "ACCEPT")
         run(table, "-t", "nat", "-A", next_nat, "-j", "RETURN")
         run(table, "-I", "OUTPUT", "1", "-j", next_chain)
         while subprocess.run([table, "-D", "OUTPUT", "-j", prev_chain], capture_output=True).returncode == 0:
@@ -199,8 +243,9 @@ def write_health(policy, state, resolved, error=""):
     temporary = HEALTH_PATH.with_suffix(".tmp")
     temporary.write_text(json.dumps({
         "state": state, "digest": digest(policy), "generation": policy.get("environment_generation"),
+        "source_digest": policy.get("gateway_source_digest"),
         "resolved": resolved, "error": error, "verified_at": time.time(), "pid": os.getpid(),
-        "network_enforced": state == "ready", "inspection": proxy_health(),
+        "network_enforced": state == "ready" and policy.get("network_mode") == "enforced", "inspection": proxy_health(),
     }))
     temporary.replace(HEALTH_PATH)
 

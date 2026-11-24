@@ -1,0 +1,20 @@
+[package]
+name = "rust-exports-native"
+description = "What a Rust crate can export to TSX: a component, a module and a class (examples/rust-exports)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+nsh-core.workspace = true
+nsh-base.workspace = true
+
+# The headless test runs `App.tsx` against this crate's set: `nsh-testing`
+# builds it (with the bundler and QuickJS) and runs it.
+[dev-dependencies]
+nsh-engine.workspace = true
+nsh-testing = { workspace = true, features = ["bundle"] }

@@ -1,0 +1,7 @@
+node_modules/
+dist/
+.astro/
+bun.lock
+bun.lockb
+# The WebAssembly player and demo bundles (`bun run play`).
+public/play/

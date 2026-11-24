@@ -1,0 +1,529 @@
+{
+  "session_new": {
+    "sessionId": "4f1b6a52-8e0c-4c1d-9a57-2d3b1e7c9a10",
+    "modes": {
+      "currentModeId": "agent",
+      "availableModes": [
+        { "id": "agent", "name": "Agent", "description": "Full agent capabilities with tool access" },
+        { "id": "plan", "name": "Plan", "description": "Read-only mode for planning and designing before implementation" },
+        { "id": "ask", "name": "Ask", "description": "Q&A mode - no edits or command execution" }
+      ]
+    },
+    "models": {
+      "currentModelId": "composer-1",
+      "availableModels": [
+        { "modelId": "composer-1", "name": "Composer 1" },
+        { "modelId": "gpt-5", "name": "GPT-5" }
+      ]
+    },
+    "configOptions": [
+      {
+        "id": "mode",
+        "name": "Mode",
+        "description": "Controls how the agent executes tasks",
+        "category": "mode",
+        "type": "select",
+        "currentValue": "agent",
+        "options": [
+          { "value": "agent", "name": "Agent", "description": "Full agent capabilities with tool access" },
+          { "value": "plan", "name": "Plan", "description": "Read-only mode for planning and designing before implementation" },
+          { "value": "ask", "name": "Ask", "description": "Q&A mode - no edits or command execution" }
+        ]
+      },
+      {
+        "id": "model",
+        "name": "Model",
+        "description": "Controls which model is used for responses",
+        "category": "model",
+        "type": "select",
+        "currentValue": "composer-1",
+        "options": [
+          { "value": "composer-1", "name": "Composer 1" },
+          { "value": "gpt-5", "name": "GPT-5" }
+        ]
+      },
+      {
+        "id": "fast",
+        "name": "Fast",
+        "category": "model_config",
+        "type": "select",
+        "currentValue": "false",
+        "options": [
+          { "value": "false", "name": "Off" },
+          { "value": "true", "name": "On" }
+        ]
+      }
+    ]
+  },
+  "set_model_gpt5": {
+    "configOptions": [
+      {
+        "id": "mode",
+        "name": "Mode",
+        "description": "Controls how the agent executes tasks",
+        "category": "mode",
+        "type": "select",
+        "currentValue": "agent",
+        "options": [
+          { "value": "agent", "name": "Agent", "description": "Full agent capabilities with tool access" },
+          { "value": "plan", "name": "Plan", "description": "Read-only mode for planning and designing before implementation" },
+          { "value": "ask", "name": "Ask", "description": "Q&A mode - no edits or command execution" }
+        ]
+      },
+      {
+        "id": "model",
+        "name": "Model",
+        "description": "Controls which model is used for responses",
+        "category": "model",
+        "type": "select",
+        "currentValue": "gpt-5",
+        "options": [
+          { "value": "composer-1", "name": "Composer 1" },
+          { "value": "gpt-5", "name": "GPT-5" }
+        ]
+      },
+      {
+        "id": "reasoning",
+        "name": "Reasoning",
+        "category": "thought_level",
+        "type": "select",
+        "currentValue": "medium",
+        "options": [
+          { "value": "low", "name": "Low" },
+          { "value": "medium", "name": "Medium" },
+          { "value": "high", "name": "High" }
+        ]
+      }
+    ]
+  },
+  "set_reasoning_high": {
+    "configOptions": [
+      {
+        "id": "mode",
+        "name": "Mode",
+        "description": "Controls how the agent executes tasks",
+        "category": "mode",
+        "type": "select",
+        "currentValue": "agent",
+        "options": [
+          { "value": "agent", "name": "Agent", "description": "Full agent capabilities with tool access" },
+          { "value": "plan", "name": "Plan", "description": "Read-only mode for planning and designing before implementation" },
+          { "value": "ask", "name": "Ask", "description": "Q&A mode - no edits or command execution" }
+        ]
+      },
+      {
+        "id": "model",
+        "name": "Model",
+        "description": "Controls which model is used for responses",
+        "category": "model",
+        "type": "select",
+        "currentValue": "gpt-5",
+        "options": [
+          { "value": "composer-1", "name": "Composer 1" },
+          { "value": "gpt-5", "name": "GPT-5" }
+        ]
+      },
+      {
+        "id": "reasoning",
+        "name": "Reasoning",
+        "category": "thought_level",
+        "type": "select",
+        "currentValue": "high",
+        "options": [
+          { "value": "low", "name": "Low" },
+          { "value": "medium", "name": "Medium" },
+          { "value": "high", "name": "High" }
+        ]
+      }
+    ]
+  },
+  "list_available_models": {
+    "models": [
+      {
+        "value": "composer-1",
+        "name": "Composer 1",
+        "configOptions": [
+          {
+            "id": "fast",
+            "name": "Fast",
+            "category": "model_config",
+            "type": "select",
+            "currentValue": "false",
+            "options": [
+              { "value": "false", "name": "Off" },
+              { "value": "true", "name": "On" }
+            ]
+          }
+        ]
+      },
+      {
+        "value": "gpt-5",
+        "name": "GPT-5",
+        "configOptions": [
+          {
+            "id": "reasoning",
+            "name": "Reasoning",
+            "category": "thought_level",
+            "type": "select",
+            "currentValue": "medium",
+            "options": [
+              { "value": "low", "name": "Low" },
+              { "value": "medium", "name": "Medium" },
+              { "value": "high", "name": "High" }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "session_load": {
+    "modes": {
+      "currentModeId": "agent",
+      "availableModes": [
+        { "id": "agent", "name": "Agent", "description": "Full agent capabilities with tool access" },
+        { "id": "plan", "name": "Plan", "description": "Read-only mode for planning and designing before implementation" },
+        { "id": "ask", "name": "Ask", "description": "Q&A mode - no edits or command execution" }
+      ]
+    },
+    "models": {
+      "currentModelId": "composer-1",
+      "availableModels": [
+        { "modelId": "composer-1", "name": "Composer 1" },
+        { "modelId": "gpt-5", "name": "GPT-5" }
+      ]
+    },
+    "configOptions": [
+      {
+        "id": "mode",
+        "name": "Mode",
+        "description": "Controls how the agent executes tasks",
+        "category": "mode",
+        "type": "select",
+        "currentValue": "agent",
+        "options": [
+          { "value": "agent", "name": "Agent", "description": "Full agent capabilities with tool access" },
+          { "value": "plan", "name": "Plan", "description": "Read-only mode for planning and designing before implementation" },
+          { "value": "ask", "name": "Ask", "description": "Q&A mode - no edits or command execution" }
+        ]
+      },
+      {
+        "id": "model",
+        "name": "Model",
+        "description": "Controls which model is used for responses",
+        "category": "model",
+        "type": "select",
+        "currentValue": "composer-1",
+        "options": [
+          { "value": "composer-1", "name": "Composer 1" },
+          { "value": "gpt-5", "name": "GPT-5" }
+        ]
+      }
+    ]
+  },
+  "load_replay": [
+    { "sessionUpdate": "user_message_chunk", "content": { "type": "text", "text": "Which database should we use?" } },
+    { "sessionUpdate": "agent_thought_chunk", "content": { "type": "text", "text": "The user has not said." } },
+    {
+      "sessionUpdate": "tool_call",
+      "toolCallId": "replay-0-1",
+      "title": "Storage",
+      "kind": "think",
+      "status": "pending",
+      "rawInput": {
+        "_toolName": "askQuestion",
+        "title": "Storage",
+        "questions": [
+          { "id": "db", "prompt": "Which database?", "options": [ { "id": "pg", "label": "Postgres" }, { "id": "lite", "label": "SQLite" } ], "allowMultiple": false }
+        ]
+      }
+    },
+    { "sessionUpdate": "tool_call_update", "toolCallId": "replay-0-1", "status": "completed" },
+    {
+      "sessionUpdate": "tool_call",
+      "toolCallId": "replay-0-2",
+      "title": "`ls`",
+      "kind": "execute",
+      "status": "pending",
+      "rawInput": { "command": "ls" }
+    },
+    {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "replay-0-2",
+      "status": "completed",
+      "rawOutput": { "exitCode": 0, "stdout": "Cargo.toml\n", "stderr": "" }
+    },
+    {
+      "sessionUpdate": "tool_call",
+      "toolCallId": "replay-0-3",
+      "title": "Task: Survey the schema",
+      "kind": "other",
+      "status": "pending",
+      "rawInput": { "_toolName": "task", "prompt": "List every table.", "description": "Survey the schema", "subagentType": "explore" }
+    },
+    { "sessionUpdate": "tool_call_update", "toolCallId": "replay-0-3", "status": "completed", "rawOutput": { "durationMs": 1200, "isBackground": false } },
+    {
+      "sessionUpdate": "subagent_spawned",
+      "subagentSessionId": "7d3c0f6e-2b1a-4e8f-9c5d-6a4b3e2f1d0c",
+      "name": "explore",
+      "task": "Survey the schema",
+      "capabilities": {},
+      "_meta": { "cursor": { "toolCallId": "replay-0-3", "agentId": "7d3c0f6e-2b1a-4e8f-9c5d-6a4b3e2f1d0c" } }
+    },
+    {
+      "sessionUpdate": "subagent_state_update",
+      "subagentSessionId": "7d3c0f6e-2b1a-4e8f-9c5d-6a4b3e2f1d0c",
+      "state": "completed",
+      "_meta": { "cursor": { "toolCallId": "replay-0-3", "agentId": "7d3c0f6e-2b1a-4e8f-9c5d-6a4b3e2f1d0c" } }
+    },
+    { "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": "Postgres it is." } }
+  ],
+  "available_commands": {
+    "sessionUpdate": "available_commands_update",
+    "availableCommands": [
+      { "name": "copy-request-id", "description": "Copy the last request ID to clipboard" },
+      { "name": "review", "description": "Review the current diff" }
+    ]
+  },
+  "turn_tools": [
+    { "sessionUpdate": "agent_thought_chunk", "content": { "type": "text", "text": "Check the build first." } },
+    {
+      "sessionUpdate": "tool_call",
+      "toolCallId": "call_shell_1",
+      "title": "`cargo build`",
+      "kind": "execute",
+      "status": "pending",
+      "rawInput": { "command": "cargo build" }
+    },
+    { "sessionUpdate": "tool_call_update", "toolCallId": "call_shell_1", "status": "in_progress" },
+    {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_shell_1",
+      "status": "completed",
+      "rawOutput": { "exitCode": 101, "stdout": "", "stderr": "error[E0425]: cannot find value `x`" }
+    },
+    {
+      "sessionUpdate": "tool_call",
+      "toolCallId": "call_edit_1",
+      "title": "Edit `src/lib.rs`",
+      "kind": "edit",
+      "status": "pending",
+      "rawInput": { "path": "src/lib.rs" },
+      "locations": [ { "path": "src/lib.rs" } ]
+    },
+    { "sessionUpdate": "tool_call_update", "toolCallId": "call_edit_1", "status": "in_progress" },
+    {
+      "sessionUpdate": "tool_call_update",
+      "toolCallId": "call_edit_1",
+      "status": "completed",
+      "content": [ { "type": "diff", "path": "src/lib.rs", "oldText": "let y = x;\n", "newText": "let x = 1;\nlet y = x;\n" } ]
+    },
+    {
+      "sessionUpdate": "tool_call",
+      "toolCallId": "call_mcp_1",
+      "title": "github: create_issue",
+      "kind": "other",
+      "status": "pending",
+      "rawInput": { "providerIdentifier": "github", "toolName": "create_issue", "args": { "title": "Build broke" } }
+    },
+    { "sessionUpdate": "tool_call_update", "toolCallId": "call_mcp_1", "status": "in_progress" },
+    { "sessionUpdate": "tool_call_update", "toolCallId": "call_mcp_1", "status": "completed", "rawOutput": { "rejected": true } },
+    {
+      "sessionUpdate": "tool_call",
+      "toolCallId": "call_grep_1",
+      "title": "grep \"fn main\"",
+      "kind": "search",
+      "status": "pending",
+      "rawInput": { "pattern": "fn main", "path": "." }
+    },
+    { "sessionUpdate": "tool_call_update", "toolCallId": "call_grep_1", "status": "completed", "rawOutput": { "totalMatches": 1, "truncated": false } },
+    { "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": "The build said \"Error: cannot find value\"; " } },
+    { "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": "I declared it." } }
+  ],
+  "run_error": {
+    "sessionUpdate": "agent_message_chunk",
+    "content": { "type": "text", "text": "\n\nError: ConnectError: [unavailable] upstream connect error" }
+  },
+  "ask_question": {
+    "toolCallId": "call_ask_1",
+    "title": "Storage",
+    "questions": [
+      {
+        "id": "db",
+        "prompt": "Which database?",
+        "options": [ { "id": "pg", "label": "Postgres" }, { "id": "lite", "label": "SQLite" } ],
+        "allowMultiple": false
+      },
+      {
+        "id": "extras",
+        "prompt": "Which extras?",
+        "options": [ { "id": "cache", "label": "Cache" }, { "id": "queue", "label": "Queue" }, { "id": "search", "label": "Search" } ],
+        "allowMultiple": true
+      }
+    ]
+  },
+  "create_plan_entries": {
+    "sessionUpdate": "plan",
+    "entries": [
+      { "content": "Add the migration", "priority": "medium", "status": "pending" },
+      { "content": "Wire the repository", "priority": "medium", "status": "pending" }
+    ]
+  },
+  "create_plan": {
+    "toolCallId": "call_plan_1",
+    "name": "Storage",
+    "overview": "Move persistence to Postgres.",
+    "plan": "# Storage\n\n1. Add the migration\n2. Wire the repository\n",
+    "todos": [
+      { "id": "t1", "content": "Add the migration", "status": "pending" },
+      { "id": "t2", "content": "Wire the repository", "status": "pending" }
+    ]
+  },
+  "update_todos": {
+    "toolCallId": "call_todos_1",
+    "todos": [
+      { "id": "t1", "content": "Add the migration", "status": "in_progress" },
+      { "id": "t2", "content": "Wire the repository", "status": "pending" },
+      { "id": "t3", "content": "Drop SQLite", "status": "pending" }
+    ],
+    "merge": false
+  },
+  "update_todos_merge": {
+    "toolCallId": "call_todos_2",
+    "todos": [
+      { "id": "t1", "content": "Add the migration", "status": "completed" },
+      { "id": "t3", "content": "Drop SQLite", "status": "cancelled" }
+    ],
+    "merge": true
+  },
+  "permission_read": {
+    "toolCall": {
+      "toolCallId": "call_read_1",
+      "title": "Read `/etc/hosts`",
+      "kind": "read",
+      "status": "pending"
+    },
+    "options": [
+      { "optionId": "allow-once", "name": "Allow once", "kind": "allow_once" },
+      { "optionId": "allow-always", "name": "Allow always", "kind": "allow_always" },
+      { "optionId": "reject-once", "name": "Reject", "kind": "reject_once" }
+    ]
+  },
+  "permission_edit": {
+    "toolCall": {
+      "toolCallId": "call_write_1",
+      "title": "Edit `src/lib.rs`",
+      "kind": "edit",
+      "status": "pending",
+      "content": [ { "type": "diff", "path": "src/lib.rs", "oldText": "a\n", "newText": "b\n" } ]
+    },
+    "options": [
+      { "optionId": "allow-once", "name": "Allow once", "kind": "allow_once" },
+      { "optionId": "allow-always", "name": "Allow always", "kind": "allow_always" },
+      { "optionId": "reject-once", "name": "Reject", "kind": "reject_once" }
+    ]
+  },
+  "permission_shell": {
+    "toolCall": {
+      "toolCallId": "call_rm_1",
+      "title": "`rm -rf target`",
+      "kind": "execute",
+      "status": "pending"
+    },
+    "options": [
+      { "optionId": "allow-once", "name": "Allow once", "kind": "allow_once" },
+      { "optionId": "allow-always", "name": "Allow always", "kind": "allow_always" },
+      { "optionId": "reject-once", "name": "Reject", "kind": "reject_once" }
+    ]
+  },
+  "subagent_turn": [
+    {
+      "sessionId": "4f1b6a52-8e0c-4c1d-9a57-2d3b1e7c9a10",
+      "update": {
+        "sessionUpdate": "tool_call",
+        "toolCallId": "call_task_1",
+        "title": "Task: Survey the schema",
+        "kind": "other",
+        "status": "pending",
+        "rawInput": { "_toolName": "task", "prompt": "List every table.", "description": "Survey the schema", "subagentType": "explore" }
+      }
+    },
+    {
+      "sessionId": "4f1b6a52-8e0c-4c1d-9a57-2d3b1e7c9a10",
+      "update": { "sessionUpdate": "tool_call_update", "toolCallId": "call_task_1", "status": "in_progress" }
+    },
+    {
+      "sessionId": "4f1b6a52-8e0c-4c1d-9a57-2d3b1e7c9a10",
+      "update": {
+        "sessionUpdate": "subagent_spawned",
+        "subagentSessionId": "9e8d7c6b-5a49-4382-a1b0-c9d8e7f6a5b4",
+        "name": "explore",
+        "task": "List every table.",
+        "capabilities": {},
+        "_meta": { "cursor": { "toolCallId": "call_task_1", "agentId": "9e8d7c6b-5a49-4382-a1b0-c9d8e7f6a5b4", "model": "composer-1" } }
+      }
+    },
+    {
+      "sessionId": "9e8d7c6b-5a49-4382-a1b0-c9d8e7f6a5b4",
+      "update": { "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": "Looking at " } }
+    },
+    {
+      "sessionId": "9e8d7c6b-5a49-4382-a1b0-c9d8e7f6a5b4",
+      "update": { "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": "the migrations." } }
+    },
+    {
+      "sessionId": "9e8d7c6b-5a49-4382-a1b0-c9d8e7f6a5b4",
+      "update": {
+        "sessionUpdate": "tool_call",
+        "toolCallId": "call_shell_1",
+        "title": "`ls migrations`",
+        "kind": "execute",
+        "status": "pending",
+        "rawInput": { "command": "ls migrations" }
+      }
+    },
+    {
+      "sessionId": "9e8d7c6b-5a49-4382-a1b0-c9d8e7f6a5b4",
+      "update": {
+        "sessionUpdate": "tool_call_update",
+        "toolCallId": "call_shell_1",
+        "status": "completed",
+        "rawOutput": { "exitCode": 0, "stdout": "0001_init.sql\n", "stderr": "" }
+      }
+    },
+    {
+      "sessionId": "9e8d7c6b-5a49-4382-a1b0-c9d8e7f6a5b4",
+      "update": { "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": "One table: users." } }
+    },
+    {
+      "sessionId": "4f1b6a52-8e0c-4c1d-9a57-2d3b1e7c9a10",
+      "update": {
+        "sessionUpdate": "subagent_state_update",
+        "subagentSessionId": "9e8d7c6b-5a49-4382-a1b0-c9d8e7f6a5b4",
+        "state": "completed",
+        "_meta": { "cursor": { "toolCallId": "call_task_1", "agentId": "9e8d7c6b-5a49-4382-a1b0-c9d8e7f6a5b4", "model": "composer-1" } }
+      }
+    },
+    {
+      "sessionId": "4f1b6a52-8e0c-4c1d-9a57-2d3b1e7c9a10",
+      "update": {
+        "sessionUpdate": "tool_call_update",
+        "toolCallId": "call_task_1",
+        "status": "completed",
+        "rawOutput": { "durationMs": 4200, "isBackground": false }
+      }
+    },
+    {
+      "sessionId": "4f1b6a52-8e0c-4c1d-9a57-2d3b1e7c9a10",
+      "update": { "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": "The schema has one table." } }
+    }
+  ],
+  "task": {
+    "toolCallId": "call_task_1",
+    "description": "Survey the schema",
+    "prompt": "List every table.",
+    "subagentType": "explore",
+    "model": "composer-1",
+    "agentId": "9e8d7c6b-5a49-4382-a1b0-c9d8e7f6a5b4",
+    "durationMs": 4200
+  }
+}

@@ -1,0 +1,9073 @@
+{
+  "src.task.archive": {
+    "type": "object",
+    "properties": {},
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "service.py:569"
+  },
+  "src.task.restore": {
+    "type": "object",
+    "properties": {},
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "service.py:597"
+  },
+  "src.task.pause": {
+    "type": "object",
+    "properties": {
+      "idempotency_key": {
+        "type": "string"
+      }
+    },
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {}
+  },
+  "src.task.resume": {
+    "type": "object",
+    "properties": {
+      "idempotency_key": {
+        "type": "string"
+      }
+    },
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {}
+  },
+  "src.task.destroy": {
+    "type": "object",
+    "properties": {},
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "service.py:715"
+  },
+  "src.task.authorization.renew": {
+    "type": "object",
+    "properties": {
+      "base_policy_version": {
+        "anyOf": [
+          {
+            "type": "integer",
+            "minimum": 1
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "targets": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "excluded_targets": {
+        "anyOf": [
+          {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "exclusions": {
+        "anyOf": [
+          {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "conditions": {
+        "anyOf": [
+          {
+            "type": "array"
+          },
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "notes": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "raw_policy_text": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "diff_summary": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "scope_fuse_override_reason": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "required": [
+      "targets"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {}
+  },
+  "src.run.archive": {
+    "type": "object",
+    "properties": {
+      "run_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "run_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "service.py:616"
+  },
+  "src.run.restore": {
+    "type": "object",
+    "properties": {
+      "run_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "run_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "service.py:632"
+  },
+  "src.run.destroy": {
+    "type": "object",
+    "properties": {
+      "run_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "run_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "service.py:671"
+  },
+  "src.artifact.destroy": {
+    "type": "object",
+    "properties": {
+      "sha256": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "sha256"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "service.py:649"
+  },
+  "src.exchange.record": {
+    "type": "object",
+    "properties": {
+      "exchange_id": {
+        "type": "string"
+      },
+      "source_kind": {
+        "enum": [
+          "browser",
+          "http_tool",
+          "proxy",
+          "import"
+        ]
+      },
+      "actor_ref": {
+        "type": "string"
+      },
+      "context_id": {
+        "type": "string"
+      },
+      "declared_target": {
+        "type": "string"
+      },
+      "observed_url": {
+        "type": "string"
+      },
+      "method": {
+        "type": "string"
+      },
+      "started_at": {
+        "type": "string"
+      },
+      "protocol": {
+        "type": "string"
+      },
+      "authorization_ref": {
+        "type": "string"
+      },
+      "decision_ref": {
+        "type": "string"
+      },
+      "protocol_stream_ref": {
+        "type": "string"
+      },
+      "source_run_id": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "finished_at": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "redirect_parent": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "replay_of": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "source_event_seq": {
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "status_code": {
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "identity_revision": {
+        "type": "integer",
+        "minimum": 0
+      },
+      "browser_generation": {
+        "type": "integer",
+        "minimum": 0
+      },
+      "tags": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "capture_limitations": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "metadata": {
+        "type": "object"
+      },
+      "request_headers": {
+        "type": "array",
+        "items": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 2,
+          "maxItems": 2
+        }
+      },
+      "response_headers": {
+        "type": "array",
+        "items": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 2,
+          "maxItems": 2
+        }
+      },
+      "capture_state": {
+        "enum": [
+          "complete",
+          "partial",
+          "unavailable"
+        ]
+      },
+      "execution_state": {
+        "enum": [
+          "created",
+          "waiting_approval",
+          "denied",
+          "ready",
+          "dispatched",
+          "completed",
+          "failed",
+          "outcome_unknown",
+          "cancelled"
+        ]
+      },
+      "request_raw_b64": {
+        "type": "string"
+      },
+      "response_raw_b64": {
+        "type": "string"
+      },
+      "raw_request_b64": {
+        "type": "string"
+      },
+      "request_raw": {
+        "type": "string"
+      },
+      "response_raw": {
+        "type": "string"
+      },
+      "response_raw_ref": {
+        "type": [
+          "object",
+          "null"
+        ],
+        "properties": {
+          "artifact_id": {
+            "type": "string"
+          },
+          "sha256": {
+            "type": "string"
+          },
+          "task_id": {
+            "type": "string"
+          },
+          "media_type": {
+            "type": "string"
+          },
+          "size": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "source_run_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source_event_seq": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "version": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "original": {
+            "type": "boolean"
+          },
+          "complete": {
+            "enum": [
+              "complete",
+              "partial",
+              "unavailable"
+            ]
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "artifact_id",
+          "sha256",
+          "task_id"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "required": [
+      "source_kind",
+      "actor_ref",
+      "method",
+      "request_raw"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {
+      "request_raw_b64": "request_raw",
+      "response_raw_b64": "response_raw",
+      "raw_request_b64": "request_raw"
+    },
+    "source": "exchanges.py:429"
+  },
+  "src.exchange.draft.save": {
+    "type": "object",
+    "properties": {
+      "source_exchange_id": {
+        "type": "string"
+      },
+      "base_revision": {
+        "type": "integer",
+        "minimum": 0
+      },
+      "raw_request_b64": {
+        "type": "string"
+      },
+      "raw_request": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "changes": {
+        "anyOf": [
+          {
+            "type": "object",
+            "additionalProperties": {}
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "metadata": {
+        "anyOf": [
+          {
+            "type": "object",
+            "additionalProperties": {}
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "editor": {
+        "type": "string"
+      },
+      "idempotency_key": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "source_exchange_id",
+      "base_revision",
+      "editor",
+      "idempotency_key"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {
+      "raw_request_b64": "raw_request"
+    },
+    "source": "exchanges.py:617"
+  },
+  "src.exchange.draft.execute": {
+    "type": "object",
+    "properties": {
+      "draft_id": {
+        "type": "string"
+      },
+      "draft_revision": {
+        "type": "integer"
+      },
+      "identity_ref": {
+        "type": "string"
+      },
+      "credential_ref": {
+        "type": "string"
+      },
+      "mutator_id": {
+        "type": "string"
+      },
+      "expected_side_effect": {
+        "type": "string"
+      },
+      "authorization_version": {
+        "type": "integer"
+      },
+      "idempotency_key": {
+        "type": "string"
+      },
+      "budget": {
+        "anyOf": [
+          {
+            "type": "object",
+            "additionalProperties": {}
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "context_id": {
+        "type": "string"
+      },
+      "identity_revision": {
+        "type": "integer"
+      },
+      "browser_generation": {
+        "type": "integer"
+      },
+      "source_run_id": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "actor_ref": {
+        "type": "string"
+      },
+      "resource_facts": {
+        "anyOf": [
+          {
+            "type": "object",
+            "additionalProperties": {
+              "type": "object"
+            }
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "wait_for_approval": {
+        "type": "boolean"
+      }
+    },
+    "required": [
+      "draft_id",
+      "draft_revision",
+      "identity_ref",
+      "authorization_version",
+      "idempotency_key"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "exchanges.py:675"
+  },
+  "src.research.plan.save": {
+    "type": "object",
+    "properties": {
+      "payload": {
+        "type": "object",
+        "required": [
+          "question",
+          "rationale",
+          "gaps",
+          "actions"
+        ],
+        "properties": {
+          "question": {
+            "type": "string"
+          },
+          "rationale": {
+            "type": "string"
+          },
+          "gaps": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "actions": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "additionalProperties": {}
+      },
+      "plan_id": {
+        "type": "string"
+      },
+      "base_revision": {
+        "type": "integer",
+        "minimum": 0
+      }
+    },
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": true,
+    "binary_aliases": {},
+    "source": "research.py:222"
+  },
+  "src.research.authorization.save": {
+    "type": "object",
+    "properties": {
+      "source_refs": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "raw_artifact": {
+        "anyOf": [
+          {
+            "type": "object"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "clauses": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": {}
+        }
+      },
+      "unknowns": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": {}
+        }
+      },
+      "snapshot_id": {
+        "type": "string"
+      },
+      "base_revision": {
+        "type": "integer",
+        "minimum": 0
+      }
+    },
+    "required": [
+      "source_refs",
+      "raw_artifact",
+      "clauses",
+      "unknowns"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "research.py:242"
+  },
+  "src.research.skill.register": {
+    "type": "object",
+    "properties": {
+      "source_url": {
+        "type": "string"
+      },
+      "source_commit": {
+        "type": "string"
+      },
+      "content_b64": {
+        "type": "string"
+      },
+      "content": {
+        "type": "string"
+      },
+      "required_capabilities": {
+        "type": "object",
+        "additionalProperties": {
+          "type": "string"
+        }
+      },
+      "available_capabilities": {
+        "type": "object",
+        "additionalProperties": {
+          "type": "string"
+        }
+      },
+      "selected_fragments": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": {}
+        }
+      },
+      "distillation_version": {
+        "type": "string"
+      },
+      "read_scope": {
+        "type": "string"
+      },
+      "material_id": {
+        "type": "string"
+      },
+      "base_revision": {
+        "type": "integer",
+        "minimum": 0
+      }
+    },
+    "required": [
+      "source_url",
+      "source_commit",
+      "content",
+      "required_capabilities",
+      "available_capabilities",
+      "selected_fragments",
+      "distillation_version"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {
+      "content_b64": "content"
+    },
+    "source": "research.py:257"
+  },
+  "src.research.openapi.ingest": {
+    "type": "object",
+    "properties": {
+      "content_b64": {
+        "type": "string"
+      },
+      "content": {
+        "type": "string"
+      },
+      "source_url": {
+        "type": "string"
+      },
+      "media_type": {
+        "type": "string"
+      },
+      "source_run_id": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "observed_at": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "required": [
+      "content",
+      "source_url"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {
+      "content_b64": "content"
+    },
+    "source": "research.py:313"
+  },
+  "src.research.javascript.ingest": {
+    "type": "object",
+    "properties": {
+      "content_b64": {
+        "type": "string"
+      },
+      "content": {
+        "type": "string"
+      },
+      "source_url": {
+        "type": "string"
+      },
+      "source_map": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "source_run_id": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "required": [
+      "content",
+      "source_url"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {
+      "content_b64": "content"
+    },
+    "source": "research.py:869"
+  },
+  "src.research.runtime.register": {
+    "type": "object",
+    "properties": {
+      "page_url": {
+        "type": "string"
+      },
+      "action": {
+        "type": "object",
+        "additionalProperties": {}
+      },
+      "exchange_ids": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "identity_ref": {
+        "type": "string"
+      },
+      "identity_revision": {
+        "type": "integer"
+      },
+      "browser_generation": {
+        "type": "integer"
+      },
+      "evidence_refs": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "dom_state": {
+        "anyOf": [
+          {
+            "type": "object",
+            "additionalProperties": {}
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "storage_refs": {
+        "anyOf": [
+          {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "script_calls": {
+        "anyOf": [
+          {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": {}
+            }
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "execution_signal": {
+        "anyOf": [
+          {
+            "type": "object",
+            "additionalProperties": {}
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "observed_at": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "required": [
+      "page_url",
+      "action",
+      "exchange_ids",
+      "identity_ref",
+      "identity_revision",
+      "browser_generation",
+      "evidence_refs"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "research.py:1016"
+  },
+  "src.research.dataflow.register": {
+    "type": "object",
+    "properties": {
+      "source": {
+        "type": "object",
+        "additionalProperties": {}
+      },
+      "transforms": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": {}
+        }
+      },
+      "sink": {
+        "type": "object",
+        "additionalProperties": {}
+      },
+      "static_refs": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "runtime_refs": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "normal_control_refs": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "frame_origin": {
+        "type": "string"
+      },
+      "required_interaction": {
+        "type": "string"
+      },
+      "target_version": {
+        "type": "string"
+      },
+      "assessment": {
+        "anyOf": [
+          {
+            "type": "object",
+            "additionalProperties": {}
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "required": [
+      "source",
+      "transforms",
+      "sink",
+      "static_refs",
+      "runtime_refs",
+      "normal_control_refs"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "research.py:1058"
+  },
+  "src.research.page_action.register": {
+    "type": "object",
+    "properties": {
+      "exchange": {
+        "anyOf": [
+          {
+            "anyOf": [
+              {
+                "type": "object"
+              },
+              {
+                "type": "object",
+                "additionalProperties": {}
+              }
+            ]
+          },
+          {
+            "type": "object"
+          }
+        ]
+      },
+      "action": {
+        "type": "object",
+        "additionalProperties": {}
+      },
+      "before_state": {
+        "type": "object",
+        "additionalProperties": {}
+      },
+      "after_state": {
+        "type": "object",
+        "additionalProperties": {}
+      },
+      "object_refs": {
+        "anyOf": [
+          {
+            "type": "object",
+            "additionalProperties": {}
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "required": [
+      "exchange",
+      "action",
+      "before_state",
+      "after_state"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "research.py:1086"
+  },
+  "src.research.business.save": {
+    "type": "object",
+    "properties": {
+      "payload": {
+        "type": "object",
+        "additionalProperties": {}
+      },
+      "model_id": {
+        "type": "string"
+      },
+      "base_revision": {
+        "type": "integer",
+        "minimum": 0
+      }
+    },
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": true,
+    "binary_aliases": {},
+    "source": "research.py:1182"
+  },
+  "src.research.business.derive": {
+    "type": "object",
+    "properties": {
+      "model_id": {
+        "type": "string"
+      }
+    },
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "research.py:1131"
+  },
+  "src.research.permission_question.add": {
+    "type": "object",
+    "properties": {
+      "question": {
+        "type": "string"
+      },
+      "object_context": {
+        "type": "object",
+        "additionalProperties": {}
+      },
+      "action": {
+        "type": "object",
+        "additionalProperties": {}
+      },
+      "expected_boundary": {
+        "type": "string"
+      },
+      "evidence_refs": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "missing_comparisons": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": {}
+        }
+      },
+      "source_refs": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "question_id": {
+        "type": "string"
+      },
+      "base_revision": {
+        "type": "integer",
+        "minimum": 0
+      }
+    },
+    "required": [
+      "question",
+      "object_context",
+      "action",
+      "expected_boundary",
+      "evidence_refs",
+      "missing_comparisons",
+      "source_refs"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "research.py:1202"
+  },
+  "src.research.experiment.record": {
+    "type": "object",
+    "properties": {
+      "hypotheses": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": {}
+        }
+      },
+      "changed_variables": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": {}
+        }
+      },
+      "baseline_exchange_ids": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "control_exchange_ids": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "experiment_exchange_ids": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "observation_refs": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "limitations": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "target_version": {
+        "type": "string"
+      },
+      "identity_refs": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "assessment": {
+        "anyOf": [
+          {
+            "type": "object",
+            "additionalProperties": {}
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "required": [
+      "hypotheses",
+      "changed_variables",
+      "baseline_exchange_ids",
+      "control_exchange_ids",
+      "experiment_exchange_ids",
+      "observation_refs",
+      "limitations",
+      "target_version",
+      "identity_refs"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "research.py:1286"
+  },
+  "src.research.capability_chain.record": {
+    "type": "object",
+    "properties": {
+      "links": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": {}
+        }
+      },
+      "connections": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": {}
+        }
+      },
+      "target_version": {
+        "type": "string"
+      },
+      "assessment": {
+        "anyOf": [
+          {
+            "type": "object",
+            "additionalProperties": {}
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "required": [
+      "links",
+      "connections",
+      "target_version"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "research.py:1325"
+  },
+  "src.research.precondition_trial.record": {
+    "type": "object",
+    "properties": {
+      "base_conditions": {
+        "type": "object",
+        "additionalProperties": {}
+      },
+      "removed_or_simplified": {
+        "type": "object",
+        "additionalProperties": {}
+      },
+      "result_exchange_ids": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "evidence_refs": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "remaining_conditions": {
+        "type": "object",
+        "additionalProperties": {}
+      },
+      "outcome": {
+        "type": "string"
+      },
+      "target_version": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "base_conditions",
+      "removed_or_simplified",
+      "result_exchange_ids",
+      "evidence_refs",
+      "remaining_conditions",
+      "outcome",
+      "target_version"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "research.py:1354"
+  },
+  "src.coverage.item.save": {
+    "type": "object",
+    "properties": {
+      "item_id": {
+        "type": "string"
+      },
+      "method": {
+        "type": "string"
+      },
+      "target": {
+        "type": "string"
+      },
+      "hypothesis": {
+        "type": "string"
+      },
+      "priority": {
+        "type": "string"
+      },
+      "source_refs": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "expected_evidence": {
+        "anyOf": [
+          {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "required": [
+      "item_id",
+      "method",
+      "target",
+      "hypothesis"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "coverage.py:36"
+  },
+  "src.coverage.item.claim": {
+    "type": "object",
+    "properties": {
+      "item_id": {
+        "type": "string"
+      },
+      "note": {
+        "type": "string"
+      },
+      "evidence_refs": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      }
+    },
+    "required": [
+      "item_id",
+      "note"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "coverage.py:69"
+  },
+  "src.coverage.attempt.record": {
+    "type": "object",
+    "properties": {
+      "item_id": {
+        "type": "string"
+      },
+      "outcome": {
+        "type": "string"
+      },
+      "exchange_ids": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "observation_refs": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "execution_receipt_ids": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "notes": {
+        "type": "string"
+      },
+      "not_applicable_reason": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "item_id",
+      "outcome"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "coverage.py:81"
+  },
+  "src.coverage.blocker.record": {
+    "type": "object",
+    "properties": {
+      "blocker_id": {
+        "type": "string"
+      },
+      "category": {
+        "type": "string"
+      },
+      "target": {
+        "type": "string"
+      },
+      "detail": {
+        "type": "string"
+      },
+      "exchange_ids": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "observation_refs": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "resolved": {
+        "type": "boolean"
+      }
+    },
+    "required": [
+      "blocker_id",
+      "category",
+      "target",
+      "detail"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "coverage.py:141"
+  },
+  "src.asset.observe": {
+    "type": "object",
+    "properties": {
+      "asset_type": {
+        "type": "string"
+      },
+      "identity": {
+        "type": "object",
+        "additionalProperties": {}
+      },
+      "source_kind": {
+        "type": "string"
+      },
+      "source_id": {
+        "type": "string"
+      },
+      "attributes": {
+        "anyOf": [
+          {
+            "type": "object",
+            "additionalProperties": {}
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "raw_values": {
+        "anyOf": [
+          {
+            "type": "object",
+            "additionalProperties": {}
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "observed_at": {},
+      "artifact_refs": {
+        "type": "array",
+        "items": {}
+      },
+      "source_run_id": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "source_event_seq": {
+        "anyOf": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "parser_version": {
+        "type": "string"
+      },
+      "completeness": {
+        "type": "string"
+      },
+      "success": {
+        "anyOf": [
+          {
+            "type": "boolean"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "source_event_id": {
+        "type": "string"
+      },
+      "manual": {
+        "type": "boolean"
+      },
+      "correction_of": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "aliases": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "judgements": {
+        "anyOf": [
+          {
+            "type": "object",
+            "additionalProperties": {}
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "required": [
+      "asset_type",
+      "identity",
+      "source_kind",
+      "source_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "assets.py:238"
+  },
+  "src.asset.correct": {
+    "type": "object",
+    "properties": {
+      "asset_id": {
+        "type": "string"
+      },
+      "attributes": {
+        "type": "object",
+        "additionalProperties": {}
+      },
+      "reason": {
+        "type": "string"
+      },
+      "correction_of": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "required": [
+      "asset_id",
+      "attributes",
+      "reason"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "assets.py:317"
+  },
+  "src.asset.relate": {
+    "type": "object",
+    "properties": {
+      "from_asset_id": {
+        "type": "string"
+      },
+      "to_asset_id": {
+        "type": "string"
+      },
+      "relation_type": {
+        "type": "string"
+      },
+      "origin": {
+        "type": "string"
+      },
+      "evidence_refs": {
+        "type": "array",
+        "items": {}
+      },
+      "valid_from": {},
+      "valid_until": {}
+    },
+    "required": [
+      "from_asset_id",
+      "to_asset_id",
+      "relation_type",
+      "origin"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "assets.py:325"
+  },
+  "src.asset.derive": {
+    "type": "object",
+    "properties": {
+      "endpoint_asset_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "endpoint_asset_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "assets.py:344"
+  },
+  "src.asset.merge": {
+    "type": "object",
+    "properties": {
+      "source_asset_id": {
+        "type": "string"
+      },
+      "target_asset_id": {
+        "type": "string"
+      },
+      "reason": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "source_asset_id",
+      "target_asset_id",
+      "reason"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "assets.py:365"
+  },
+  "src.asset.split": {
+    "type": "object",
+    "properties": {
+      "merged_asset_id": {
+        "type": "string"
+      },
+      "observation_ids": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      }
+    },
+    "required": [
+      "merged_asset_id",
+      "observation_ids"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "assets.py:411"
+  },
+  "src.asset.lifecycle": {
+    "type": "object",
+    "properties": {
+      "asset_id": {
+        "type": "string"
+      },
+      "action": {
+        "type": "string"
+      },
+      "expected_revision": {
+        "type": "integer",
+        "minimum": 0
+      }
+    },
+    "required": [
+      "asset_id",
+      "action"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "assets.py:448"
+  },
+  "src.asset.destroy": {
+    "type": "object",
+    "properties": {
+      "asset_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "asset_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "assets.py:491"
+  },
+  "src.asset.publish": {
+    "type": "object",
+    "properties": {
+      "target_task_id": {
+        "type": "string"
+      },
+      "selection": {
+        "type": "object",
+        "additionalProperties": {}
+      },
+      "purpose": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "target_task_id",
+      "selection",
+      "purpose"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "assets.py:513"
+  },
+  "src.asset.reference.refresh": {
+    "type": "object",
+    "properties": {
+      "publication_id": {
+        "type": "string"
+      },
+      "selection": {
+        "type": "object",
+        "additionalProperties": {}
+      },
+      "purpose": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "publication_id",
+      "selection",
+      "purpose"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "assets.py:585"
+  },
+  "src.asset.publication.revoke": {
+    "type": "object",
+    "properties": {
+      "publication_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "publication_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "assets.py:589"
+  },
+  "src.ingestion.ingest": {
+    "type": "object",
+    "properties": {
+      "source_kind": {
+        "type": "string"
+      },
+      "content_b64": {
+        "type": "string"
+      },
+      "content": {
+        "type": "string"
+      },
+      "media_type": {
+        "type": "string"
+      },
+      "source_id": {
+        "type": "string"
+      },
+      "source_metadata": {
+        "anyOf": [
+          {
+            "type": "object",
+            "additionalProperties": {}
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "field_mapping": {
+        "anyOf": [
+          {
+            "type": "object",
+            "additionalProperties": {}
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "idempotency_key": {
+        "type": "string"
+      },
+      "observed_at": {},
+      "cost": {
+        "anyOf": [
+          {
+            "type": "object",
+            "additionalProperties": {}
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "encoding": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "source_kind",
+      "content"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {
+      "content_b64": "content"
+    },
+    "source": "ingestion.py:51"
+  },
+  "src.ingestion.retry": {
+    "type": "object",
+    "properties": {
+      "batch_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "batch_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "ingestion.py:400"
+  },
+  "src.ingestion.reconcile": {
+    "type": "object",
+    "properties": {
+      "batch_id": {
+        "type": "string"
+      },
+      "receipt": {
+        "type": "object",
+        "additionalProperties": {}
+      }
+    },
+    "required": [
+      "batch_id",
+      "receipt"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "ingestion.py:422"
+  },
+  "src.ingestion.external_event": {
+    "type": "object",
+    "properties": {
+      "event": {
+        "type": "object",
+        "additionalProperties": {}
+      }
+    },
+    "required": [
+      "event"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "ingestion.py:432"
+  },
+  "src.query.save": {
+    "type": "object",
+    "properties": {
+      "payload": {
+        "type": "object",
+        "required": [
+          "expression"
+        ],
+        "properties": {
+          "expression": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": {}
+      },
+      "query_id": {
+        "type": "string"
+      },
+      "base_revision": {
+        "type": "integer",
+        "minimum": 0
+      }
+    },
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": true,
+    "binary_aliases": {},
+    "source": "query.py:397"
+  },
+  "src.query.delete": {
+    "type": "object",
+    "properties": {
+      "query_id": {
+        "type": "string"
+      },
+      "base_revision": {
+        "type": "integer",
+        "minimum": 0
+      }
+    },
+    "required": [
+      "query_id",
+      "base_revision"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "query.py:417"
+  },
+  "src.vocabulary.save": {
+    "type": "object",
+    "properties": {
+      "payload": {
+        "type": "object",
+        "required": [
+          "term"
+        ],
+        "properties": {
+          "term": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": {}
+      },
+      "term_id": {
+        "type": "string"
+      },
+      "base_revision": {
+        "type": "integer",
+        "minimum": 0
+      }
+    },
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": true,
+    "binary_aliases": {},
+    "source": "query.py:422"
+  },
+  "src.tag.save": {
+    "type": "object",
+    "properties": {
+      "payload": {
+        "type": "object",
+        "additionalProperties": {}
+      },
+      "tag_id": {
+        "type": "string"
+      },
+      "base_revision": {
+        "type": "integer",
+        "minimum": 0
+      }
+    },
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": true,
+    "binary_aliases": {},
+    "source": "query.py:433"
+  },
+  "src.tag.assign": {
+    "type": "object",
+    "properties": {
+      "asset_ids": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "tag_ids": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "detach": {
+        "type": "boolean"
+      }
+    },
+    "required": [
+      "asset_ids",
+      "tag_ids"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "query.py:444"
+  },
+  "src.note.save": {
+    "type": "object",
+    "properties": {
+      "asset_id": {
+        "type": "string"
+      },
+      "payload": {
+        "type": "object",
+        "additionalProperties": {}
+      },
+      "note_id": {
+        "type": "string"
+      },
+      "base_revision": {
+        "type": "integer",
+        "minimum": 0
+      }
+    },
+    "required": [
+      "asset_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": true,
+    "binary_aliases": {},
+    "source": "query.py:461"
+  },
+  "src.connector.config.save": {
+    "type": "object",
+    "properties": {
+      "connector_id": {
+        "type": "string"
+      },
+      "config": {
+        "type": "object",
+        "additionalProperties": {}
+      },
+      "executable_version": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "connector_id",
+      "config"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "connectors.py:122"
+  },
+  "src.connector.config.revoke": {
+    "type": "object",
+    "properties": {
+      "connector_id": {
+        "type": "string"
+      },
+      "version": {
+        "type": "integer"
+      },
+      "base_revision": {
+        "type": "integer",
+        "minimum": 0
+      }
+    },
+    "required": [
+      "connector_id",
+      "version",
+      "base_revision"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "connectors.py:174"
+  },
+  "src.connector.import": {
+    "type": "object",
+    "properties": {
+      "connector_id": {
+        "type": "string"
+      },
+      "data": {
+        "type": "string"
+      },
+      "filename": {
+        "type": "string"
+      },
+      "config_version": {
+        "anyOf": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "idempotency_key": {
+        "type": "string"
+      },
+      "field_mapping": {
+        "anyOf": [
+          {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            }
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "data_b64": {
+        "type": "string"
+      },
+      "content_b64": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "connector_id",
+      "data",
+      "filename"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {
+      "data_b64": "data",
+      "content_b64": "data"
+    },
+    "source": "connectors.py:250"
+  },
+  "src.connector.query": {
+    "type": "object",
+    "properties": {
+      "connector_id": {
+        "type": "string"
+      },
+      "query": {
+        "type": "string"
+      },
+      "config_version": {
+        "anyOf": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "max_pages": {
+        "anyOf": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "max_items": {
+        "anyOf": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "idempotency_key": {
+        "type": "string"
+      },
+      "extra": {
+        "anyOf": [
+          {
+            "type": "object",
+            "additionalProperties": {}
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "required": [
+      "connector_id",
+      "query"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "connectors.py:460"
+  },
+  "src.connector.repository": {
+    "type": "object",
+    "properties": {
+      "provider": {
+        "type": "string"
+      },
+      "connector_id": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "owner": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "repo": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "repository": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "ref": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "branch": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "config_version": {
+        "anyOf": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "idempotency_key": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "provider"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "connectors.py:541"
+  },
+  "src.connector.external_event": {
+    "type": "object",
+    "properties": {
+      "source_id": {
+        "type": "string"
+      },
+      "event_id": {
+        "type": "string"
+      },
+      "source_version": {
+        "type": "string"
+      },
+      "payload": {
+        "type": "object",
+        "additionalProperties": {}
+      },
+      "target_ref": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "source_id",
+      "event_id",
+      "source_version",
+      "payload"
+    ],
+    "additionalProperties": false,
+    "auto_payload": true,
+    "binary_aliases": {},
+    "source": "connectors.py:579"
+  },
+  "src.monitor.create": {
+    "type": "object",
+    "properties": {
+      "payload": {
+        "type": "object",
+        "required": [
+          "source",
+          "authorization_ref",
+          "chain_type",
+          "schedule",
+          "budget",
+          "continuous"
+        ],
+        "properties": {
+          "source": {
+            "type": "object",
+            "required": [
+              "connector_id",
+              "capability_manifest_ref"
+            ]
+          },
+          "authorization_ref": {
+            "type": "string"
+          },
+          "chain_type": {
+            "enum": [
+              "asset",
+              "rule"
+            ]
+          },
+          "schedule": {
+            "type": "object",
+            "required": [
+              "interval_seconds"
+            ],
+            "properties": {
+              "interval_seconds": {
+                "type": "integer",
+                "minimum": 1
+              }
+            }
+          },
+          "budget": {
+            "type": "object"
+          },
+          "continuous": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": {}
+      }
+    },
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": true,
+    "binary_aliases": {},
+    "source": "monitoring.py:202"
+  },
+  "src.monitor.revise": {
+    "type": "object",
+    "properties": {
+      "monitor_id": {
+        "type": "string"
+      },
+      "payload": {
+        "type": "object",
+        "additionalProperties": {}
+      },
+      "expected_revision": {
+        "type": "integer",
+        "minimum": 0
+      }
+    },
+    "required": [
+      "monitor_id",
+      "expected_revision"
+    ],
+    "additionalProperties": false,
+    "auto_payload": true,
+    "binary_aliases": {},
+    "source": "monitoring.py:272"
+  },
+  "src.monitor.state": {
+    "type": "object",
+    "properties": {
+      "monitor_id": {
+        "type": "string"
+      },
+      "state": {
+        "type": "string"
+      },
+      "expected_revision": {
+        "type": "integer",
+        "minimum": 0
+      }
+    },
+    "required": [
+      "monitor_id",
+      "state",
+      "expected_revision"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "monitoring.py:315"
+  },
+  "src.monitor.wake": {
+    "type": "object",
+    "properties": {},
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "monitoring.py:382"
+  },
+  "src.monitor.run_once": {
+    "type": "object",
+    "properties": {
+      "monitor_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "monitor_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "monitoring.py:392"
+  },
+  "src.monitor.cycle.run": {
+    "type": "object",
+    "properties": {
+      "monitor_id": {
+        "type": "string"
+      },
+      "cycle_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "monitor_id",
+      "cycle_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "monitoring.py:555"
+  },
+  "src.monitor.candidate.handle": {
+    "type": "object",
+    "properties": {
+      "candidate_id": {
+        "type": "string"
+      },
+      "expected_revision": {
+        "type": "integer",
+        "minimum": 0
+      },
+      "outcome": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "candidate_id",
+      "expected_revision",
+      "outcome"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "monitoring.py:1077"
+  },
+  "src.monitor.external.reconcile": {
+    "type": "object",
+    "properties": {
+      "cycle_id": {
+        "type": "string"
+      },
+      "receipt": {
+        "type": "object",
+        "additionalProperties": {}
+      }
+    },
+    "required": [
+      "cycle_id",
+      "receipt"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "monitoring.py:1142"
+  },
+  "src.monitor.notifications.deliver": {
+    "type": "object",
+    "properties": {},
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "monitoring.py:1060"
+  },
+  "src.report.freeze": {
+    "type": "object",
+    "properties": {
+      "finding_id": {
+        "type": "string"
+      },
+      "source_run_id": {
+        "type": "string"
+      },
+      "document": {
+        "type": "object",
+        "additionalProperties": {}
+      },
+      "evidence_refs": {
+        "type": "array",
+        "items": {
+          "anyOf": [
+            {
+              "type": "object"
+            },
+            {
+              "type": "object",
+              "additionalProperties": {}
+            }
+          ]
+        }
+      },
+      "claims": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": {}
+        }
+      },
+      "review": {
+        "type": "object",
+        "additionalProperties": {}
+      },
+      "cvss": {
+        "type": "object",
+        "additionalProperties": {}
+      },
+      "deduplication": {
+        "type": "object",
+        "additionalProperties": {}
+      },
+      "template": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "object",
+            "additionalProperties": {}
+          }
+        ]
+      },
+      "plan_snapshot": {
+        "type": "object",
+        "additionalProperties": {}
+      },
+      "authorization_snapshot": {
+        "type": "object",
+        "additionalProperties": {}
+      },
+      "source_watermarks": {
+        "type": "object",
+        "additionalProperties": {}
+      },
+      "idempotency_key": {
+        "type": "string"
+      },
+      "supersedes": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "feedback_responses": {
+        "anyOf": [
+          {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": {}
+            }
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "profile_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "finding_id",
+      "source_run_id",
+      "document",
+      "evidence_refs",
+      "claims",
+      "review",
+      "cvss",
+      "deduplication",
+      "template",
+      "plan_snapshot",
+      "authorization_snapshot",
+      "source_watermarks",
+      "idempotency_key"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "reports.py:200"
+  },
+  "src.report.reproduction.record": {
+    "type": "object",
+    "properties": {
+      "report_id": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "finding_id": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "reviewer": {
+        "type": "string"
+      },
+      "original_researcher": {
+        "type": "string"
+      },
+      "executed_steps": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "skipped_steps": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        }
+      },
+      "success": {
+        "type": "boolean"
+      },
+      "evidence_refs": {
+        "type": "array",
+        "items": {
+          "anyOf": [
+            {
+              "type": "object"
+            },
+            {
+              "type": "object",
+              "additionalProperties": {}
+            }
+          ]
+        }
+      },
+      "execution": {
+        "anyOf": [
+          {
+            "type": "object",
+            "additionalProperties": {}
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "blockers": {
+        "anyOf": [
+          {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "execution_receipt_ids": {
+        "anyOf": [
+          {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "target_version": {
+        "type": "string"
+      },
+      "identity_refs": {
+        "anyOf": [
+          {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "required": [
+      "reviewer",
+      "original_researcher",
+      "executed_steps",
+      "skipped_steps",
+      "success",
+      "evidence_refs"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "reports.py:376"
+  },
+  "src.submission.export": {
+    "type": "object",
+    "properties": {
+      "report_id": {
+        "type": "string"
+      },
+      "format": {
+        "type": "string"
+      },
+      "allow_partial": {
+        "type": "boolean"
+      },
+      "redact_auth": {
+        "type": "boolean"
+      },
+      "all_frozen_reports": {
+        "type": "boolean"
+      },
+      "redactions": {
+        "anyOf": [
+          {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": {}
+            }
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "required": [
+      "report_id",
+      "format"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "submission.py:261"
+  },
+  "src.report.render": {
+    "type": "object",
+    "properties": {
+      "report_id": {
+        "type": "string"
+      },
+      "redactions": {
+        "anyOf": [
+          {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": {}
+            }
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "allow_partial": {
+        "type": "boolean"
+      },
+      "redact_auth": {
+        "type": "boolean"
+      },
+      "language": {
+        "type": "string"
+      },
+      "template": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "object",
+            "additionalProperties": {}
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "required": [
+      "report_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "submission.py:251"
+  },
+  "src.review.record": {
+    "type": "object",
+    "properties": {
+      "finding_id": {
+        "type": "string"
+      },
+      "validation_type": {
+        "type": "string"
+      },
+      "readiness": {
+        "type": "string"
+      },
+      "report_id": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "claim_versions": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": {}
+        }
+      },
+      "reasons": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "missing": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": {}
+        }
+      },
+      "alternative_explanations": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": {}
+        }
+      },
+      "evidence_snapshot": {
+        "type": "array",
+        "items": {}
+      },
+      "executed_steps": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "skipped_steps": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        }
+      },
+      "reviewer": {
+        "type": "string"
+      },
+      "target_version": {
+        "type": "string"
+      },
+      "identity_refs": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "independent_context": {
+        "type": "boolean"
+      },
+      "execution_receipt_ids": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "retest_id": {
+        "type": "string"
+      },
+      "dependencies": {
+        "anyOf": [
+          {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            }
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "cvss": {
+        "anyOf": [
+          {
+            "type": "object"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "independent_reproduction": {
+        "anyOf": [
+          {
+            "type": "object",
+            "additionalProperties": {}
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "idempotency_key": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "finding_id",
+      "validation_type",
+      "readiness",
+      "reviewer"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "findings.py:322"
+  },
+  "src.platform.status.record": {
+    "type": "object",
+    "properties": {
+      "report_id": {
+        "type": "string"
+      },
+      "status": {
+        "type": "string"
+      },
+      "base_revision": {
+        "type": "integer",
+        "minimum": 0
+      },
+      "platform_reference": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "amount": {
+        "anyOf": [
+          {
+            "type": "number"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "currency": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "platform": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "paid_at": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "notes": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "required": [
+      "report_id",
+      "status",
+      "base_revision"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "feedback.py:90"
+  },
+  "src.retest.request": {
+    "type": "object",
+    "properties": {
+      "report_id": {
+        "type": "string"
+      },
+      "finding_id": {
+        "type": "string"
+      },
+      "repair_statement": {
+        "type": "string"
+      },
+      "expected_target_version": {
+        "type": "string"
+      },
+      "authorization_ref": {
+        "type": "string"
+      },
+      "idempotency_key": {
+        "type": "string"
+      },
+      "identity_refs": {
+        "anyOf": [
+          {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "original_poc_refs": {
+        "anyOf": [
+          {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "baseline_refs": {
+        "anyOf": [
+          {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "budget": {
+        "anyOf": [
+          {
+            "type": "object",
+            "additionalProperties": {}
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "required": [
+      "report_id",
+      "finding_id",
+      "repair_statement",
+      "expected_target_version",
+      "idempotency_key"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "retests.py:22"
+  },
+  "src.retest.dispatch": {
+    "type": "object",
+    "properties": {
+      "retest_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "retest_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "retests.py:65"
+  },
+  "src.retest.complete": {
+    "type": "object",
+    "properties": {
+      "retest_id": {
+        "type": "string"
+      },
+      "preconditions_valid": {
+        "type": "boolean"
+      },
+      "target_version_confirmed": {
+        "type": "boolean"
+      },
+      "original_path_impact": {
+        "anyOf": [
+          {
+            "type": "boolean"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "normal_control_works": {
+        "anyOf": [
+          {
+            "type": "boolean"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "evidence_refs": {
+        "type": "array",
+        "items": {
+          "anyOf": [
+            {
+              "type": "object"
+            },
+            {
+              "type": "object",
+              "additionalProperties": {}
+            }
+          ]
+        }
+      },
+      "reviewer": {
+        "type": "string"
+      },
+      "gaps": {
+        "anyOf": [
+          {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "restoration": {
+        "anyOf": [
+          {
+            "type": "object",
+            "additionalProperties": {}
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "outcome_unknown": {
+        "type": "boolean"
+      },
+      "substitute_poc": {
+        "anyOf": [
+          {
+            "type": "object",
+            "additionalProperties": {}
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "execution_receipt_ids": {
+        "anyOf": [
+          {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "force_fixed": {
+        "type": "boolean"
+      }
+    },
+    "required": [
+      "retest_id",
+      "preconditions_valid",
+      "target_version_confirmed",
+      "original_path_impact",
+      "normal_control_works",
+      "evidence_refs",
+      "reviewer"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "retests.py:101"
+  },
+  "src.feedback.record": {
+    "type": "object",
+    "properties": {
+      "report_id": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "finding_id": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "kind": {
+        "anyOf": [
+          {
+            "type": "string",
+            "enum": [
+              "supplement_request",
+              "duplicate_dispute",
+              "retest_notice",
+              "triage_question",
+              "general"
+            ]
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "text": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "notes": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "source": {
+        "type": "string"
+      },
+      "links": {
+        "anyOf": [
+          {
+            "type": "array",
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "object",
+                  "additionalProperties": {}
+                }
+              ]
+            }
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "attachments": {
+        "type": "array",
+        "items": {
+          "anyOf": [
+            {
+              "type": "object"
+            },
+            {
+              "type": "object",
+              "additionalProperties": {}
+            }
+          ]
+        }
+      },
+      "attachment_refs": {
+        "anyOf": [
+          {
+            "type": "array",
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "object",
+                  "additionalProperties": {}
+                }
+              ]
+            }
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "platform_reference": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "received_at": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "required": [
+      "source"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "feedback.py:24"
+  },
+  "src.feedback.platform_status.record": {
+    "type": "object",
+    "properties": {
+      "report_id": {
+        "type": "string"
+      },
+      "status": {
+        "type": "string"
+      },
+      "base_revision": {
+        "type": "integer",
+        "minimum": 0
+      },
+      "platform_reference": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "amount": {
+        "anyOf": [
+          {
+            "type": "number"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "currency": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "platform": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "paid_at": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "notes": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "required": [
+      "report_id",
+      "status",
+      "base_revision"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "feedback.py:90"
+  },
+  "src.finding.claim.create": {
+    "type": "object",
+    "properties": {
+      "text": {
+        "type": "string"
+      },
+      "status": {
+        "type": "string"
+      },
+      "finding_id": {
+        "type": "string"
+      },
+      "claim_id": {
+        "type": "string"
+      },
+      "evidence_refs": {
+        "type": "array",
+        "items": {}
+      },
+      "counterevidence_refs": {
+        "type": "array",
+        "items": {}
+      },
+      "source_run_id": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "fact_ref": {
+        "type": "string"
+      },
+      "exchange_refs": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "target_version": {
+        "type": "string"
+      },
+      "identity_refs": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "limitations": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "missing_proof": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": {}
+        }
+      },
+      "idempotency_key": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "text",
+      "status"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "findings.py:116"
+  },
+  "src.finding.review.record": {
+    "type": "object",
+    "properties": {
+      "finding_id": {
+        "type": "string"
+      },
+      "validation_type": {
+        "type": "string"
+      },
+      "readiness": {
+        "type": "string"
+      },
+      "report_id": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "claim_versions": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": {}
+        }
+      },
+      "reasons": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "missing": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": {}
+        }
+      },
+      "alternative_explanations": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": {}
+        }
+      },
+      "evidence_snapshot": {
+        "type": "array",
+        "items": {}
+      },
+      "executed_steps": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "skipped_steps": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        }
+      },
+      "reviewer": {
+        "type": "string"
+      },
+      "target_version": {
+        "type": "string"
+      },
+      "identity_refs": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "independent_context": {
+        "type": "boolean"
+      },
+      "execution_receipt_ids": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "retest_id": {
+        "type": "string"
+      },
+      "dependencies": {
+        "anyOf": [
+          {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            }
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "cvss": {
+        "anyOf": [
+          {
+            "type": "object"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "independent_reproduction": {
+        "anyOf": [
+          {
+            "type": "object",
+            "additionalProperties": {}
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "idempotency_key": {
+        "type": "string"
+      },
+      "auto_draft_if_incomplete": {
+        "type": "boolean"
+      },
+      "baseline_confirmed": {
+        "type": "boolean"
+      },
+      "comparison_refs": {
+        "type": "array",
+        "items": {}
+      },
+      "impact_metrics": {
+        "type": "object",
+        "additionalProperties": {}
+      },
+      "quantitative_proof": {
+        "type": "string"
+      },
+      "affected_count": {
+        "type": "integer"
+      }
+    },
+    "required": [
+      "finding_id",
+      "validation_type",
+      "readiness",
+      "reviewer"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "findings.py:322"
+  },
+  "src.finding.invalidate": {
+    "type": "object",
+    "properties": {
+      "finding_id": {
+        "type": "string"
+      },
+      "reason": {
+        "type": "string"
+      },
+      "dependency_digest": {
+        "type": "string"
+      },
+      "source_refs": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      }
+    },
+    "required": [
+      "finding_id",
+      "reason",
+      "dependency_digest"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "findings.py:210"
+  },
+  "src.finding.deduplicate": {
+    "type": "object",
+    "properties": {
+      "finding_id": {
+        "type": "string"
+      },
+      "candidate": {
+        "type": "object",
+        "additionalProperties": {}
+      },
+      "assessments": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": {}
+        }
+      },
+      "history_task_ids": {
+        "anyOf": [
+          {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "history_complete": {
+        "type": "boolean"
+      },
+      "reasons": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "idempotency_key": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "finding_id",
+      "candidate"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "findings.py:441"
+  },
+  "src.browser.ensure": {
+    "type": "object",
+    "properties": {},
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "browser.py:263"
+  },
+  "src.browser.context.ensure": {
+    "type": "object",
+    "properties": {
+      "context_id": {
+        "type": "string"
+      }
+    },
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "browser.py:283"
+  },
+  "src.browser.tab.open": {
+    "type": "object",
+    "properties": {
+      "context_id": {
+        "type": "string"
+      },
+      "shared": {
+        "type": "boolean"
+      },
+      "ttl_seconds": {
+        "type": "integer"
+      }
+    },
+    "required": [
+      "context_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "browser.py:369"
+  },
+  "src.browser.tab.release": {
+    "type": "object",
+    "properties": {
+      "context_id": {
+        "type": "string"
+      },
+      "tab_id": {
+        "type": "string"
+      },
+      "fencing_token": {
+        "type": "integer"
+      }
+    },
+    "required": [
+      "context_id",
+      "tab_id",
+      "fencing_token"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "browser.py:435"
+  },
+  "src.browser.screenshot.capture": {
+    "type": "object",
+    "properties": {
+      "context_id": {
+        "type": "string"
+      },
+      "tab_id": {
+        "type": "string"
+      },
+      "fencing_token": {
+        "type": "integer"
+      },
+      "action_ref": {
+        "type": "string"
+      },
+      "request_refs": {
+        "anyOf": [
+          {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "required": [
+      "context_id",
+      "tab_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "browser.py:451"
+  },
+  "src.browser.image.review": {
+    "type": "object",
+    "properties": {
+      "screenshot_id": {
+        "type": "string"
+      },
+      "reviewer": {
+        "type": "string"
+      },
+      "judgment": {},
+      "review_read_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "screenshot_id",
+      "reviewer"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "browser.py:597"
+  },
+  "src.inspection.decide": {
+    "type": "object",
+    "properties": {
+      "request_id": {
+        "type": "string"
+      },
+      "approved": {
+        "type": "boolean"
+      },
+      "task_scope": {
+        "type": "boolean"
+      }
+    },
+    "required": [
+      "request_id",
+      "approved"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "egress.py:346"
+  },
+  "src.inspection.grant.revoke": {
+    "type": "object",
+    "properties": {
+      "digest": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "digest"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "egress.py:357"
+  },
+  "src.browser.execution.record": {
+    "type": "object",
+    "properties": {
+      "context_id": {
+        "type": "string"
+      },
+      "kind": {
+        "type": "string"
+      },
+      "frame_origin": {
+        "type": "string"
+      },
+      "trigger": {
+        "type": "object",
+        "additionalProperties": {}
+      },
+      "evidence_refs": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": {}
+        }
+      },
+      "injected": {
+        "type": "boolean"
+      },
+      "normal_user_path": {
+        "type": "boolean"
+      },
+      "csp": {
+        "type": "string"
+      },
+      "sandbox": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "context_id",
+      "kind",
+      "frame_origin",
+      "trigger",
+      "evidence_refs"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "browser.py:651"
+  },
+  "src.browser.run.finish": {
+    "type": "object",
+    "properties": {
+      "context_id": {
+        "type": "string"
+      },
+      "run_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "context_id",
+      "run_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "browser.py:678"
+  },
+  "src.browser.task.close": {
+    "type": "object",
+    "properties": {},
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "browser.py:697"
+  },
+  "src.identity.ensure": {
+    "type": "object",
+    "properties": {
+      "context_id": {
+        "type": "string"
+      },
+      "account_ref": {
+        "type": "string"
+      },
+      "role": {
+        "type": "string"
+      },
+      "tenant": {
+        "type": "string"
+      },
+      "credential_ref": {
+        "type": "string"
+      },
+      "expected_revision": {
+        "type": "integer",
+        "minimum": 0
+      },
+      "success_conditions": {
+        "anyOf": [
+          {
+            "type": "object",
+            "additionalProperties": {}
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "required": [
+      "context_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "identity.py:28"
+  },
+  "src.identity.verify": {
+    "type": "object",
+    "properties": {
+      "context_id": {
+        "type": "string"
+      },
+      "browser_generation": {
+        "type": "integer"
+      },
+      "observed": {
+        "type": "object",
+        "additionalProperties": {}
+      },
+      "evidence_refs": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": {}
+        }
+      },
+      "expected": {
+        "anyOf": [
+          {
+            "type": "object",
+            "additionalProperties": {}
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "condition_version": {
+        "anyOf": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "required": [
+      "context_id",
+      "browser_generation",
+      "observed",
+      "evidence_refs"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "identity.py:81"
+  },
+  "src.identity.recover": {
+    "type": "object",
+    "properties": {
+      "context_id": {
+        "type": "string"
+      },
+      "profile_readable": {
+        "type": "boolean"
+      },
+      "live_session_observed": {
+        "type": "boolean"
+      }
+    },
+    "required": [
+      "context_id",
+      "profile_readable",
+      "live_session_observed"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "identity.py:188"
+  },
+  "src.object.lease.acquire": {
+    "type": "object",
+    "properties": {
+      "context_id": {
+        "type": "string"
+      },
+      "resource_kind": {
+        "type": "string"
+      },
+      "resource_id": {
+        "type": "string"
+      },
+      "owner": {
+        "type": "string"
+      },
+      "ttl_seconds": {
+        "type": "integer"
+      }
+    },
+    "required": [
+      "context_id",
+      "resource_kind",
+      "resource_id",
+      "owner"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "objects.py:48"
+  },
+  "src.object.lease.release": {
+    "type": "object",
+    "properties": {
+      "context_id": {
+        "type": "string"
+      },
+      "resource_kind": {
+        "type": "string"
+      },
+      "resource_id": {
+        "type": "string"
+      },
+      "owner": {
+        "type": "string"
+      },
+      "fencing_token": {
+        "type": "integer"
+      }
+    },
+    "required": [
+      "context_id",
+      "resource_kind",
+      "resource_id",
+      "owner",
+      "fencing_token"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "objects.py:94"
+  },
+  "src.object.register": {
+    "type": "object",
+    "properties": {
+      "context_id": {
+        "type": "string"
+      },
+      "object_type": {
+        "type": "string"
+      },
+      "object_id": {
+        "type": "string"
+      },
+      "owner": {
+        "type": "string"
+      },
+      "tenant": {
+        "type": "string"
+      },
+      "metadata": {
+        "anyOf": [
+          {
+            "type": "object",
+            "additionalProperties": {}
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "expected_revision": {
+        "type": "integer",
+        "minimum": 0
+      }
+    },
+    "required": [
+      "context_id",
+      "object_type",
+      "object_id",
+      "owner"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "objects.py:106"
+  },
+  "src.object.experiment.begin": {
+    "type": "object",
+    "properties": {
+      "context_id": {
+        "type": "string"
+      },
+      "object_type": {
+        "type": "string"
+      },
+      "object_id": {
+        "type": "string"
+      },
+      "owner": {
+        "type": "string"
+      },
+      "tenant": {
+        "type": "string"
+      },
+      "initial_state": {
+        "type": "object",
+        "additionalProperties": {}
+      },
+      "expected_change": {
+        "type": "object",
+        "additionalProperties": {}
+      },
+      "restoration": {
+        "type": "object",
+        "additionalProperties": {}
+      },
+      "expected_revision": {
+        "type": "integer",
+        "minimum": 0
+      },
+      "mutation": {
+        "type": "boolean"
+      },
+      "ttl_seconds": {
+        "type": "integer"
+      },
+      "metadata": {
+        "anyOf": [
+          {
+            "type": "object",
+            "additionalProperties": {}
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "required": [
+      "context_id",
+      "object_type",
+      "object_id",
+      "owner",
+      "initial_state",
+      "expected_change",
+      "restoration"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "objects.py:131"
+  },
+  "src.object.experiment.after": {
+    "type": "object",
+    "properties": {
+      "experiment_id": {
+        "type": "string"
+      },
+      "observed_state": {
+        "type": "object",
+        "additionalProperties": {}
+      },
+      "fencing_token": {
+        "type": "integer"
+      },
+      "evidence_refs": {
+        "anyOf": [
+          {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": {}
+            }
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "required": [
+      "experiment_id",
+      "observed_state"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "objects.py:190"
+  },
+  "src.object.experiment.restore": {
+    "type": "object",
+    "properties": {
+      "experiment_id": {
+        "type": "string"
+      },
+      "status": {
+        "type": "string"
+      },
+      "readback": {
+        "anyOf": [
+          {
+            "type": "object",
+            "additionalProperties": {}
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "fencing_token": {
+        "type": "integer"
+      },
+      "residual_objects": {
+        "anyOf": [
+          {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": {}
+            }
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "unrestored_fields": {
+        "anyOf": [
+          {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "reason": {
+        "type": "string"
+      },
+      "evidence_refs": {
+        "anyOf": [
+          {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": {}
+            }
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "release": {
+        "type": "boolean"
+      }
+    },
+    "required": [
+      "experiment_id",
+      "status",
+      "readback"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "objects.py:216"
+  },
+  "src.oast.allocate": {
+    "type": "object",
+    "properties": {
+      "run_id": {
+        "type": "string"
+      },
+      "step_id": {
+        "type": "string"
+      },
+      "trigger_exchange_ids": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "protocols": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "expires_at": {
+        "type": "string"
+      },
+      "authorization_ref": {
+        "type": "string"
+      },
+      "service_instance": {
+        "type": "string"
+      },
+      "external_base_url": {
+        "type": "string"
+      },
+      "retention_seconds": {
+        "type": "integer"
+      },
+      "idempotency_key": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "trigger_exchange_ids",
+      "protocols",
+      "expires_at"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "oast.py:180"
+  },
+  "src.oast.poll": {
+    "type": "object",
+    "properties": {
+      "interaction_id": {
+        "type": "string"
+      },
+      "max_pages": {
+        "type": "integer"
+      }
+    },
+    "required": [
+      "interaction_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "oast.py:305"
+  },
+  "src.oast.expire": {
+    "type": "object",
+    "properties": {
+      "interaction_id": {
+        "type": "string"
+      },
+      "delete_token": {
+        "type": "boolean"
+      }
+    },
+    "required": [
+      "interaction_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "oast.py:244"
+  },
+  "src.oast.health": {
+    "type": "object",
+    "properties": {
+      "interaction_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "interaction_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "oast.py:381"
+  },
+  "src.oast.local.start": {
+    "type": "object",
+    "properties": {
+      "host": {
+        "type": "string"
+      },
+      "port": {
+        "type": "integer"
+      }
+    },
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "oast.py:166"
+  },
+  "src.stream.websocket.connect": {
+    "type": "object",
+    "properties": {
+      "url": {
+        "type": "string"
+      },
+      "identity_ref": {
+        "type": "string"
+      },
+      "identity_revision": {
+        "type": "integer"
+      },
+      "authorization_ref": {
+        "type": "string"
+      },
+      "headers": {
+        "anyOf": [
+          {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            }
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "subprotocols": {
+        "anyOf": [
+          {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "run_id": {
+        "type": "string"
+      },
+      "step_id": {
+        "type": "string"
+      },
+      "replay_of": {
+        "type": "string"
+      },
+      "idempotency_key": {
+        "type": "string"
+      },
+      "open_timeout": {
+        "type": "number"
+      }
+    },
+    "required": [
+      "url"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "streams.py:88"
+  },
+  "src.stream.websocket.send": {
+    "type": "object",
+    "properties": {
+      "stream_id": {
+        "type": "string"
+      },
+      "payload": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "string"
+          }
+        ]
+      },
+      "payload_b64": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "stream_id",
+      "payload"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {
+      "payload_b64": "payload"
+    },
+    "source": "streams.py:160"
+  },
+  "src.stream.websocket.receive": {
+    "type": "object",
+    "properties": {
+      "stream_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "stream_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "streams.py:175"
+  },
+  "src.stream.websocket.acknowledge": {
+    "type": "object",
+    "properties": {
+      "stream_id": {
+        "type": "string"
+      },
+      "event_seq": {
+        "type": "integer"
+      },
+      "evidence_refs": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      }
+    },
+    "required": [
+      "stream_id",
+      "event_seq",
+      "evidence_refs"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "streams.py:222"
+  },
+  "src.stream.websocket.close": {
+    "type": "object",
+    "properties": {
+      "stream_id": {
+        "type": "string"
+      },
+      "code": {
+        "type": "integer"
+      },
+      "reason": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "stream_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "streams.py:242"
+  },
+  "src.stream.sse.connect": {
+    "type": "object",
+    "properties": {
+      "url": {
+        "type": "string"
+      },
+      "identity_ref": {
+        "type": "string"
+      },
+      "identity_revision": {
+        "type": "integer"
+      },
+      "authorization_ref": {
+        "type": "string"
+      },
+      "headers": {
+        "anyOf": [
+          {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            }
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "run_id": {
+        "type": "string"
+      },
+      "step_id": {
+        "type": "string"
+      },
+      "replay_of": {
+        "type": "string"
+      },
+      "idempotency_key": {
+        "type": "string"
+      },
+      "timeout": {
+        "type": "number"
+      }
+    },
+    "required": [
+      "url"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "streams.py:266"
+  },
+  "src.stream.sse.read": {
+    "type": "object",
+    "properties": {
+      "stream_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "stream_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "streams.py:342"
+  },
+  "src.stream.sse.close": {
+    "type": "object",
+    "properties": {
+      "stream_id": {
+        "type": "string"
+      },
+      "reason": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "stream_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "streams.py:483"
+  },
+  "src.knowledge.dataset.create": {
+    "type": "object",
+    "properties": {
+      "name": {
+        "type": "string"
+      },
+      "dataset_id": {
+        "type": "string"
+      },
+      "reader_task_ids": {
+        "anyOf": [
+          {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "contributor_task_ids": {
+        "anyOf": [
+          {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "reader_principal_ids": {
+        "anyOf": [
+          {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "required": [
+      "name"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "knowledge.py:298"
+  },
+  "src.knowledge.publish": {
+    "type": "object",
+    "properties": {
+      "source_kind": {
+        "type": "string"
+      },
+      "source_id": {
+        "type": "string"
+      },
+      "source_revision": {
+        "type": "integer"
+      },
+      "selected_source_fields": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "entry": {
+        "type": "object",
+        "additionalProperties": {}
+      },
+      "evidence_refs": {
+        "type": "array",
+        "items": {
+          "type": "object"
+        }
+      },
+      "dataset_id": {
+        "type": "string"
+      },
+      "validity": {
+        "anyOf": [
+          {
+            "type": "object",
+            "additionalProperties": {}
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "entry_id": {
+        "type": "string"
+      },
+      "idempotency_key": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "source_kind",
+      "source_id",
+      "source_revision",
+      "selected_source_fields",
+      "entry",
+      "evidence_refs",
+      "idempotency_key"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "knowledge.py:336"
+  },
+  "src.knowledge.revoke": {
+    "type": "object",
+    "properties": {
+      "dataset_id": {
+        "type": "string"
+      },
+      "publication_id": {
+        "type": "string"
+      },
+      "reason": {
+        "type": "string"
+      },
+      "expected_revision": {
+        "type": "integer",
+        "minimum": 0
+      }
+    },
+    "required": [
+      "dataset_id",
+      "publication_id",
+      "reason",
+      "expected_revision"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "knowledge.py:583"
+  },
+  "src.knowledge.invalidate": {
+    "type": "object",
+    "properties": {
+      "dataset_id": {
+        "type": "string"
+      },
+      "publication_id": {
+        "type": "string"
+      },
+      "reason": {
+        "type": "string"
+      },
+      "expected_revision": {
+        "type": "integer",
+        "minimum": 0
+      }
+    },
+    "required": [
+      "dataset_id",
+      "publication_id",
+      "reason",
+      "expected_revision"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "knowledge.py:615"
+  },
+  "src.workbench.slice.save": {
+    "type": "object",
+    "properties": {
+      "slice": {
+        "type": "string"
+      },
+      "data": {},
+      "base_revision": {
+        "type": "integer",
+        "minimum": 0
+      },
+      "client_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "slice",
+      "data"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "workbench.py:38"
+  },
+  "src.workbench.asset.importance": {
+    "type": "object",
+    "properties": {
+      "asset_ids": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "importance": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "asset_ids",
+      "importance"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "assets_workbench.py:44"
+  },
+  "src.workbench.finding.merge": {
+    "type": "object",
+    "properties": {
+      "kind": {
+        "type": "string"
+      },
+      "primary_id": {
+        "type": "string"
+      },
+      "member_ids": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "reason": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "kind",
+      "primary_id",
+      "member_ids"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "assets_workbench.py:403"
+  },
+  "src.workbench.finding.unmerge": {
+    "type": "object",
+    "properties": {
+      "merge_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "merge_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "assets_workbench.py:416"
+  },
+  "src.workbench.finding.meta.save": {
+    "type": "object",
+    "properties": {
+      "finding_id": {
+        "type": "string"
+      },
+      "meta": {
+        "type": "object",
+        "additionalProperties": {}
+      }
+    },
+    "required": [
+      "finding_id",
+      "meta"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "assets_workbench.py:429"
+  },
+  "src.workbench.finding.stale": {
+    "type": "object",
+    "properties": {
+      "finding_id": {
+        "type": "string"
+      },
+      "reason": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "finding_id",
+      "reason"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "assets_workbench.py:443"
+  },
+  "src.workbench.finding.stale.clear": {
+    "type": "object",
+    "properties": {
+      "finding_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "finding_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "assets_workbench.py:459"
+  },
+  "src.workbench.object.link": {
+    "type": "object",
+    "properties": {
+      "ref_kind": {
+        "type": "string"
+      },
+      "ref_id": {
+        "type": "string"
+      },
+      "object_ids": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "object_kind": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "ref_kind",
+      "ref_id",
+      "object_ids"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "assets_workbench.py:493"
+  },
+  "src.workbench.todo.save": {
+    "type": "object",
+    "properties": {
+      "todo_id": {
+        "type": "string"
+      },
+      "payload": {
+        "anyOf": [
+          {
+            "type": "object",
+            "additionalProperties": {}
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": true,
+    "binary_aliases": {},
+    "source": "assets_workbench.py:510"
+  },
+  "src.workbench.question.status": {
+    "type": "object",
+    "properties": {
+      "question_id": {
+        "type": "string"
+      },
+      "status": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "question_id",
+      "status"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "assets_workbench.py:530"
+  },
+  "src.workbench.report.draft.save": {
+    "type": "object",
+    "properties": {
+      "draft_id": {
+        "type": "string"
+      },
+      "payload": {
+        "anyOf": [
+          {
+            "type": "object",
+            "additionalProperties": {}
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "base_revision": {
+        "type": "integer",
+        "minimum": 0
+      }
+    },
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": true,
+    "binary_aliases": {},
+    "source": "assets_workbench.py:546"
+  },
+  "src.workbench.report.draft.discard": {
+    "type": "object",
+    "properties": {
+      "draft_id": {
+        "type": "string"
+      },
+      "base_revision": {
+        "type": "integer",
+        "minimum": 0
+      }
+    },
+    "required": [
+      "draft_id",
+      "base_revision"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "assets_workbench.py:565"
+  },
+  "src.workbench.suggestion.propose": {
+    "type": "object",
+    "properties": {
+      "kind": {
+        "type": "string"
+      },
+      "proposal": {
+        "type": "object",
+        "additionalProperties": {}
+      },
+      "rationale": {
+        "type": "string"
+      },
+      "turn_id": {
+        "type": "string"
+      },
+      "source_message_id": {
+        "type": "string"
+      },
+      "evidence_refs": {
+        "anyOf": [
+          {
+            "type": "array"
+          },
+          {
+            "type": "object"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "required": [
+      "kind",
+      "proposal"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "assets_workbench.py:671"
+  },
+  "src.workbench.suggestion.resolve": {
+    "type": "object",
+    "properties": {
+      "suggestion_id": {
+        "type": "string"
+      },
+      "decision": {
+        "type": "string"
+      },
+      "base_revision": {
+        "type": "integer",
+        "minimum": 0
+      },
+      "applied_ref": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "suggestion_id",
+      "decision",
+      "base_revision"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "assets_workbench.py:708"
+  },
+  "src.workbench.asset.link": {
+    "type": "object",
+    "properties": {
+      "ref_kind": {
+        "type": "string"
+      },
+      "ref_id": {
+        "type": "string"
+      },
+      "asset_ids": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      }
+    },
+    "required": [
+      "ref_kind",
+      "ref_id",
+      "asset_ids"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "assets_workbench.py:67"
+  },
+  "src.workbench.asset.tasklink": {
+    "type": "object",
+    "properties": {
+      "asset_id": {
+        "type": "string"
+      },
+      "state": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "asset_id",
+      "state"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "assets_workbench.py:365"
+  },
+  "src.workbench.duplicate.verdict": {
+    "type": "object",
+    "properties": {
+      "key": {
+        "type": "string"
+      },
+      "kind": {
+        "type": "string"
+      },
+      "ids": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "state": {
+        "type": "string"
+      },
+      "reason": {
+        "type": "string"
+      },
+      "missing_note": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "key",
+      "kind",
+      "ids",
+      "state"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "assets_workbench.py:101"
+  },
+  "src.workbench.history.record": {
+    "type": "object",
+    "properties": {
+      "entry": {
+        "type": "object",
+        "additionalProperties": {}
+      }
+    },
+    "required": [
+      "entry"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "assets_workbench.py:162"
+  },
+  "src.workbench.history.revert": {
+    "type": "object",
+    "properties": {
+      "entry_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "entry_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "assets_workbench.py:177"
+  },
+  "src.asset.merge.revert": {
+    "type": "object",
+    "properties": {
+      "source_asset_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "source_asset_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "assets_workbench.py:199"
+  },
+  "src.ingestion.batch.revert": {
+    "type": "object",
+    "properties": {
+      "batch_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "batch_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "assets_workbench.py:266"
+  },
+  "src.asset.version.pin": {
+    "type": "object",
+    "properties": {
+      "asset_id": {
+        "type": "string"
+      },
+      "label": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "asset_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "assets_workbench.py:343"
+  },
+  "src.exchange.query": {
+    "type": "object",
+    "properties": {
+      "filters": {
+        "anyOf": [
+          {
+            "type": "object",
+            "additionalProperties": {}
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "cursor": {
+        "type": "string"
+      },
+      "limit": {
+        "type": "integer"
+      }
+    },
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "exchanges.py:545"
+  },
+  "src.exchange.read": {
+    "type": "object",
+    "properties": {
+      "exchange_id": {
+        "type": "string"
+      },
+      "revision": {
+        "anyOf": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "include_bytes": {
+        "type": "boolean"
+      }
+    },
+    "required": [
+      "exchange_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "exchanges.py:457"
+  },
+  "src.exchange.draft.read": {
+    "type": "object",
+    "properties": {
+      "draft_id": {
+        "type": "string"
+      },
+      "revision": {
+        "anyOf": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "include_bytes": {
+        "type": "boolean"
+      }
+    },
+    "required": [
+      "draft_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "exchanges.py:665"
+  },
+  "src.exchange.compare": {
+    "type": "object",
+    "properties": {
+      "baseline_id": {
+        "type": "string"
+      },
+      "experiment_id": {
+        "type": "string"
+      },
+      "ignore_rules": {
+        "anyOf": [
+          {
+            "type": "object",
+            "additionalProperties": {}
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "baseline_context": {
+        "anyOf": [
+          {
+            "type": "object",
+            "additionalProperties": {}
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "experiment_context": {
+        "anyOf": [
+          {
+            "type": "object",
+            "additionalProperties": {}
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "required": [
+      "baseline_id",
+      "experiment_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "exchanges.py:840"
+  },
+  "src.exchange.export": {
+    "type": "object",
+    "properties": {
+      "exchange_ids": {
+        "anyOf": [
+          {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "filters": {
+        "anyOf": [
+          {
+            "type": "object",
+            "additionalProperties": {}
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "format": {
+        "type": "string"
+      },
+      "allow_partial": {
+        "type": "boolean"
+      }
+    },
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "exchanges.py:961"
+  },
+  "src.research.records": {
+    "type": "object",
+    "properties": {
+      "kind": {
+        "type": "string"
+      },
+      "limit": {
+        "type": "integer"
+      },
+      "after_rowid": {
+        "type": "integer"
+      }
+    },
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "research.py:219"
+  },
+  "src.research.record.get": {
+    "type": "object",
+    "properties": {
+      "kind": {
+        "type": "string"
+      },
+      "record_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "kind",
+      "record_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "research.py:216"
+  },
+  "src.research.plan.current": {
+    "type": "object",
+    "properties": {
+      "plan_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "plan_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "research.py:236"
+  },
+  "src.research.skill.read": {
+    "type": "object",
+    "properties": {
+      "record_id": {
+        "type": "string"
+      },
+      "fragment_index": {
+        "anyOf": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "required": [
+      "record_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "research.py:294"
+  },
+  "src.research.openapi.read": {
+    "type": "object",
+    "properties": {
+      "record_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "record_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "research.py:473"
+  },
+  "src.research.openapi.compare": {
+    "type": "object",
+    "properties": {
+      "document_id": {
+        "type": "string"
+      },
+      "exchanges": {
+        "type": "array",
+        "items": {
+          "anyOf": [
+            {
+              "anyOf": [
+                {
+                  "type": "object"
+                },
+                {
+                  "type": "object",
+                  "additionalProperties": {}
+                }
+              ]
+            },
+            {
+              "type": "object"
+            }
+          ]
+        }
+      },
+      "base_revision": {
+        "type": "integer",
+        "minimum": 0
+      }
+    },
+    "required": [
+      "document_id",
+      "exchanges"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "research.py:509"
+  },
+  "src.research.javascript.read": {
+    "type": "object",
+    "properties": {
+      "record_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "record_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "research.py:1005"
+  },
+  "src.research.backlog": {
+    "type": "object",
+    "properties": {},
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "research.py:1218"
+  },
+  "src.research.history": {
+    "type": "object",
+    "properties": {
+      "run_id": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "asset_id": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "limit": {
+        "type": "integer"
+      },
+      "offset": {
+        "type": "integer"
+      }
+    },
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "research.py:1247"
+  },
+  "src.research.precondition.summary": {
+    "type": "object",
+    "properties": {},
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "research.py:1380"
+  },
+  "src.coverage.audit": {
+    "type": "object",
+    "properties": {},
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "coverage.py:167"
+  },
+  "src.asset.detail": {
+    "type": "object",
+    "properties": {
+      "asset_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "asset_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "assets.py:597"
+  },
+  "src.asset.published": {
+    "type": "object",
+    "properties": {
+      "publication_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "publication_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "assets.py:575"
+  },
+  "src.asset.query": {
+    "type": "object",
+    "properties": {
+      "expression": {
+        "type": "string"
+      },
+      "limit": {
+        "type": "integer"
+      },
+      "cursor": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "query.py:353"
+  },
+  "src.asset.saved_query.read": {
+    "type": "object",
+    "properties": {
+      "query_id": {
+        "type": "string"
+      },
+      "revision": {
+        "anyOf": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "required": [
+      "query_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "query.py:414"
+  },
+  "src.asset.full_text": {
+    "type": "object",
+    "properties": {
+      "needle": {
+        "type": "string"
+      },
+      "kinds": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "limit": {
+        "type": "integer"
+      },
+      "cursor": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "required": [
+      "needle"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "query.py:472"
+  },
+  "src.asset.pivot": {
+    "type": "object",
+    "properties": {
+      "asset_id": {
+        "type": "string"
+      },
+      "relation_type": {
+        "type": "string"
+      },
+      "limit": {
+        "type": "integer"
+      },
+      "cursor": {
+        "type": "integer"
+      }
+    },
+    "required": [
+      "asset_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "query.py:575"
+  },
+  "src.asset.export": {
+    "type": "object",
+    "properties": {
+      "expression": {
+        "type": "string"
+      },
+      "export_format": {
+        "type": "string"
+      },
+      "selected_ids": {
+        "anyOf": [
+          {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "include_artifacts": {
+        "type": "boolean"
+      },
+      "partial": {
+        "type": "boolean"
+      }
+    },
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "query.py:596"
+  },
+  "src.report.get": {
+    "type": "object",
+    "properties": {
+      "report_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "report_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "reports.py:335"
+  },
+  "src.report.list": {
+    "type": "object",
+    "properties": {
+      "finding_id": {
+        "type": "string"
+      }
+    },
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "reports.py:345"
+  },
+  "src.feedback.diff": {
+    "type": "object",
+    "properties": {
+      "old_report_id": {
+        "type": "string"
+      },
+      "new_report_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "old_report_id",
+      "new_report_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "feedback.py:51"
+  },
+  "src.feedback.platform_status": {
+    "type": "object",
+    "properties": {
+      "report_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "report_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "feedback.py:126"
+  },
+  "src.feedback.history": {
+    "type": "object",
+    "properties": {
+      "report_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "report_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "feedback.py:137"
+  },
+  "src.finding.claims": {
+    "type": "object",
+    "properties": {
+      "finding_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "finding_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "findings.py:93"
+  },
+  "src.finding.claim.get": {
+    "type": "object",
+    "properties": {
+      "finding_id": {
+        "type": "string"
+      },
+      "claim_id": {
+        "type": "string"
+      },
+      "version": {
+        "anyOf": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "required": [
+      "finding_id",
+      "claim_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "findings.py:107"
+  },
+  "src.finding.reviews": {
+    "type": "object",
+    "properties": {
+      "finding_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "finding_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "findings.py:181"
+  },
+  "src.finding.status": {
+    "type": "object",
+    "properties": {
+      "finding_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "finding_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "findings.py:251"
+  },
+  "src.finding.deduplications": {
+    "type": "object",
+    "properties": {
+      "finding_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "finding_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "findings.py:530"
+  },
+  "src.connector.manifests": {
+    "type": "object",
+    "properties": {},
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "connectors.py:113"
+  },
+  "src.connector.manifest": {
+    "type": "object",
+    "properties": {
+      "connector_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "connector_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "connectors.py:116"
+  },
+  "src.connector.config": {
+    "type": "object",
+    "properties": {
+      "connector_id": {
+        "type": "string"
+      },
+      "version": {
+        "anyOf": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "required": [
+      "connector_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "connectors.py:157"
+  },
+  "src.monitor.get": {
+    "type": "object",
+    "properties": {
+      "monitor_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "monitor_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "monitoring.py:299"
+  },
+  "src.monitor.list": {
+    "type": "object",
+    "properties": {},
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "monitoring.py:312"
+  },
+  "src.monitor.changes": {
+    "type": "object",
+    "properties": {
+      "monitor_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "monitor_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "monitoring.py:1194"
+  },
+  "src.monitor.notifications": {
+    "type": "object",
+    "properties": {
+      "monitor_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "monitor_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "monitoring.py:1197"
+  },
+  "src.monitor.scheduler_health": {
+    "type": "object",
+    "properties": {},
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "monitoring.py:404"
+  },
+  "src.retest.recover": {
+    "type": "object",
+    "properties": {},
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "retests.py:190"
+  },
+  "src.identity.get": {
+    "type": "object",
+    "properties": {
+      "context_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "context_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "identity.py:64"
+  },
+  "src.identity.login_recipe.get": {
+    "type": "object",
+    "properties": {
+      "context_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "context_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {}
+  },
+  "src.identity.login_recipe.save": {
+    "type": "object",
+    "properties": {
+      "context_id": {
+        "type": "string"
+      },
+      "login_draft_id": {
+        "type": "string"
+      },
+      "login_draft_revision": {
+        "type": "integer"
+      },
+      "login_credential_bindings": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "location": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            },
+            "reference": {
+              "type": "string"
+            },
+            "format": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "location",
+            "name",
+            "reference"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "extract": {
+        "type": "object",
+        "additionalProperties": true
+      },
+      "target_credential_alias": {
+        "type": "string"
+      },
+      "inject": {
+        "type": "object",
+        "additionalProperties": true
+      },
+      "max_reauth_attempts": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 5
+      },
+      "consecutive_auth_failures_threshold": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 5
+      },
+      "idempotency_key": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "context_id",
+      "login_draft_id",
+      "extract",
+      "target_credential_alias",
+      "inject"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {}
+  },
+  "src.identity.login_recipe.replay": {
+    "type": "object",
+    "properties": {
+      "context_id": {
+        "type": "string"
+      },
+      "force": {
+        "type": "boolean"
+      },
+      "idempotency_key": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "context_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {}
+  },
+  "src.identity.verifications": {
+    "type": "object",
+    "properties": {
+      "context_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "context_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "identity.py:243"
+  },
+  "src.identity.compare": {
+    "type": "object",
+    "properties": {
+      "left_context": {
+        "type": "string"
+      },
+      "right_context": {
+        "type": "string"
+      },
+      "left_generation": {
+        "type": "integer"
+      },
+      "right_generation": {
+        "type": "integer"
+      }
+    },
+    "required": [
+      "left_context",
+      "right_context",
+      "left_generation",
+      "right_generation"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "identity.py:210"
+  },
+  "src.object.history": {
+    "type": "object",
+    "properties": {
+      "experiment_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "experiment_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "objects.py:317"
+  },
+  "src.oast.events": {
+    "type": "object",
+    "properties": {
+      "interaction_id": {
+        "type": "string"
+      },
+      "cursor": {
+        "type": "string",
+        "pattern": "^[0-9]+$"
+      },
+      "after_seq": {
+        "type": "integer",
+        "minimum": 0
+      },
+      "after_rowid": {
+        "type": "integer",
+        "minimum": 0
+      },
+      "limit": {
+        "type": "integer"
+      }
+    },
+    "required": [
+      "interaction_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "oast.py:395"
+  },
+  "src.stream.export": {
+    "type": "object",
+    "properties": {
+      "root_stream_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "root_stream_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "streams.py:518"
+  },
+  "src.knowledge.search": {
+    "type": "object",
+    "properties": {
+      "query": {
+        "type": "string"
+      },
+      "kind": {
+        "type": "string"
+      },
+      "context": {
+        "anyOf": [
+          {
+            "type": "object",
+            "additionalProperties": {}
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "knowledge.py:480"
+  },
+  "src.knowledge.read": {
+    "type": "object",
+    "properties": {
+      "dataset_id": {
+        "type": "string"
+      },
+      "publication_id": {
+        "type": "string"
+      },
+      "include_bytes": {
+        "type": "boolean"
+      },
+      "context": {
+        "anyOf": [
+          {
+            "type": "object",
+            "additionalProperties": {}
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "required": [
+      "dataset_id",
+      "publication_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "knowledge.py:507"
+  },
+  "src.knowledge.source.read": {
+    "type": "object",
+    "properties": {
+      "kind": {
+        "type": "string"
+      },
+      "record_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "kind",
+      "record_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "knowledge.py:538"
+  },
+  "src.knowledge.history": {
+    "type": "object",
+    "properties": {
+      "dataset_id": {
+        "type": "string"
+      },
+      "entry_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "dataset_id",
+      "entry_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "knowledge.py:547"
+  },
+  "src.browser.service": {
+    "type": "object",
+    "properties": {},
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "browser.py:275"
+  },
+  "src.browser.context": {
+    "type": "object",
+    "properties": {
+      "context_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "context_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "browser.py:329"
+  },
+  "src.browser.generation": {
+    "type": "object",
+    "properties": {},
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "browser.py:280"
+  },
+  "src.browser.image.read": {
+    "type": "object",
+    "properties": {
+      "screenshot_id": {
+        "type": "string"
+      },
+      "reviewer": {
+        "type": "string"
+      },
+      "confirm_delivery": {
+        "type": "boolean"
+      }
+    },
+    "required": [
+      "screenshot_id",
+      "reviewer"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "browser.py:560"
+  },
+  "src.inspection.requests": {
+    "type": "object",
+    "properties": {},
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "egress.py:340"
+  },
+  "src.artifact.read": {
+    "type": "object",
+    "properties": {
+      "ref_data": {
+        "type": "object",
+        "additionalProperties": {}
+      }
+    },
+    "required": [
+      "ref_data"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "query.py:555"
+  },
+  "src.report.templates": {
+    "type": "object",
+    "properties": {},
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "reports.py:417"
+  },
+  "src.workbench.snapshot": {
+    "type": "object",
+    "properties": {},
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "workbench.py:79"
+  },
+  "src.workbench.slice.get": {
+    "type": "object",
+    "properties": {
+      "slice": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "slice"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "workbench.py:90"
+  },
+  "src.workbench.asset.bulk": {
+    "type": "object",
+    "properties": {
+      "cursor": {
+        "type": "integer"
+      },
+      "limit": {
+        "type": "integer"
+      }
+    },
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "assets_workbench.py:381"
+  },
+  "src.workbench.asset.links": {
+    "type": "object",
+    "properties": {},
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "assets_workbench.py:96"
+  },
+  "src.workbench.finding.merges": {
+    "type": "object",
+    "properties": {
+      "kind": {
+        "type": "string"
+      }
+    },
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "assets_workbench.py:425"
+  },
+  "src.workbench.finding.meta": {
+    "type": "object",
+    "properties": {},
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "assets_workbench.py:439"
+  },
+  "src.workbench.evidence.verify": {
+    "type": "object",
+    "properties": {
+      "ref_data": {
+        "type": "object",
+        "additionalProperties": {}
+      },
+      "evidence_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "ref_data"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "assets_workbench.py:474"
+  },
+  "src.workbench.todo.list": {
+    "type": "object",
+    "properties": {},
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "assets_workbench.py:526"
+  },
+  "src.workbench.report.drafts": {
+    "type": "object",
+    "properties": {},
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "assets_workbench.py:576"
+  },
+  "src.workbench.report.diff": {
+    "type": "object",
+    "properties": {
+      "from_report_id": {
+        "type": "string"
+      },
+      "to_report_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "from_report_id",
+      "to_report_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "assets_workbench.py:580"
+  },
+  "src.workbench.suggestions": {
+    "type": "object",
+    "properties": {},
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "assets_workbench.py:723"
+  },
+  "src.workbench.asset.tasklinks": {
+    "type": "object",
+    "properties": {},
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "assets_workbench.py:376"
+  },
+  "src.workbench.duplicates": {
+    "type": "object",
+    "properties": {},
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "assets_workbench.py:131"
+  },
+  "src.workbench.duplicate.verdicts": {
+    "type": "object",
+    "properties": {},
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "assets_workbench.py:127"
+  },
+  "src.workbench.history": {
+    "type": "object",
+    "properties": {
+      "cursor": {
+        "type": "integer"
+      },
+      "limit": {
+        "type": "integer"
+      }
+    },
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "assets_workbench.py:188"
+  },
+  "src.asset.version.list": {
+    "type": "object",
+    "properties": {
+      "asset_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "asset_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {},
+    "source": "assets_workbench.py:357"
+  },
+  "src.coordination.policy.save": {
+    "type": "object",
+    "properties": {
+      "enabled": {
+        "type": "boolean"
+      },
+      "auto_recon": {
+        "type": "boolean"
+      },
+      "auto_reproduce": {
+        "type": "boolean"
+      },
+      "merge_window_seconds": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 600
+      },
+      "max_wakeups_per_hour": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 240
+      },
+      "max_concurrent_runs": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 16
+      },
+      "max_coordination_tokens": {
+        "type": "integer",
+        "minimum": 0
+      },
+      "sources": {
+        "type": "object",
+        "additionalProperties": {
+          "type": "boolean"
+        }
+      },
+      "idempotency_key": {
+        "type": "string"
+      }
+    },
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {}
+  },
+  "src.coordination.decide": {
+    "type": "object",
+    "properties": {
+      "wakeup_ids": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "action": {
+        "type": "string",
+        "enum": [
+          "ignore",
+          "defer",
+          "follow_up_run",
+          "start_new_run",
+          "dispatch_reproduction",
+          "freeze_report",
+          "notify_operator"
+        ]
+      },
+      "rationale": {
+        "type": "string",
+        "minLength": 1
+      },
+      "target_run_id": {
+        "type": "string"
+      },
+      "finding_id": {
+        "type": "string"
+      },
+      "report_id": {
+        "type": "string"
+      },
+      "retest_id": {
+        "type": "string"
+      },
+      "reproduction_id": {
+        "type": "string"
+      },
+      "command_receipt_id": {
+        "type": "string"
+      },
+      "quiet": {
+        "type": "boolean"
+      },
+      "idempotency_key": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "action",
+      "rationale"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {}
+  },
+  "src.coordination.notice.ack": {
+    "type": "object",
+    "properties": {
+      "notice_id": {
+        "type": "string"
+      },
+      "idempotency_key": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "notice_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {}
+  },
+  "src.coverage.seed": {
+    "type": "object",
+    "properties": {
+      "base_url": {
+        "type": "string"
+      },
+      "derive": {
+        "type": "boolean"
+      },
+      "idempotency_key": {
+        "type": "string"
+      }
+    },
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {}
+  },
+  "src.coordination.status": {
+    "type": "object",
+    "properties": {},
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {}
+  },
+  "src.research.javascript.collect": {
+    "type": "object",
+    "properties": {
+      "entry_url": {
+        "type": "string",
+        "description": "授权范围内的目标页面或脚本 URL"
+      },
+      "extra_js_urls": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "max_files": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 50
+      },
+      "derive_business_context": {
+        "type": "boolean"
+      },
+      "source_run_id": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "idempotency_key": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "entry_url"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {}
+  },
+  "src.exchange.differential_probe": {
+    "type": "object",
+    "properties": {
+      "source_exchange_id": {
+        "type": "string",
+        "description": "基准 HttpExchange ID"
+      },
+      "baseline_context_id": {
+        "type": "string"
+      },
+      "variants": {
+        "type": "array",
+        "minItems": 1,
+        "maxItems": 8,
+        "items": {
+          "type": "object",
+          "properties": {
+            "label": {
+              "type": "string"
+            },
+            "context_id": {
+              "type": "string",
+              "description": "切换身份必须显式替换源请求中所有鉴权头；仅修改 context_id 不会载入该身份凭据"
+            },
+            "drop_auth": {
+              "type": "boolean"
+            },
+            "method": {
+              "type": "string"
+            },
+            "replace_path": {
+              "type": "string"
+            },
+            "replace_headers": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            },
+            "replace_body": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "source_run_id": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "idempotency_key": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "source_exchange_id",
+      "variants"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {}
+  },
+  "src.report.reproduction.auto": {
+    "type": "object",
+    "properties": {
+      "finding_id": {
+        "type": "string"
+      },
+      "report_id": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "exchange_ids": {
+        "type": "array",
+        "minItems": 1,
+        "items": {
+          "type": "string"
+        }
+      },
+      "reviewer": {
+        "type": "string"
+      },
+      "original_researcher": {
+        "type": "string"
+      },
+      "target_version": {
+        "type": "string"
+      },
+      "expected_status": {
+        "type": "integer",
+        "description": "仅记录 HTTP 状态匹配情况；不能据此判定漏洞复现成功"
+      },
+      "idempotency_key": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "finding_id",
+      "exchange_ids"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {}
+  },
+  "src.identity.session.import": {
+    "type": "object",
+    "properties": {
+      "context_id": {
+        "type": "string"
+      },
+      "domain": {
+        "type": "string"
+      },
+      "raw_cookie_header": {
+        "type": "string"
+      },
+      "cookies": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "value": {
+              "type": "string"
+            },
+            "domain": {
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            },
+            "secure": {
+              "type": "boolean"
+            },
+            "http_only": {
+              "type": "boolean"
+            },
+            "expires_at": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "name",
+            "value"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "headers": {
+        "type": "object",
+        "additionalProperties": {
+          "type": "string"
+        }
+      },
+      "totp_secret": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "context_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {}
+  },
+  "src.identity.session.probe": {
+    "type": "object",
+    "properties": {
+      "context_id": {
+        "type": "string"
+      },
+      "probe_url": {
+        "type": "string"
+      },
+      "method": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "context_id",
+      "probe_url"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {}
+  },
+  "src.identity.session.status": {
+    "type": "object",
+    "properties": {
+      "context_id": {
+        "type": "string"
+      }
+    },
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {}
+  },
+  "src.identity.contexts": {
+    "type": "object",
+    "properties": {},
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {}
+  },
+  "src.traffic.search": {
+    "type": "object",
+    "properties": {
+      "query": {
+        "type": "string"
+      },
+      "method": {
+        "type": "string"
+      },
+      "host": {
+        "type": "string"
+      },
+      "context_id": {
+        "type": "string"
+      },
+      "source_run_id": {
+        "type": "string"
+      },
+      "mime": {
+        "type": "string"
+      },
+      "status_code": {
+        "type": "integer"
+      },
+      "bookmarked_only": {
+        "type": "boolean"
+      },
+      "limit": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 200
+      },
+      "cursor": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {}
+  },
+  "src.traffic.read_bytes": {
+    "type": "object",
+    "properties": {
+      "exchange_id": {
+        "type": "string"
+      },
+      "part": {
+        "type": "string",
+        "enum": [
+          "request",
+          "response",
+          "both"
+        ]
+      },
+      "offset": {
+        "type": "integer",
+        "minimum": 0
+      },
+      "limit": {
+        "type": "integer",
+        "minimum": 1
+      }
+    },
+    "required": [
+      "exchange_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {}
+  },
+  "src.exchange.diff": {
+    "type": "object",
+    "properties": {
+      "baseline_id": {
+        "type": "string"
+      },
+      "experiment_id": {
+        "type": "string"
+      },
+      "ignore_rules": {
+        "type": "object",
+        "additionalProperties": {}
+      },
+      "baseline_context": {
+        "type": "object",
+        "additionalProperties": {}
+      },
+      "experiment_context": {
+        "type": "object",
+        "additionalProperties": {}
+      }
+    },
+    "required": [
+      "baseline_id",
+      "experiment_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {}
+  },
+  "src.exchange.curl_export": {
+    "type": "object",
+    "properties": {
+      "exchange_id": {
+        "type": "string"
+      },
+      "include_live_auth": {
+        "type": "boolean"
+      },
+      "redact_auth": {
+        "type": "boolean"
+      }
+    },
+    "required": [
+      "exchange_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {}
+  },
+  "src.proxy_bridge.start": {
+    "type": "object",
+    "properties": {
+      "allow_lan": {
+        "type": "boolean"
+      },
+      "port": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 65535
+      },
+      "capture_context_id": {
+        "type": "string"
+      },
+      "upstream_ca_pem": {
+        "type": "string"
+      }
+    },
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {}
+  },
+  "src.proxy_bridge.stop": {
+    "type": "object",
+    "properties": {},
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {}
+  },
+  "src.proxy_bridge.status": {
+    "type": "object",
+    "properties": {},
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {}
+  },
+  "src.proxy_bridge.ca_cert": {
+    "type": "object",
+    "properties": {},
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {}
+  },
+  "src.proxy_bridge.bookmark": {
+    "type": "object",
+    "properties": {
+      "exchange_id": {
+        "type": "string"
+      },
+      "bookmarked": {
+        "type": "boolean"
+      },
+      "label": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "exchange_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {}
+  },
+  "src.mutator.save": {
+    "type": "object",
+    "properties": {
+      "mutator_id": {
+        "type": "string"
+      },
+      "name": {
+        "type": "string"
+      },
+      "kind": {
+        "type": "string",
+        "enum": [
+          "declarative",
+          "sandbox_js"
+        ]
+      },
+      "algorithm": {
+        "type": "string",
+        "enum": [
+          "hmac_sha256",
+          "hmac_sha1",
+          "sha256_kv_sorted",
+          "md5_kv_join",
+          "timestamp_nonce",
+          "bearer_from_jar"
+        ]
+      },
+      "secret_ref": {
+        "type": "string"
+      },
+      "output_header": {
+        "type": "string"
+      },
+      "output_query": {
+        "type": "string"
+      },
+      "timestamp_header": {
+        "type": "string"
+      },
+      "nonce_header": {
+        "type": "string"
+      },
+      "js_source": {
+        "type": "string"
+      },
+      "config": {
+        "type": "object",
+        "additionalProperties": {}
+      }
+    },
+    "required": [
+      "name"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {}
+  },
+  "src.mutator.list": {
+    "type": "object",
+    "properties": {},
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {}
+  },
+  "src.mutator.test": {
+    "type": "object",
+    "properties": {
+      "mutator_id": {
+        "type": "string"
+      },
+      "sample_method": {
+        "type": "string"
+      },
+      "sample_url": {
+        "type": "string"
+      },
+      "sample_headers": {
+        "type": "object",
+        "additionalProperties": {
+          "type": "string"
+        }
+      },
+      "sample_body": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "mutator_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {}
+  },
+  "src.proxypool.save": {
+    "type": "object",
+    "properties": {
+      "enabled": {
+        "type": "boolean"
+      },
+      "selection": {
+        "type": "string",
+        "enum": [
+          "failover",
+          "round_robin"
+        ]
+      },
+      "failure_threshold": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 50
+      },
+      "cooldown_secs": {
+        "type": "integer",
+        "minimum": 10,
+        "maximum": 86400
+      },
+      "fallback_direct": {
+        "type": "boolean"
+      },
+      "nodes": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "node_id": {
+              "type": "string"
+            },
+            "label": {
+              "type": "string"
+            },
+            "scheme": {
+              "type": "string",
+              "enum": [
+                "http",
+                "https",
+                "socks5",
+                "socks5h"
+              ]
+            },
+            "host": {
+              "type": "string"
+            },
+            "port": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 65535
+            },
+            "username": {
+              "type": "string"
+            },
+            "password": {
+              "type": "string"
+            },
+            "credential_ref": {
+              "type": "string"
+            },
+            "enabled": {
+              "type": "boolean"
+            },
+            "priority": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "host",
+            "port"
+          ],
+          "additionalProperties": false
+        }
+      }
+    },
+    "required": [
+      "nodes"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {}
+  },
+  "src.proxypool.status": {
+    "type": "object",
+    "properties": {},
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {}
+  },
+  "src.proxypool.reset_circuit": {
+    "type": "object",
+    "properties": {
+      "node_id": {
+        "type": "string"
+      }
+    },
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {}
+  },
+  "src.oast.token.mint": {
+    "type": "object",
+    "properties": {
+      "exchange_id": {
+        "type": "string"
+      },
+      "draft_id": {
+        "type": "string"
+      },
+      "finding_id": {
+        "type": "string"
+      },
+      "run_id": {
+        "type": "string"
+      },
+      "note": {
+        "type": "string"
+      },
+      "external_base_url": {
+        "type": "string"
+      },
+      "ttl_seconds": {
+        "type": "integer",
+        "minimum": 60,
+        "maximum": 2592000
+      },
+      "protocols": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      }
+    },
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {}
+  },
+  "src.oast.callback.ingest": {
+    "type": "object",
+    "properties": {
+      "token": {
+        "type": "string"
+      },
+      "signature": {
+        "type": "string"
+      },
+      "verify_signature": {
+        "type": "boolean"
+      },
+      "method": {
+        "type": "string"
+      },
+      "path": {
+        "type": "string"
+      },
+      "source_address": {
+        "type": "string"
+      },
+      "headers": {
+        "type": "object",
+        "additionalProperties": {
+          "type": "string"
+        }
+      },
+      "body": {
+        "type": "string"
+      },
+      "raw_body_b64": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "token"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {}
+  },
+  "src.research.javascript.sourcemap_unpack": {
+    "type": "object",
+    "properties": {
+      "document_id": {
+        "type": "string"
+      },
+      "source_url": {
+        "type": "string"
+      },
+      "source_map_b64": {
+        "type": "string"
+      },
+      "source_map": {},
+      "source_run_id": {
+        "type": "string"
+      }
+    },
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {}
+  },
+  "src.asset.fold_routes": {
+    "type": "object",
+    "properties": {
+      "host": {
+        "type": "string"
+      },
+      "limit": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 2000
+      }
+    },
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {}
+  },
+  "src.intel.advisory.import": {
+    "type": "object",
+    "properties": {
+      "advisories": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "advisory_id": {
+              "type": "string"
+            },
+            "ecosystem": {
+              "type": "string"
+            },
+            "package_name": {
+              "type": "string"
+            },
+            "affected_ranges": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "severity": {
+              "type": "string",
+              "enum": [
+                "critical",
+                "high",
+                "medium",
+                "low",
+                "info"
+              ]
+            },
+            "title": {
+              "type": "string"
+            },
+            "cve_ids": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "fix_version": {
+              "type": "string"
+            },
+            "reference_url": {
+              "type": "string"
+            },
+            "description": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "advisory_id",
+            "package_name",
+            "affected_ranges"
+          ],
+          "additionalProperties": false
+        }
+      }
+    },
+    "required": [
+      "advisories"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {}
+  },
+  "src.intel.match_run": {
+    "type": "object",
+    "properties": {
+      "emit_suggestions": {
+        "type": "boolean"
+      },
+      "observations": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "ecosystem": {
+              "type": "string"
+            },
+            "package_name": {
+              "type": "string"
+            },
+            "version": {
+              "type": "string"
+            },
+            "source_ref": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "package_name",
+            "version"
+          ],
+          "additionalProperties": false
+        }
+      }
+    },
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {}
+  },
+  "src.intel.list": {
+    "type": "object",
+    "properties": {},
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {}
+  },
+  "src.run.intervene": {
+    "type": "object",
+    "properties": {
+      "run_id": {
+        "type": "string"
+      },
+      "action": {
+        "type": "string",
+        "enum": [
+          "pause",
+          "resume",
+          "freeze",
+          "thaw",
+          "stop",
+          "steer"
+        ]
+      },
+      "note": {
+        "type": "string"
+      },
+      "exclude_paths": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "focus_targets": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      }
+    },
+    "required": [
+      "run_id",
+      "action"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {}
+  },
+  "src.research.graphql_grpc.ingest": {
+    "type": "object",
+    "properties": {
+      "protocol": {
+        "type": "string",
+        "enum": [
+          "graphql",
+          "grpc"
+        ]
+      },
+      "endpoint_url": {
+        "type": "string"
+      },
+      "schema": {},
+      "schema_text": {
+        "type": "string"
+      },
+      "proto_text": {
+        "type": "string"
+      },
+      "services": {
+        "type": "array"
+      }
+    },
+    "required": [
+      "protocol"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {}
+  },
+  "src.research.graphql_grpc.auth_matrix": {
+    "type": "object",
+    "properties": {
+      "contexts": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      }
+    },
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {}
+  },
+  "src.exchange.race_probe": {
+    "type": "object",
+    "properties": {
+      "draft_id": {
+        "type": "string"
+      },
+      "draft_revision": {
+        "type": "integer"
+      },
+      "authorization_version": {
+        "type": "integer"
+      },
+      "operator_approved_once": {
+        "type": "boolean"
+      },
+      "concurrency": {
+        "type": "integer",
+        "minimum": 2,
+        "maximum": 20
+      },
+      "context_id": {
+        "type": "string"
+      },
+      "mutator_id": {
+        "type": "string"
+      },
+      "timeout_seconds": {
+        "type": "integer",
+        "minimum": 2,
+        "maximum": 60
+      },
+      "source_run_id": {
+        "type": "string"
+      },
+      "budget": {
+        "type": "object",
+        "additionalProperties": {}
+      }
+    },
+    "required": [
+      "draft_id",
+      "draft_revision"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {}
+  },
+  "src.workspace.tables": {
+    "type": "object",
+    "properties": {
+      "db_path": {
+        "type": "string"
+      }
+    },
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {}
+  },
+  "src.workspace.sample": {
+    "type": "object",
+    "properties": {
+      "db_path": {
+        "type": "string"
+      },
+      "table_name": {
+        "type": "string"
+      },
+      "limit": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 100
+      }
+    },
+    "required": [
+      "db_path",
+      "table_name"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {}
+  },
+  "src.workbench.attachment.autobind": {
+    "type": "object",
+    "properties": {
+      "filename": {
+        "type": "string"
+      },
+      "source_url": {
+        "type": "string"
+      },
+      "content_b64": {
+        "type": "string"
+      },
+      "content_text": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "filename"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {}
+  },
+  "src.notify.channel.save": {
+    "type": "object",
+    "properties": {
+      "channel_id": {
+        "type": "string"
+      },
+      "kind": {
+        "type": "string",
+        "enum": [
+          "dingtalk",
+          "feishu",
+          "wecom",
+          "telegram",
+          "smtp",
+          "slack",
+          "discord",
+          "webhook"
+        ]
+      },
+      "label": {
+        "type": "string"
+      },
+      "url": {
+        "type": "string"
+      },
+      "chat_id": {
+        "type": "string"
+      },
+      "smtp_from": {
+        "type": "string"
+      },
+      "smtp_to": {
+        "type": "string"
+      },
+      "smtp_username": {
+        "type": "string"
+      },
+      "smtp_starttls": {
+        "type": "boolean"
+      },
+      "secret": {
+        "type": "string"
+      },
+      "enabled": {
+        "type": "boolean"
+      },
+      "allow_private_test": {
+        "type": "boolean"
+      },
+      "events": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      }
+    },
+    "required": [
+      "kind",
+      "url"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {}
+  },
+  "src.notify.channel.list": {
+    "type": "object",
+    "properties": {},
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {}
+  },
+  "src.notify.test": {
+    "type": "object",
+    "properties": {
+      "channel_id": {
+        "type": "string"
+      },
+      "title": {
+        "type": "string"
+      },
+      "text": {
+        "type": "string"
+      },
+      "allow_private_test": {
+        "type": "boolean"
+      }
+    },
+    "required": [
+      "channel_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {}
+  },
+  "src.notify.flush_carryover": {
+    "type": "object",
+    "properties": {
+      "channel_id": {
+        "type": "string"
+      },
+      "allow_private_test": {
+        "type": "boolean"
+      }
+    },
+    "required": [
+      "channel_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {}
+  },
+  "src.archive.export": {
+    "type": "object",
+    "properties": {
+      "format": {
+        "type": "string",
+        "enum": [
+          "tar.zst",
+          "tar.gz"
+        ]
+      }
+    },
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {}
+  },
+  "src.archive.import": {
+    "type": "object",
+    "properties": {
+      "archive_b64": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "archive_b64"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {}
+  },
+  "src.diagnostics.wire": {
+    "type": "object",
+    "properties": {
+      "exchange_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "exchange_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {}
+  },
+  "src.diagnostics.mcp_circuits": {
+    "type": "object",
+    "properties": {},
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {}
+  },
+  "src.diagnostics.mcp_reset": {
+    "type": "object",
+    "properties": {
+      "server": {
+        "type": "string"
+      }
+    },
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {}
+  },
+  "src.connector.grant.save": {
+    "type": "object",
+    "properties": {
+      "connector_id": {
+        "type": "string"
+      },
+      "project_id": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "allowed_purposes": {
+        "anyOf": [
+          {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "budget_limit": {
+        "anyOf": [
+          {
+            "type": "integer",
+            "minimum": 0
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "notes": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "base_revision": {
+        "anyOf": [
+          {
+            "type": "integer",
+            "minimum": 0
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "required": [
+      "connector_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {}
+  },
+  "src.connector.grant.revoke": {
+    "type": "object",
+    "properties": {
+      "connector_id": {
+        "type": "string"
+      },
+      "base_revision": {
+        "anyOf": [
+          {
+            "type": "integer",
+            "minimum": 0
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "required": [
+      "connector_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {}
+  },
+  "src.connector.verify": {
+    "type": "object",
+    "properties": {
+      "connector_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "connector_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {}
+  },
+  "src.connector.status": {
+    "type": "object",
+    "properties": {
+      "connector_id": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {}
+  },
+  "src.connector.batch.list": {
+    "type": "object",
+    "properties": {
+      "connector_id": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "limit": {
+        "anyOf": [
+          {
+            "type": "integer",
+            "minimum": 1
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {}
+  },
+  "src.connector.batch.get": {
+    "type": "object",
+    "properties": {
+      "batch_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "batch_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {}
+  },
+  "src.ingestion.preview": {
+    "type": "object",
+    "properties": {
+      "content": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "data": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "content_b64": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "data_b64": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "filename": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "source_kind": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "connector_id": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "format": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "media_type": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "encoding": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "field_mapping": {
+        "anyOf": [
+          {
+            "type": "object",
+            "additionalProperties": {}
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "source_metadata": {
+        "anyOf": [
+          {
+            "type": "object",
+            "additionalProperties": {}
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {}
+  },
+  "src.asset.judgement.save": {
+    "type": "object",
+    "properties": {
+      "asset_id": {
+        "type": "string"
+      },
+      "judgement_state": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "system_name": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "uncertainty_note": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "priority": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "integer"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "base_revision": {
+        "anyOf": [
+          {
+            "type": "integer",
+            "minimum": 0
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "updated_by": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "required": [
+      "asset_id"
+    ],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {}
+  },
+  "src.monitor.preflight": {
+    "type": "object",
+    "properties": {
+      "monitor_id": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "definition": {
+        "anyOf": [
+          {
+            "type": "object",
+            "additionalProperties": {}
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "source": {
+        "anyOf": [
+          {
+            "type": "object",
+            "additionalProperties": {}
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "chain_type": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "continuous": {
+        "anyOf": [
+          {
+            "type": "boolean"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "authorization_ref": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "name": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "schedule": {
+        "anyOf": [
+          {
+            "type": "object",
+            "additionalProperties": {}
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "budget": {
+        "anyOf": [
+          {
+            "type": "object",
+            "additionalProperties": {}
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {}
+  },
+  "src.intel.status": {
+    "type": "object",
+    "properties": {},
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {}
+  },
+  "src.project.memory.get": {
+    "type": "object",
+    "properties": {},
+    "required": [],
+    "additionalProperties": false,
+    "auto_payload": false,
+    "binary_aliases": {}
+  },
+  "src.project.memory.save": {
+    "type": "object",
+    "properties": {
+      "preferences": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "notes": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "mode": {
+        "anyOf": [
+          {
+            "type": "string",
+            "enum": [
+              "replace",
+              "append"
+            ]
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "base_revision": {
+        "anyOf": [
+          {
+            "type": "integer",
+            "minimum": 0
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "payload": {
+        "anyOf": [
+          {
+            "type": "object",
+            "additionalProperties": true
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "required": [],
+    "additionalProperties": true,
+    "auto_payload": true,
+    "binary_aliases": {}
+  }
+}

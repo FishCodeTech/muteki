@@ -1,0 +1,126 @@
+.desktop-window {
+  display: grid;
+  grid-template-rows: 44px minmax(0, 1fr);
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--chrome, var(--rail));
+}
+.desktop-window-content { min-width: 0; min-height: 0; overflow: hidden; }
+.desktop-titlebar {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  padding: 0 10px 0 92px;
+  user-select: none;
+  color: var(--text);
+  background: var(--chrome, var(--rail));
+  font-family: var(--font-sans);
+}
+.desktop-window-navigation { display: flex; flex: none; gap: 3px; margin-right: 17px; }
+.desktop-window-navigation button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 0;
+  border-radius: 7px;
+  color: var(--muted);
+  background: transparent;
+  cursor: pointer;
+}
+.desktop-window-navigation button:hover:enabled { background: var(--panel3); color: var(--bright); }
+.desktop-window-navigation button:disabled { opacity: .35; cursor: default; }
+.desktop-window-navigation button:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
+.desktop-titlebar > h1 { flex: 1; min-width: 0; margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; font-weight: 500; }
+.desktop-titlebar-thread {
+  display: flex;
+  align-items: center;
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+  margin-left: max(0px, calc(56px + var(--desktop-sidebar-width, 0px) - 206px));
+}
+.desktop-titlebar-thread[hidden], .desktop-titlebar-thread:empty { display: none; }
+.desktop-titlebar:has(.desktop-titlebar-thread:not([hidden]):not(:empty)) > h1 { display: none; }
+.desktop-titlebar-thread > * { flex: 1; min-width: 0; }
+.desktop-window .workspace-frame { background: var(--chrome, var(--rail)); }
+.desktop-window .workspace-activity-rail { background: var(--chrome, var(--rail)); }
+.desktop-window .workspace-frame-content { margin-top: 2px; }
+.desktop-window .cx-sidebar-nav::before { display: none; }
+.desktop-window .cx-settings-web { height: 100%; }
+.desktop-window .cx-panel-header { --cx-header-h: 44px; }
+@media (max-width: 768px) {
+  .desktop-titlebar-thread { margin-left: 0; }
+  .desktop-window .workspace-frame-content { margin-top: 0; }
+}
+
+:is(.desktop-window, html:has(.desktop-window) .cx-portal) .cx-press:not([data-cx-nav-row]):active:not(:disabled):not([aria-disabled="true"]),
+.desktop-window :is(.insp-tab, .newsolve, .icon-btn, .thread-item, .artifact-head .tabs button, .suggest button, .suggest-card, .evi-sort-btn, .menu .mi):active:not(:disabled) {
+  transform: none;
+}
+
+:is(.desktop-window, html:has(.desktop-window) .cx-portal) .cx-press:not([data-cx-nav-row]):not([data-variant="link"]):not([data-variant="unstyled"]):not([class*="after:"]),
+.desktop-window :is(.insp-tab, .newsolve, .icon-btn, .thread-item, .artifact-head .tabs button, .suggest button, .suggest-card, .evi-sort-btn, .menu .mi) {
+  isolation: isolate;
+}
+
+:is(.desktop-window, html:has(.desktop-window) .cx-portal) .cx-press:not([data-cx-nav-row]):not([data-variant="link"]):not([data-variant="unstyled"]):not([class*="after:"]):not(.absolute):not(.fixed):not(.sticky),
+.desktop-window :is(.insp-tab, .newsolve, .icon-btn, .thread-item, .artifact-head .tabs button, .suggest button, .suggest-card, .evi-sort-btn, .menu .mi):not(.absolute):not(.fixed):not(.sticky) {
+  position: relative;
+}
+
+:is(.desktop-window, html:has(.desktop-window) .cx-portal) .cx-press:not([data-cx-nav-row]):not([data-variant="link"]):not([data-variant="unstyled"]):not([class*="after:"])::after,
+.desktop-window :is(.insp-tab, .newsolve, .icon-btn, .thread-item, .artifact-head .tabs button, .suggest button, .suggest-card, .evi-sort-btn, .menu .mi)::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  border-radius: inherit;
+  pointer-events: none;
+  background: var(--cx-active, var(--panel3));
+  opacity: 0;
+  transform: scale(1);
+  transition: opacity var(--cx-dur-fast, 120ms) var(--cx-ease-out, cubic-bezier(0.22, 1, 0.36, 1)),
+    transform var(--cx-dur-fast, 120ms) var(--cx-ease-out, cubic-bezier(0.22, 1, 0.36, 1));
+}
+
+:is(.desktop-window, html:has(.desktop-window) .cx-portal) .cx-press:not([data-cx-nav-row]):not([class*="after:"]):is([data-variant="primary"], [data-variant="danger"])::after {
+  background: color-mix(in srgb, black 12%, transparent);
+}
+
+:is(.desktop-window, html:has(.desktop-window) .cx-portal) .cx-press:not([data-cx-nav-row]):not([data-variant="link"]):not([data-variant="unstyled"]):not([class*="after:"]):active:not(:disabled):not([aria-disabled="true"])::after,
+.desktop-window :is(.insp-tab, .newsolve, .icon-btn, .thread-item, .artifact-head .tabs button, .suggest button, .suggest-card, .evi-sort-btn, .menu .mi):active:not(:disabled)::after {
+  opacity: 1;
+  transform: scale(0.97);
+}
+
+:is(.desktop-window, html:has(.desktop-window) .cx-portal) :is(
+  svg.muteki-icon,
+  svg.engine-logo,
+  svg.muteki-logo,
+  [data-slot="spinner"],
+  .desktop-titlebar svg,
+  .workspace-activity-rail svg,
+  .cx-conv-header svg,
+  .cx-panel-header svg,
+  .cx-sidebar-nav svg,
+  .cx-composer-card svg,
+  .cx-composer-tools,
+  .cx-context-strip svg,
+  .cx-conversation-queue svg,
+  .insp-tab svg,
+  .runtime-primary-nav svg,
+  .runtime-view-nav svg,
+  .convo-top svg,
+  .artifact-head svg,
+  .icon-btn svg,
+  .transition-opacity
+) {
+  will-change: opacity;
+  backface-visibility: hidden;
+}

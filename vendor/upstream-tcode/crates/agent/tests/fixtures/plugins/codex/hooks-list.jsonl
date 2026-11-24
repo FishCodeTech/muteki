@@ -1,0 +1,4 @@
+{"id":12,"method":"hooks/list","params":{"cwds":["/tmp/tcode-probe/codex-proj"]}}
+{"id":12,"result":{"data":[{"cwd":"/tmp/tcode-probe/codex-proj","hooks":[{"key":"alpha@tcode-probe-mkt:hooks/hooks.json:session_start:0:0","eventName":"sessionStart","handlerType":"command","command":"echo tcode-probe-alpha-hook","async":false,"matcher":null,"timeoutSec":600,"statusMessage":"tcode probe alpha hook","additionalContextLimit":null,"sourcePath":"/private/tmp/tcode-probe/codex-home/plugins/cache/tcode-probe-mkt/alpha/0.1.0/hooks/hooks.json","source":"plugin","pluginId":"alpha@tcode-probe-mkt","displayOrder":0,"enabled":true,"isManaged":false,"currentHash":"sha256:d628fcaca98205d5b4dc811ab48aea01b3e8fd22a09c76192e72228d94939dc8","trustStatus":"untrusted"}],"warnings":[],"errors":[]}]}}
+{"id":18,"method":"hooks/list","params":{"cwds":["/tmp/tcode-probe/codex-proj"]}}
+{"id":18,"result":{"data":[{"cwd":"/tmp/tcode-probe/codex-proj","hooks":[],"warnings":[],"errors":[]}]}}

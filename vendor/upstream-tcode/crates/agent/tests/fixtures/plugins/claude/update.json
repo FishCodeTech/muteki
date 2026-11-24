@@ -1,0 +1,1 @@
+{"command":"update","outcome":"ok","plugin":"alpha","pluginId":"alpha@tcode-probe","scope":"project","message":"Plugin \"alpha\" updated from 1.0.0 to 1.0.1 for scope project (/private/tmp/tcode-probe/proj). Restart to apply changes.","updateOutcome":"updated","oldVersion":"1.0.0","newVersion":"1.0.1"}

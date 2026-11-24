@@ -1,0 +1,2 @@
+{"id":2,"method":"marketplace/add","params":{"source":"/tmp/tcode-probe/codex-mkt"}}
+{"id":2,"result":{"marketplaceName":"tcode-probe-mkt","installedRoot":"/private/tmp/tcode-probe/codex-mkt","alreadyAdded":false}}

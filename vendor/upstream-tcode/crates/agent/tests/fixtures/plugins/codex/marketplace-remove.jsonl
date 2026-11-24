@@ -1,0 +1,2 @@
+{"id":28,"method":"marketplace/remove","params":{"marketplaceName":"tcode-probe-mkt"}}
+{"id":28,"result":{"marketplaceName":"tcode-probe-mkt","installedRoot":null}}

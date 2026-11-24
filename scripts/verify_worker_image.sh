@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# Verify a Muteki Worker image (full or slim) against the ten container engines
+# Verify a Muteki Worker image (curated, heavy, or legacy full) against the registered container engines
 # and core tools. Optional tools are probed and reported, but missing optionals
 # do not fail the check.
 #
 # Usage:
-#   ./scripts/verify_worker_image.sh --image <ref> --variant slim|full [--platform linux/amd64|linux/arm64]
-#   ./scripts/verify_worker_image.sh --in-container --variant slim|full
+#   ./scripts/verify_worker_image.sh --image <ref> --variant curated|heavy|full [--platform linux/amd64|linux/arm64]
+#   ./scripts/verify_worker_image.sh --in-container --variant curated|heavy|full
 #
-# Exit 0 only when all ten engines start (--version) and every required core
-# tool is present and runnable. Prints a version inventory to stdout.
+# Exit 0 only when all registered engines meet the runtime minimum versions,
+# and every required core tool is present and runnable. Prints a version inventory.
 set -euo pipefail
 
 IMAGE=""
@@ -38,24 +38,20 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "${VARIANT}" in
-  slim|full) ;;
-  *) echo "--variant must be slim or full" >&2; exit 2 ;;
+  curated|heavy|full) ;;
+  *) echo "--variant must be curated, heavy or full" >&2; exit 2 ;;
 esac
 
-# Ten container engines — matches muteki/solver/container_exec._CONTAINER_BIN.
-# Devin is host-local only; DeepSeek Harness (dsh) is temporarily disabled.
-ENGINE_CHECKS=(
-  "claude:claude"
-  "codex:codex"
-  "cursor:/home/kali/.local/bin/cursor-agent"
-  "pi:pi"
-  "omp:/home/kali/.local/bin/omp"
-  "kimi:kimi"
-  "grok:/home/kali/.grok/bin/grok"
-  "opencode:opencode"
-  "droid:droid"
-  "zcode:zcode"
-)
+registry="/opt/muteki/engines.json"
+if [[ "$IN_CONTAINER" -eq 0 ]]; then
+  registry="$(cd "$(dirname "${BASH_SOURCE[0]}")/../docker/worker-common" && pwd)/engines.json"
+fi
+minimums="/opt/muteki/minimum_versions.json"
+capabilities="/opt/muteki/capabilities.py"
+if [[ "$IN_CONTAINER" -eq 0 ]]; then
+  minimums="$(cd "$(dirname "${BASH_SOURCE[0]}")/../crates/server/src/agent_runtime" && pwd)/minimum_versions.json"
+  capabilities="$(cd "$(dirname "${BASH_SOURCE[0]}")/../docker/worker-common" && pwd)/capabilities.py"
+fi
 
 CORE_BOTH=(
   "/opt/muteki/runtime_agent"
@@ -64,18 +60,12 @@ CORE_BOTH=(
   "/opt/muteki/omp_offline_config.yml"
   "/opt/muteki/kimi_offline_agent.md"
   "/opt/muteki/grok_offline_agent.md"
-  "/opt/muteki/python/muteki/solver/native_prompt_bridge.py"
-  "/opt/muteki/python/muteki/solver/zcode_prompt_bridge.py"
-  "/opt/muteki/python/muteki/solver/pi_prompt_bridge.py"
-  "/opt/muteki/python/muteki/solver/grok_prompt_bridge.py"
   "/opt/muteki/AGENTS.md"
   "/opt/muteki/CLAUDE.md"
 )
 
 CORE_CMDS_BOTH=(python3 curl git jq rg)
 
-# Full-image core CTF toolchain. These are hard requirements of docker/worker/Dockerfile.
-# Arch-specific or best-effort packages belong in OPTIONAL_* below.
 CORE_CMDS_FULL=(
   nmap masscan ffuf gobuster sqlmap nikto whatweb
   tshark binwalk foremost exiftool steghide
@@ -98,8 +88,6 @@ CORE_FILES_FULL=(
   /usr/share/chisel-common-binaries/chisel-linux-arm64
 )
 
-# Optional / best-effort: report actual launchability, never treat mere file
-# existence as success, never fail the build when absent.
 OPTIONAL_CMDS_FULL=(
   jadx apktool aapt apksigner zipalign adb dex2jar
   one_gadget seccomp-tools zsteg
@@ -107,33 +95,32 @@ OPTIONAL_CMDS_FULL=(
   playwright
 )
 
+if [[ "$VARIANT" == "curated" || "$VARIANT" == "heavy" ]]; then
+  CORE_CMDS_FULL=(nmap masscan ffuf gobuster sqlmap nikto whatweb tshark binwalk foremost exiftool steghide hydra john hashcat socat ncat proxychains4 chisel ssh sshpass openvpn nuclei radare2 gdb gdb-multiarch objdump strings)
+  CORE_FILES_FULL=(/opt/muteki/browser_coord.py /opt/muteki/agent-browser/SKILL.md /opt/muteki/IMAGE_CAPABILITIES.json /opt/muteki/packages.tsv /opt/muteki/npm-packages.json /usr/share/chisel-common-binaries/chisel-linux-amd64 /usr/share/chisel-common-binaries/chisel-linux-arm64)
+fi
+
+if [[ "$VARIANT" == "heavy" ]]; then
+  CORE_CMDS_FULL+=(sage vol)
+  CORE_FILES_FULL+=(/opt/muteki/heavy-conda-packages.txt /opt/muteki/heavy-python-packages.txt /opt/muteki/heavy-python/bin/python)
+fi
+
 run_verify() {
   local arch
   arch="$(uname -m)"
   echo "== muteki worker image verify (variant=${VARIANT}, arch=${arch}) =="
 
-  local versions=()
-  local name bin out
-  for entry in "${ENGINE_CHECKS[@]}"; do
-    name="${entry%%:*}"
-    bin="${entry#*:}"
-    if ! out="$(timeout 60 "$bin" --version 2>&1)"; then
-      echo "FAIL: engine ${name} (${bin}) did not start via --version" >&2
-      exit 1
-    fi
-    if [[ -z "${out// }" ]]; then
-      echo "FAIL: engine ${name} (${bin}) returned empty --version" >&2
-      exit 1
-    fi
-    echo "OK engine ${name}: ${out}"
-    versions+=("${name}=${out//$'\n'/ }")
-  done
-  local engine_count="${#ENGINE_CHECKS[@]}"
-  if [[ "$engine_count" -ne 10 ]]; then
-    echo "FAIL: expected 10 engines, got ${engine_count}" >&2
-    exit 1
+  [[ "$(id -u)" == 0 ]] || { echo "FAIL: Worker Agent must run as root" >&2; exit 1; }
+  echo "OK execution user root (uid=0)"
+
+  local version_args=(--registry "$registry" --minimum-versions "$minimums" --check-only)
+  if [[ -n "$VERSIONS_FILE" ]]; then
+    version_args+=(--versions-file "$VERSIONS_FILE")
   fi
-  echo "OK: all 10 container engines started"
+  python3 "$capabilities" "${version_args[@]}"
+  local engine_count
+  engine_count="$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))))' "$registry")"
+  local out
 
   local path
   for path in "${CORE_BOTH[@]}"; do
@@ -143,22 +130,22 @@ run_verify() {
     fi
     echo "OK core path ${path}"
   done
-  if [[ "$VARIANT" == "full" ]]; then
+  if [[ "$VARIANT" == "full" || "$VARIANT" == "curated" || "$VARIANT" == "heavy" ]]; then
     if ! out="$(timeout 20 agent-browser --version 2>&1)" || [[ -z "${out// }" ]]; then
-      echo "FAIL: full image agent-browser did not start via --version" >&2
+      echo "FAIL: image agent-browser did not start via --version" >&2
       exit 1
     fi
-    echo "OK full agent-browser: ${out}"
+    echo "OK agent-browser: ${out}"
     if ! out="$(timeout 20 /usr/bin/chromium --version 2>&1)" || [[ -z "${out// }" ]]; then
-      echo "FAIL: full image Chromium runtime did not start via --version" >&2
+      echo "FAIL: image Chromium runtime did not start via --version" >&2
       exit 1
     fi
-    echo "OK full Chromium runtime: ${out}"
+    echo "OK Chromium runtime: ${out}"
     if ! out="$(timeout 20 agent-browser skills get core 2>&1)" || [[ -z "${out// }" ]]; then
-      echo "FAIL: full image agent-browser core Skill is unavailable" >&2
+      echo "FAIL: image agent-browser core Skill is unavailable" >&2
       exit 1
     fi
-    echo "OK full agent-browser core Skill"
+    echo "OK agent-browser core Skill"
   fi
   if [[ ! -x /opt/muteki/runtime_agent ]]; then
     echo "FAIL: /opt/muteki/runtime_agent not executable" >&2
@@ -168,7 +155,6 @@ run_verify() {
     echo "FAIL: /usr/local/bin/blackboard.py not executable" >&2
     exit 1
   fi
-  # Blackboard must actually run, not only exist on disk.
   if ! out="$(timeout 20 python3 /usr/local/bin/blackboard.py --help 2>&1)"; then
     echo "FAIL: blackboard.py --help failed" >&2
     exit 1
@@ -183,10 +169,9 @@ run_verify() {
     fi
   done
 
-  # Commands safe to exercise with --version in headless CI (no GUI).
   SAFE_VERSION_CMDS=(nmap masscan ffuf gobuster sqlmap nuclei gh jwt_tool cloudfox
     forge cast anvil sage vol radare2 gdb gdb-multiarch chisel ssh openvpn)
-  if [[ "$VARIANT" == "full" ]]; then
+  if [[ "$VARIANT" == "full" || "$VARIANT" == "curated" || "$VARIANT" == "heavy" ]]; then
     for cmd in "${CORE_CMDS_FULL[@]}"; do
       if ! command -v "$cmd" >/dev/null 2>&1; then
         echo "FAIL: missing full core command ${cmd}" >&2
@@ -194,8 +179,6 @@ run_verify() {
       fi
       echo "OK full core cmd present ${cmd}"
     done
-    # Primary probe flag per command; `-h` is the fallback. Some tools exit non-zero
-    # on --version/-h even when healthy (masscan exits 1 on both; ssh only knows -V).
     probe_flag() {
       case "$1" in
         ssh) echo "-V" ;;
@@ -208,8 +191,6 @@ run_verify() {
       if ! command -v "$cmd" >/dev/null 2>&1; then
         continue
       fi
-      # Capture output so a failure shows the real error (e.g. exec EPERM from file
-      # capabilities outside Docker's default bounding set) instead of a bare FAIL.
       local flag ver_rc=0 help_rc=0 ver_out="" help_out=""
       flag="$(probe_flag "$cmd")"
       ver_out="$(timeout 20 "$cmd" "$flag" 2>&1)" || ver_rc=$?
@@ -223,7 +204,6 @@ run_verify() {
         echo "  ${cmd} -h exit=${help_rc}; first lines:" >&2
         printf '%s\n' "$help_out" | head -n 5 | sed 's/^/    | /' >&2 || true
         if command -v getcap >/dev/null 2>&1; then
-          # Kali wraps some tools (e.g. /usr/bin/nmap -> /usr/lib/nmap/nmap).
           getcap "$(command -v "$cmd")" "/usr/lib/${cmd}/${cmd}" 2>/dev/null | sed 's/^/  getcap: /' >&2 || true
         fi
         probe_failed+=("$cmd")
@@ -231,12 +211,10 @@ run_verify() {
       fi
       echo "OK full core cmd runnable ${cmd} (user=$(id -un) ${flag} exit=${ver_rc}${help_out:+ -h exit=${help_rc}})"
     done
-    # Evidence for #173 review: file caps must stay inside Docker's default set.
     if command -v getcap >/dev/null 2>&1; then
       echo "-- file capabilities (getcap -r /usr /opt) --"
       getcap -r /usr /opt 2>/dev/null | sed 's/^/getcap: /' || true
     fi
-    # Probe every command before failing so one CI run reports all broken tools.
     if [[ "${#probe_failed[@]}" -gt 0 ]]; then
       echo "FAIL: full core commands not runnable: ${probe_failed[*]}" >&2
       exit 1
@@ -256,7 +234,6 @@ run_verify() {
           timeout 20 aapt version >/dev/null 2>&1
           ;;
         zipalign)
-          # zipalign exits 2 for its help flags, so exercise a real ZIP instead.
           local probe_dir
           probe_dir="$(mktemp -d)" || return 1
           printf 'probe' > "$probe_dir/data" || return 1
@@ -279,11 +256,9 @@ run_verify() {
       if optional_probe "$cmd"; then
         echo "OPTIONAL_OK ${cmd}"
       else
-        # Binary on PATH but could not be exercised — do not claim usable.
         echo "OPTIONAL_UNUSABLE ${cmd} (on PATH but --version/--help failed)"
       fi
     done
-    # Playwright Chromium: presence of the python module is not enough.
     if python3 -c 'import playwright' >/dev/null 2>&1; then
       if python3 -c 'from playwright.sync_api import sync_playwright' >/dev/null 2>&1; then
         echo "OPTIONAL_OK playwright-python-import"
@@ -293,15 +268,18 @@ run_verify() {
     else
       echo "OPTIONAL_MISSING playwright-python"
     fi
-  else
-    echo "slim variant: skipping Kali full core/optional probes"
+  fi
+
+  if [[ "$VARIANT" == "heavy" ]]; then
+    timeout 60 sage -c 'assert list(factor(15)) == [(3, 1), (5, 1)]; print(version())'
+    timeout 60 /opt/muteki/heavy-python/bin/python -c 'import angr, volatility3; print(angr.__version__)'
+    echo "OK specialist Sage/angr/Volatility3 runtime"
   fi
 
   if [[ -n "$VERSIONS_FILE" ]]; then
-    printf '%s\n' "${versions[@]}" > "$VERSIONS_FILE"
     echo "wrote engine versions to ${VERSIONS_FILE}"
   fi
-  echo "== verify passed (10 engines + core tools) =="
+  echo "== verify passed (${engine_count} engines + core tools) =="
 }
 
 if [[ "$IN_CONTAINER" -eq 1 ]]; then
@@ -315,11 +293,12 @@ if [[ -z "$IMAGE" ]]; then
 fi
 
 script_host="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/verify_worker_image.sh"
-docker_args=(run --rm --user kali --security-opt no-new-privileges=true -e HOME=/home/kali --entrypoint bash)
+docker_args=(run --rm --user 0:0 --cap-add NET_ADMIN --cap-add SYS_PTRACE -e HOME=/home/kali -e USER=root -e LOGNAME=root -e IS_SANDBOX=1 --entrypoint bash)
 if [[ -n "$PLATFORM" ]]; then
   docker_args+=(--platform "$PLATFORM")
 fi
-docker_args+=(-v "${script_host}:/tmp/verify_worker_image.sh:ro")
+docker_args+=(-v "${script_host}:/tmp/verify_worker_image.sh:ro" -v "${registry}:/opt/muteki/engines.json:ro"
+  -v "${minimums}:/opt/muteki/minimum_versions.json:ro" -v "${capabilities}:/opt/muteki/capabilities.py:ro")
 
 inner=(/tmp/verify_worker_image.sh --in-container --variant "$VARIANT")
 if [[ -n "$VERSIONS_FILE" ]]; then
@@ -327,12 +306,6 @@ if [[ -n "$VERSIONS_FILE" ]]; then
   versions_base="$(basename "$VERSIONS_FILE")"
   versions_host="${versions_dir}/${versions_base}"
   : > "$versions_host"
-  # The container writes this as `kali`, whose uid differs per image (1000 in the
-  # Kali-based full image, 1001 in the Ubuntu-based slim image) and need not match
-  # the host/runner uid: make the host file world-writable, and mount it outside
-  # /tmp — with fs.protected_regular (Ubuntu default), O_CREAT on a file owned by
-  # another uid inside a sticky world-writable dir fails with EACCES even at 0666.
-  chmod 0666 "$versions_host"
   docker_args+=(-v "${versions_host}:/opt/muteki-verify/engine-versions.txt")
   inner+=(--versions-file /opt/muteki-verify/engine-versions.txt)
 fi

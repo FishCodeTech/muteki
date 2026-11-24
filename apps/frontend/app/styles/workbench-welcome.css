@@ -1,0 +1,91 @@
+:root {
+  --workbench-welcome-top: clamp(24px, 14vh, 140px);
+  --workbench-welcome-composer-gap: 56px;
+  --workbench-welcome-header-height: 56px;
+  --workbench-welcome-compact-header-height: 83px;
+}
+
+@supports (padding-top: round(down, 1px, 1px)) {
+  :root { --workbench-welcome-top: round(down, clamp(24px, 14vh, 140px), 1px); }
+}
+
+.workbench-welcome-content {
+  width: 100%;
+  max-width: 768px;
+  padding-inline: 24px;
+}
+
+.workbench-welcome-content .cx-prompt-editor {
+  min-block-size: 48px;
+}
+
+.workbench-welcome-content .cx-composer-toolbar {
+  height: auto;
+  min-height: 48px;
+  flex-wrap: wrap;
+}
+
+.workbench-welcome-content .cx-composer-toolbar > :first-child { flex: 1 1 auto; }
+.workbench-welcome-content .cx-composer-toolbar > :last-child { margin-inline-start: auto; }
+
+.workbench-welcome-intro {
+  display: flex;
+  width: 100%;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  text-align: center;
+  container: workbench-welcome-intro / inline-size;
+}
+
+.workbench-welcome-title {
+  color: var(--cx-fg);
+  font-size: 28px;
+  font-weight: 600;
+  line-height: 36px;
+  letter-spacing: -.01em;
+  text-wrap: balance;
+}
+
+.workbench-welcome-subtitle {
+  color: color-mix(in srgb, var(--cx-fg-2) 78%, var(--cx-bg));
+  font-size: 16px;
+  line-height: 24px;
+  overflow-wrap: anywhere;
+  text-wrap: pretty;
+}
+
+@container workbench-welcome-intro (max-width: 680px) {
+  .workbench-welcome-subtitle { min-block-size: 48px; }
+}
+
+@container workbench-welcome-intro (max-width: 560px) {
+  .workbench-welcome-title { min-block-size: 72px; }
+}
+
+@container workbench-welcome-intro (max-width: 360px) {
+  .workbench-welcome-subtitle { min-block-size: 72px; }
+}
+
+@container workbench-welcome-intro (max-width: 280px) {
+  .workbench-welcome-title { min-block-size: 108px; }
+  .workbench-welcome-subtitle { min-block-size: 96px; }
+}
+
+.cx-conversation-home { container: conversation-home / inline-size; }
+
+.conversation-home-content {
+  padding-top: calc(var(--workbench-welcome-header-height) + var(--workbench-welcome-top));
+}
+
+.conversation-home-content > .workbench-welcome-intro {
+  margin-bottom: var(--workbench-welcome-composer-gap);
+}
+
+@container conversation-home (max-width: 760px) {
+  .conversation-home-content { --workbench-welcome-header-height: var(--workbench-welcome-compact-header-height); }
+}
+
+@container conversation (max-width: 760px) {
+  .convo:has(.welcome) .convo-top { min-height: var(--workbench-welcome-compact-header-height); }
+}

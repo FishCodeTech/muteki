@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Tcode uses the microphone for voice input in the message composer.</string>
+    <key>NSSpeechRecognitionUsageDescription</key>
+    <string>Tcode transcribes your speech on-device to type messages by voice.</string>
+</dict>
+</plist>
