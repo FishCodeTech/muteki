@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="14 12 100 100">
+  <style>
+    .top { stop-color: #a3d13a; }
+    .bottom { stop-color: #6a9a12; }
+    .dot { fill: #15161a; }
+    @media (prefers-color-scheme: dark) {
+      .top { stop-color: #e2fb9f; }
+      .bottom { stop-color: #a9d63f; }
+      .dot { fill: #eef0f2; }
+    }
+  </style>
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" class="top"/>
+      <stop offset="1" class="bottom"/>
+    </linearGradient>
+  </defs>
+  <path d="M30 100 V58 a34 34 0 0 1 68 0 V100" fill="none" stroke="url(#g)" stroke-width="20" stroke-linecap="round"/>
+  <circle class="dot" cx="64" cy="76" r="11"/>
+</svg>

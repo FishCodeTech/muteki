@@ -1,0 +1,69 @@
+:root {
+  --wb-radius: 14px;
+  --wb-border: color-mix(in srgb, var(--bright) 11%, var(--panel));
+  --wb-shadow: 0 2px 8px color-mix(in srgb, var(--bright) 4%, transparent);
+  --wb-selected: color-mix(in srgb, var(--accent) 9%, var(--panel));
+}
+
+.workspace-home { gap: 30px; }
+.workspace-home-hero h1 { margin: 0; font-weight: 600; letter-spacing: -.025em; text-wrap: balance; }
+.workspace-home-grid { gap: 18px; }
+.workspace-home-card {
+  --home-card-ring: var(--cx-ring);
+  border-radius: 18px;
+  border-color: transparent;
+  background: var(--panel);
+  box-shadow: 0 0 0 1px var(--home-card-ring), var(--wb-shadow);
+  transition: box-shadow 160ms ease;
+}
+.workspace-home-card:hover {
+  --home-card-ring: var(--cx-ring-strong);
+  border-color: transparent;
+  box-shadow: 0 0 0 1px var(--home-card-ring), 0 4px 18px color-mix(in srgb, var(--bright) 7%, transparent);
+  transform: none;
+}
+.workspace-home-card.pending { border-color: var(--line2); box-shadow: none; }
+.workspace-home-card h2 { display: flex; align-items: center; gap: 8px; margin: 0 0 8px; font-size: 20px; font-weight: 600; letter-spacing: -.02em; }
+.workspace-home-card h2 svg { flex: none; color: var(--accent); }
+.workspace-home-card p { line-height: 1.75; }
+.workspace-home-points { gap: 8px; margin-top: 12px; }
+.workspace-home-points .workspace-home-running { color: var(--cx-accent); background: var(--cx-accent-soft); }
+.workspace-home-points .workspace-home-attention { color: var(--cx-warning); background: var(--cx-warning-soft); }
+.workspace-home-action { font-weight: 600; }
+:root[data-theme="dark"] .workspace-home-card { background: color-mix(in srgb, var(--panel) 96%, var(--bright)); box-shadow: 0 0 0 1px var(--home-card-ring); }
+:root[data-theme="dark"] .workspace-home-card:hover { background: var(--panel2); }
+.workspace-home-recent-head { margin-bottom: 12px; }
+.workspace-home-recent-list { gap: 10px; }
+.workspace-home-recent-list > a {
+  border-radius: 12px;
+  border-color: var(--wb-border);
+  background: var(--panel);
+  transition: background-color 160ms ease, border-color 160ms ease;
+}
+.workspace-home-recent-list > a:hover { background: var(--panel2); border-color: var(--border2); }
+.workspace-home-recent-list strong { font-weight: 600; line-height: 1.5; }
+.workspace-home-recent-list small { line-height: 1.6; }
+.workspace-home-empty { border-radius: var(--wb-radius); padding: 24px; background: var(--panel2); }
+
+.rail-search-input { min-height: 36px; border-radius: 10px; background: var(--panel); }
+.rail-search-input:focus-visible { outline: 2px solid var(--focus-ring, var(--accent)); outline-offset: 2px; }
+.newsolve { min-height: 38px; border-radius: 10px; font-weight: 600; }
+
+.cx-composer-card:focus-within {
+  outline: none;
+}
+.workspace-route-state { line-height: 1.7; }
+.workspace-home-error { border-radius: 12px; padding: 12px 16px; line-height: 1.6; }
+
+:is(.workspace-home, .settings-hub, .wsettings-editor) :is(a, button, input, select, textarea):focus-visible {
+  outline: 2px solid var(--focus-ring, var(--accent));
+  outline-offset: 3px;
+}
+@media (max-width: 768px) {
+  .workspace-home { padding-inline: 16px; gap: 24px; }
+  .workspace-home-grid { gap: 12px; }
+  .workspace-home-card { border-radius: 14px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .workspace-home-card, .workspace-home-recent-list > a { transition: none; }
+}

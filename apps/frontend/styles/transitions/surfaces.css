@@ -1,0 +1,61 @@
+.t-icon-swap {
+  position: relative;
+  display: inline-grid;
+}
+.t-icon-swap .t-icon {
+  grid-area: 1 / 1;
+  transition:
+    opacity   var(--icon-swap-dur) var(--icon-swap-ease),
+    transform var(--icon-swap-dur) var(--icon-swap-ease);
+}
+.t-icon-swap[data-state="a"] .t-icon[data-icon="a"],
+.t-icon-swap[data-state="b"] .t-icon[data-icon="b"] {
+  opacity: 1;
+  transform: scale(1);
+}
+.t-icon-swap[data-state="a"] .t-icon[data-icon="b"],
+.t-icon-swap[data-state="b"] .t-icon[data-icon="a"] {
+  opacity: 0;
+  transform: scale(var(--icon-swap-start-scale));
+}
+@media (prefers-reduced-motion: reduce) {
+  .t-icon-swap .t-icon { transition: none !important; }
+}
+html[data-motion="reduce"] .t-icon-swap .t-icon {
+  transition: none !important;
+}
+
+[data-slot="dialog-backdrop"],
+[data-slot="drawer-backdrop"] { z-index: var(--z-overlay); }
+:is(
+  [data-slot="popover-content"],
+  [data-slot="menu-content"],
+  [data-slot="select-content"],
+  [data-slot="hover-card-content"]
+) {
+  z-index: var(--z-popover);
+}
+[data-slot="tooltip-content"] { z-index: var(--z-tooltip); }
+[data-slot="tabs-indicator"] {
+  transition-duration: var(--tabs-dur);
+  transition-timing-function: var(--tabs-ease);
+}
+[data-slot="accordion-panel"] {
+  transition-duration: var(--acc-expand);
+  transition-timing-function: var(--acc-ease);
+}
+[data-slot="accordion-item"]:not([data-open]) [data-slot="accordion-panel"] {
+  transition-duration: var(--acc-collapse);
+}
+
+:is(.global-search-backdrop, .command-palette-backdrop),
+:is(.global-search-backdrop, .command-palette-backdrop) [data-slot="dialog-content"],
+:is([data-slot="dialog-backdrop"], [data-slot="dialog-content"], [data-slot="drawer-backdrop"], [data-slot="drawer-content"], [data-slot="popover-content"])[data-instant="true"] {
+  animation: none !important;
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+}
+
+.workspace-home-hero { animation: t-texts-reveal-in var(--stagger-dur) var(--stagger-ease) backwards; }
+.workspace-home-grid { animation: t-texts-reveal-in var(--stagger-dur) var(--stagger-ease) var(--duration-stagger) backwards; }
+.workspace-home-recent { animation: t-texts-reveal-in var(--stagger-dur) var(--stagger-ease) calc(var(--duration-stagger) * 2) backwards; }

@@ -1,0 +1,48 @@
+[package]
+name = "nsh-base"
+description = "Behavior and infrastructure foundations of NSH apps' UI (`nsh/base`), unstyled: navigation, safe areas, dialogs, the keyboard and the status bar."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = ["highlight"]
+# Built-in syntax highlighting of `TextView`'s code blocks (syntect).
+highlight = ["dep:syntect", "dep:two-face"]
+
+[dependencies]
+nsh-core.workspace = true
+chrono.workspace = true
+rustc-hash.workspace = true
+serde_json.workspace = true
+serde.workspace = true
+markdown.workspace = true
+html5ever.workspace = true
+markup5ever_rcdom.workspace = true
+regex.workspace = true
+ropey.workspace = true
+unicode-segmentation.workspace = true
+imara-diff.workspace = true
+log.workspace = true
+syntect = { workspace = true, optional = true }
+
+# The syntaxes' data: the native runtimes keep it in their binaries; the web
+# runtime leaves it out and fetches the page's copy on first use (`syntax.rs`).
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# The local time zone (`Local`): the web runtime asks the page instead.
+chrono = { workspace = true, features = ["clock"] }
+two-face = { workspace = true, optional = true }
+
+[dev-dependencies]
+# The components' tests run them headless (`tests/base`), without QuickJS.
+# Path only, unlike the workspace's entries: `cargo publish` drops a
+# dev-dependency without a version, and these two depend on nsh-js, which
+# depends on this crate, so with versions nsh-base could not be packaged
+# before nsh-js is on crates.io.
+nsh-engine = { path = "../nsh-engine", default-features = false }
+nsh-testing = { path = "../nsh-testing", default-features = false }

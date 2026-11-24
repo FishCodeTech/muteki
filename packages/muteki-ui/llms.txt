@@ -1,0 +1,25 @@
+# @muteki/ui
+
+> Muteki Tactile Precision Workbench UI system — built on `@ui-sdk/core` & `@ui-sdk/react` (`0.1.0-beta.13`), styled with OKLCH tokens (`--ui-*` / `--cx-*`), and split into Base UI + Agent Domain + Engine Facades.
+
+## Subpath Exports
+
+- `@muteki/ui`: Base primitives (`Button`, `IconButton`, `ButtonGroup`, `CopyButton`, `useCopy`, `Input`, `TextField`, `TextArea`, `SearchInput`, `Label`, `NativeSelect`, `Select`, `OptionList`, `Checkbox`, `RadioGroup`, `Switch`, `Slider`, `Tabs`, `TabsList`, `TabsTrigger`, `TabsContent`, `TabBar`, `SegmentedControl`, `Accordion`, `AccordionItem`, `AccordionTrigger`, `AccordionContent`, `Dialog`, `ConfirmDialog`, `ModalOverlay`, `Sheet`, `Popover`, `HoverCard`, `FloatingHoverPanel`, `Tooltip`, `Menu`, `MenuItem`, `MenuSeparator`, `MenuLabel`, `MenuSub`, `MenuScope`, `useContextMenu`, `Badge`, `Chip`, `Alert`, `Callout`, `InlineStatus`, `StatusDot`, `Spinner`, `Skeleton`, `ShimmerText`, `DiffStat`, `EmptyState`, `Card`, `CardHeader`, `CardTitle`, `CardDescription`, `CardBody`, `CardFooter`, `ProgressBar`, `Toaster`, `toast`, `dismissToast`, `ScrollArea`, `Collapse`, `ResizeHandle`, `Divider`, `Surface`, `Portal`, `OverlayVisibilityContext`, `RetainedOverlayScope`, `Kbd`, `Shortcut`, `Icon`, `IconName`, motion/layout constants).
+- `@muteki/ui/agent`: Agent domain components (`CodeBlock`, `AgentCode`, `AgentCodeLine`, `TokenLine`, `languageLabel`, `FileDiff`, `DiffTable`, `parseUnifiedDiff`, `Message`, `MessageGroup`, `MessageAvatar`, `MessageContent`, `MessageHeader`, `MessageFooter`, `MessageMarker`, `MessageTyping`, `MessageBubble`, `MessageBubbleContent`, `MessageBubbleGroup`, `MessageBubbleCollapsible`, `Chat`, `REFLOW_PANEL_ATTR`, `Thinking`, `formatThinkingDuration`, `LoadingState`, `ToolResult`, `ToolResultOutput`, `ApprovalCard`, `ToolApproval`, `ToolApprovalCode`, `QuestionCard`, `TodoList`, `TodoStatusIcon`, `AgentMarkdown`, `AgentPromptBar`, `ModelPicker`, `EffortSlider`, `ContextMeter`, `AgentRoster`).
+- `@muteki/ui/engines/shiki`: Lazy Shiki + Oniguruma syntax highlighting (`highlightCode`, `useHighlightedCode`, `normalizeLanguage`, `languageFromPath`).
+- `@muteki/ui/engines/markdown`: Encapsulated Markdown parser/renderer types & plugins (`ReactMarkdown`, `remarkGfm`, `remarkMath`, `remarkParse`, `remarkRehype`, `unified`, `toJsxRuntime`).
+- `@muteki/ui/engines/math`: `renderLatexToHtml` pure strict KaTeX HTML renderer.
+- `@muteki/ui/engines/math-view`: `MathFormula` component owning KaTeX CSS import.
+- `@muteki/ui/engines/terminal`: `loadTerminalEngine()` lazy-loading `@xterm/xterm`, `@xterm/addon-fit`, and xterm CSS.
+- `@muteki/ui/engines/code-editor`: `@codemirror/commands`, `@codemirror/state`, `@codemirror/view` facade.
+- `@muteki/ui/engines/virtual`: `@tanstack/react-virtual` (`useVirtualizer`, `defaultRangeExtractor`, `Range`).
+- `@muteki/ui/tokens.css` & `@muteki/ui/styles.css`: Design tokens, surface utilities, overlay keyframes.
+
+## Semantic Contracts & Guardrails
+
+- Structural slots: `data-slot` (`button`, `card`, `tabs`, `accordion`, `dialog`, `alert-dialog`, `popover`, `hover-card`, `tooltip`, `menu`, `select`, `radio-group`, `badge`, `chip`, `alert`, `callout`, `toast`, `code-block`, `thinking`, `file-diff`, `approval-card`, `question-card`, `agent-prompt-bar`).
+- State attributes: `data-open` / `data-state`, `data-side`, `data-disabled`, `data-invalid`, `data-selected`.
+- Security & agent automation markers:
+  - Pass `agentSecret` on secret/API-key `Input`/`TextField`/`TextArea` to emit `data-agent-secret="true"`.
+  - Pass `agentConfirm="destructive" | "hitl"` on `Button`, `ConfirmDialog`, or `ApprovalCard` to emit `data-agent-confirm`.
+- App code in `apps/frontend` must NEVER import raw `@ui-sdk/*`, `lucide-react`, `@heroui/*`, React Aria, Radix, `shiki`, `katex`, `react-markdown`, `remark-*`, `unified`, `@xterm/*`, `@codemirror/*`, or `@tanstack/react-virtual` directly (`no-restricted-imports` enforced in ESLint + `scripts/lint_rules.mjs`).

@@ -1,0 +1,7 @@
+{"type":"assistant","message":{"id":"msg-spawn","content":[{"type":"tool_use","id":"toolu_spawn_1","name":"Agent","input":{"description":"Ping test","prompt":"Reply with pong after checking the task.","subagent_type":"general-purpose","run_in_background":false}}]}}
+{"type":"system","subtype":"task_started","task_id":"task-synthetic-1","tool_use_id":"toolu_spawn_1","description":"Ping test","subagent_type":"general-purpose","task_type":"local_agent","prompt":"Reply with pong after checking the task.","session_id":"session-synthetic-1"}
+{"type":"user","parent_tool_use_id":"toolu_spawn_1","message":{"role":"user","content":"Reply with pong after checking the task."}}
+{"type":"assistant","parent_tool_use_id":"toolu_spawn_1","effort":"high","message":{"id":"msg-child-1","model":"claude-sonnet-5","role":"assistant","content":[{"type":"text","text":"pong"}]}}
+{"type":"system","subtype":"task_updated","task_id":"task-synthetic-1","patch":{"status":"completed","end_time":1783944057211,"ignored":"value"}}
+{"type":"system","subtype":"task_notification","task_id":"task-synthetic-1","tool_use_id":"toolu_spawn_1","status":"completed","output_file":"/tmp/tcode-synthetic/tasks/task-synthetic-1.output","summary":"pong","usage":{"total_tokens":12,"tool_uses":0,"duration_ms":34}}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_spawn_1","content":"pong","is_error":false}]}}

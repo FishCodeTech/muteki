@@ -1,0 +1,41 @@
+{
+  "fill" : "system-dark",
+  "groups" : [
+    {
+      "layers" : [
+        {
+          "image-name" : "04-folded-front.png",
+          "name" : "Folded Front"
+        },
+        {
+          "hidden" : true,
+          "image-name" : "01-base.png",
+          "name" : "Reference Base (Hidden)"
+        },
+        {
+          "image-name" : "03-horizontal-ribbon.png",
+          "name" : "Horizontal Beam"
+        },
+        {
+          "image-name" : "02-vertical-ribbon.png",
+          "name" : "Vertical Stem"
+        }
+      ],
+      "name" : "T — Clean Fold",
+      "shadow" : {
+        "kind" : "neutral",
+        "opacity" : 0.5
+      },
+      "translucency" : {
+        "enabled" : true,
+        "value" : 0.5
+      }
+    }
+  ],
+  "supported-platforms" : {
+    "circles" : [
+      "watchOS"
+    ],
+    "squares" : "shared"
+  }
+}

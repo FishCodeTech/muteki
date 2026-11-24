@@ -1,0 +1,20 @@
+---
+// The mark of the app icon (public/logo.svg): a thick arch, the shell, in the
+// citrus accent, holding a light dot, the module it runs (on the light
+// theme a deeper citrus, the dot in a faint ring: `--logo-*`). The viewBox is
+// cropped to the arch so it fills the box at small sizes; the gradient's id
+// is per instance because the nav and the footer both draw one.
+export interface Props { class?: string }
+const { class: className = '' } = Astro.props;
+const id = `logo-${Math.random().toString(36).slice(2, 8)}`;
+---
+<svg class:list={['logo', className]} viewBox="14 12 100 100" aria-hidden="true">
+  <defs>
+    <linearGradient id={id} x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" style="stop-color: var(--logo-top, #e2fb9f)" />
+      <stop offset="1" style="stop-color: var(--logo-bottom, #a9d63f)" />
+    </linearGradient>
+  </defs>
+  <path d="M30 100 V58 a34 34 0 0 1 68 0 V100" fill="none" stroke={`url(#${id})`} stroke-width="20" stroke-linecap="round" />
+  <circle cx="64" cy="76" r="11" style="fill: var(--logo-dot, #eef0f2); stroke: var(--logo-ring, transparent); stroke-width: 2.5" />
+</svg>

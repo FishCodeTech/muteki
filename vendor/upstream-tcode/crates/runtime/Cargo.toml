@@ -1,0 +1,35 @@
+[package]
+name = "tcode-runtime"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+test-support = ["tcode-services/test-support"]
+
+[dependencies]
+agent = { path = "../agent" }
+async-channel = "2"
+base64 = "0.23"
+computer-use-mcp = { path = "../computer-use-mcp" }
+control-mcp = { path = "../control-mcp" }
+log = "0.4"
+mcp-host = { path = "../mcp-host" }
+orchestrate-mcp = { path = "../orchestrate-mcp" }
+preview-mcp = { path = "../preview-mcp" }
+pull-request-mcp = { path = "../pull-request-mcp" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+smol = "2"
+tcode-core = { path = "../core" }
+tcode-client = { path = "../client" }
+tcode-protocol = { path = "../protocol" }
+tcode-services = { path = "../services" }
+term = { path = "../term" }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+ureq = { version = "2", default-features = false, features = ["tls"] }
+chrono = "0.4"
+filetime = "0.2"
+tcode-services = { path = "../services", features = ["test-support"] }
+tcode-traverse = { path = "../traverse", default-features = false }

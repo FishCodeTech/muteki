@@ -1,0 +1,32 @@
+#!/usr/bin/env python3
+"""Stable command installed by the Python 0.4.7 updater."""
+
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+
+def main() -> int:
+    configured = os.environ.get("MUTEKI_INSTALL_ROOT")
+    root = Path(configured).expanduser().resolve() if configured else (Path.home() / ".local" / "share" / "muteki").resolve()
+    current = root / "current"
+    if not current.exists():
+        print(f"Muteki 托管安装不完整：{current} 不存在", file=sys.stderr)
+        return 1
+    release = current.resolve()
+    python = release / ".venv" / "bin" / "python"
+    if not python.is_file():
+        print(f"Muteki 升级桥缺少 Python 运行环境：{python}", file=sys.stderr)
+        return 1
+    environment = os.environ.copy()
+    environment["MUTEKI_INSTALL_ROOT"] = str(root)
+    environment["MUTEKI_RELEASE_ROOT"] = str(release)
+    os.chdir(release)
+    os.execve(python, [str(python), "-m", "muteki.cli", *sys.argv[1:]], environment)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

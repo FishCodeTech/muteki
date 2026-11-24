@@ -1,0 +1,45 @@
+.single-task-workers .workspace-settings {
+  --ws-fs-micro: 12px; --ws-fs-hint: 13px; --ws-fs-small: 13px; --ws-fs-body: 14px;
+  --wsettings-content-max: 1080px;
+  --ws-r-sm: 8px; --ws-r-md: 12px; --ws-r-lg: 16px;
+  width: 100%; font-family: var(--cx-font-sans);
+}
+.single-task-workers .workspace-settings-main { container-type: inline-size; container-name: workers; }
+.single-task-workers .workspace-settings-main { display: flex; flex-direction: column; }
+.single-task-workers .workspace-settings-main > * { flex-shrink: 0; }
+.single-task-workers .workspace-settings .workspace-settings-main > .cx-settings-page { padding-bottom: 24px; gap: 0; }
+.single-task-workers .workspace-settings .wsettings-content { height: auto; overflow: visible; background: transparent; }
+.single-task-workers .workspace-settings .wsettings-content > :is(.wsettings-orchestration) {
+  width: 100%; max-width: 1080px; height: auto; min-height: 0; margin: 0 auto; padding: 0 32px 64px; overflow: visible;
+}
+.single-task-workers .workspace-settings .wsettings-orchestration { display: block; }
+.single-task-workers .workspace-settings .wsettings-orchestration.roster-overview { display: flex; }
+
+.single-task-workers .workspace-settings .wsettings-credentials { height: auto; overflow: visible; }
+
+@media (max-width: 680px) {
+  .single-task-workers .workspace-settings .wsettings-content > :is(.wsettings-orchestration),
+.single-task-workers .workspace-settings .cx-settings-page { padding-inline: 16px; }
+
+}
+
+.single-task-workers .workspace-settings .wsettings-content > .cx-settings-content { height: auto; overflow: visible; }
+
+
+
+.single-task-workers .workspace-settings :is(summary, button, a, input, textarea, select):focus-visible { outline: 2px solid var(--cx-focus); outline-offset: 2px; }
+
+@container workers (max-width: 600px) {
+  .single-task-workers .workspace-settings .cx-settings-page > header { flex-wrap: wrap; }
+  .single-task-workers .workspace-settings .cx-settings-row > div:first-child { flex-wrap: wrap; }
+  .single-task-workers .workspace-settings .cx-settings-row > div:first-child > div:first-child { flex-basis: 100%; }
+
+
+}
+
+.single-task-workers .workspace-settings .num-field { min-height: 32px; border: 1px solid var(--cx-border); border-radius: 8px; background: var(--cx-elevated); box-shadow: none; }
+.single-task-workers .workspace-settings .num-field .num-field-input { min-width: 0; height: auto; border: 0; border-radius: 0; background: transparent; box-shadow: none; outline: none; }
+.single-task-workers .workspace-settings .num-field:focus-within { outline: 2px solid var(--cx-focus); outline-offset: 2px; }
+.single-task-workers .workspace-settings .num-field-suffix { color: var(--cx-fg-3); }
+
+.single-task-workers .workspace-settings .wsettings-narrow .num-field { width: 160px; }

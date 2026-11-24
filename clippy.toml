@@ -1,0 +1,7 @@
+disallowed-methods = [
+    { path = "std::process::Command::new", reason = "Use crate::host_process::std_command / binary_command / node_command (server), crate::shell_env::command (desktop), or agent::process::command so GUI-launched PATH and host shell env apply." },
+    { path = "tokio::process::Command::new", reason = "Use crate::host_process::command / binary_command / node_command (server) or agent::process::command so GUI-launched PATH and host shell env apply." },
+    { path = "reqwest::Client::builder", reason = "Use crate::network_proxy::http_client_builder (outbound, follows the global proxy) or direct_client_builder (loopback, Unix socket, SRC-controlled traffic)." },
+    { path = "reqwest::Client::new", reason = "Use crate::network_proxy::http_client_builder or direct_client_builder so the global network proxy setting applies." },
+    { path = "reqwest::get", reason = "Use a client from crate::network_proxy::http_client_builder so the global network proxy setting applies." },
+]

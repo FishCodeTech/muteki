@@ -1,0 +1,48 @@
+[package]
+name = "agent"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["process"]
+process = [
+    "dep:agent-client-protocol",
+    "dep:base64",
+    "dep:dirs",
+    "dep:sha2",
+    "dep:smol",
+    "dep:toml",
+    "dep:ureq",
+    "dep:uuid",
+    "dep:url",
+    "dep:windows",
+]
+
+[dependencies]
+rewind-protocol = { package = "agent", git = "https://github.com/Tryanks/tcode", rev = "ee22483c402f5f05350e60ac513d33ee9347df26", default-features = false }
+agent-client-protocol = { version = "2.0", optional = true, features = [
+    "unstable_auth_methods",
+    "unstable_end_turn_token_usage",
+] }
+log = "0.4"
+base64 = { version = "0.23", optional = true }
+dirs = { version = "7", optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+shell-words = "1"
+sha2 = { version = "0.11", optional = true }
+smol = { version = "2", optional = true }
+toml = { version = "1.1", optional = true }
+url = { version = "2", optional = true }
+ureq = { version = "2", default-features = false, features = ["tls", "gzip"], optional = true }
+uuid = { version = "1", features = ["v4"], optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "=0.62.2", features = ["Win32_Foundation"], optional = true }
+
+[dev-dependencies]
+env_logger = "0.11"
+
+[[example]]
+name = "probe"
+required-features = ["process"]

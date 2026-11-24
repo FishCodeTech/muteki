@@ -1,0 +1,100 @@
+name: Core
+
+# Lints and tests the crates every platform shares: the core, the animation
+# graph, the macros, the JS runtime (the runtime's Rust modules included), `nsh/base`, the
+# engine, the bundler and signed packages. The platform workflows test their backends and the
+# tooling only, so these ran nowhere but on developers' machines. What
+# releases froze is checked by the Compat workflow.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/nsh-bundler/**"
+      - "crates/nsh-core/**"
+      - "crates/nsh-dev/**"
+      - "crates/nsh-engine/**"
+      - "crates/nsh-js/**"
+      - "crates/nsh-macros/**"
+      - "crates/nsh-package/**"
+      - "crates/nsh-testing/**"
+      - "crates/nsh-base/**"
+      - "examples/counter/**"
+      - "examples/gallery/**"
+      - "examples/bench/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".cargo/**"
+      - "rust-toolchain.toml"
+      - ".github/workflows/core.yml"
+  pull_request:
+    paths:
+      - "crates/nsh-bundler/**"
+      - "crates/nsh-core/**"
+      - "crates/nsh-dev/**"
+      - "crates/nsh-engine/**"
+      - "crates/nsh-js/**"
+      - "crates/nsh-macros/**"
+      - "crates/nsh-package/**"
+      - "crates/nsh-testing/**"
+      - "crates/nsh-base/**"
+      - "examples/counter/**"
+      - "examples/gallery/**"
+      - "examples/bench/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".cargo/**"
+      - "rust-toolchain.toml"
+      - ".github/workflows/core.yml"
+  merge_group:
+    types: [checks_requested]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: core-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # CI builds each crate once: no incremental state and no debug info
+  # (faster builds, smaller caches; panics still name their file and line).
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  # The toolchain file's iOS and Android targets are only the release's.
+  RUSTUP_TOOLCHAIN: stable
+  # The bundler as the command line builds it (`bundle`: rolldown and the
+  # whole pipeline), so its tests all run.
+  PACKAGES: >-
+    -p nsh-core -p nsh-macros -p nsh-js -p nsh-base -p nsh-engine
+    -p nsh-bundler -p nsh-package -p nsh-testing
+    --features nsh-bundler/bundle,nsh-testing/bundle,nsh-testing/agent
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # QuickJS is C (bindgen needs libclang); none of these crates needs a
+      # platform backend.
+      - name: Install clang
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      # Dependencies only: main's runs save it, pull requests restore it.
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Clippy
+        run: cargo clippy --all-targets $PACKAGES -- -D warnings
+
+      - name: Test
+        run: cargo test $PACKAGES

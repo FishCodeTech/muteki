@@ -1,0 +1,2 @@
+{"id":13,"method":"config/value/write","params":{"keyPath":"plugins.alpha@tcode-probe-mkt.enabled","value":false,"mergeStrategy":"upsert"}}
+{"id":13,"result":{"status":"ok","version":"sha256:f2be58cf32b904ebdd370e6f824091b0f16b18977506d313e63350b26151f846","filePath":"/private/tmp/tcode-probe/codex-home/config.toml","overriddenMetadata":null}}

@@ -1,6 +1,10 @@
 package main
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"io"
 	"log"
@@ -15,12 +19,8 @@ import (
 	"time"
 )
 
-// worker is one forked CLI agent the supervisor manages. Because the supervisor
-// forks it directly (vs the old host-side `docker exec`), it owns the real PID and
-// puts the worker in its OWN process group (Setpgid) — so a STOP/CONT/KILL hits the
-// worker AND every helper it spawns (curl/python/sh) by signalling the negative
-// pgid. This is strictly cleaner than the old `pkill -f <tag>` cmdline-sentinel
-// hack, which only worked because the host couldn't reach the in-container tree.
+const workerRingMaxBytes = 1024 * 1024
+
 type worker struct {
 	id         string
 	ownerRunID string
@@ -28,6 +28,8 @@ type worker struct {
 	tag        string
 	cmd        *exec.Cmd
 	pgid       int
+	stdinMu    sync.Mutex
+	stdinPipe  io.WriteCloser
 
 	mu            sync.Mutex
 	paused        bool
@@ -39,67 +41,127 @@ type worker struct {
 	outputLimit   bool
 	diskLimit     bool
 	killRequested bool
+
+	ringMu    sync.Mutex
+	ringBuf   []byte
+	ringTotal int64
 }
 
-// uid/gid of the kali user the worker runs as. Resolved once at startup. The
-// supervisor itself runs as root (PID1) so it can drop to kali for the worker.
+func stripANSISequences(raw []byte) []byte {
+	out := make([]byte, 0, len(raw))
+	i := 0
+	for i < len(raw) {
+		if raw[i] == 0x1b && i+1 < len(raw) {
+			next := raw[i+1]
+			if next == '[' {
+				i += 2
+				for i < len(raw) && !(raw[i] >= 0x40 && raw[i] <= 0x7e) {
+					i++
+				}
+				if i < len(raw) {
+					i++
+				}
+				continue
+			}
+			if next == ']' {
+				i += 2
+				for i < len(raw) && raw[i] != 0x07 {
+					if raw[i] == 0x1b && i+1 < len(raw) && raw[i+1] == '\\' {
+						i += 2
+						break
+					}
+					i++
+				}
+				if i < len(raw) && raw[i] == 0x07 {
+					i++
+				}
+				continue
+			}
+		}
+		out = append(out, raw[i])
+		i++
+	}
+	return out
+}
+
+func (w *worker) appendRing(line []byte) {
+	cleaned := stripANSISequences(line)
+	w.ringMu.Lock()
+	defer w.ringMu.Unlock()
+	w.ringTotal += int64(len(cleaned)) + 1
+	w.ringBuf = append(w.ringBuf, cleaned...)
+	w.ringBuf = append(w.ringBuf, '\n')
+	if len(w.ringBuf) > workerRingMaxBytes {
+		excess := len(w.ringBuf) - workerRingMaxBytes
+		copy(w.ringBuf, w.ringBuf[excess:])
+		w.ringBuf = w.ringBuf[:workerRingMaxBytes]
+	}
+}
+
+func (w *worker) verifyOutput(needle string) (bool, int64, string, string) {
+	w.ringMu.Lock()
+	snapshot := make([]byte, len(w.ringBuf))
+	copy(snapshot, w.ringBuf)
+	total := w.ringTotal
+	w.ringMu.Unlock()
+	sum := sha256.Sum256(snapshot)
+	shaHex := hex.EncodeToString(sum[:])
+	if needle == "" {
+		return true, total, shaHex, ""
+	}
+	idx := bytes.Index(snapshot, []byte(needle))
+	if idx < 0 {
+		return false, total, shaHex, ""
+	}
+	start := idx - 80
+	if start < 0 {
+		start = 0
+	}
+	end := idx + len(needle) + 80
+	if end > len(snapshot) {
+		end = len(snapshot)
+	}
+	return true, total, shaHex, string(snapshot[start:end])
+}
+
 var (
-	kaliUID int = -1
-	kaliGID int = -1
+	workspaceUID = 0
+	workspaceGID = 0
 )
 
-func resolveKali() {
-	// Prefer reading /etc/passwd directly — os/user needs cgo for some libc setups
-	// and we build CGO_ENABLED=0. The worker image creates `kali` via useradd.
-	data, err := os.ReadFile("/etc/passwd")
-	if err != nil {
-		return
+func resolveWorkspaceOwner() {
+	if uid, err := strconv.Atoi(os.Getenv("MUTEKI_WORKSPACE_UID")); err == nil && uid >= 0 {
+		workspaceUID = uid
 	}
-	for _, line := range strings.Split(string(data), "\n") {
-		f := strings.Split(line, ":")
-		if len(f) >= 4 && f[0] == "kali" {
-			if u, err := strconv.Atoi(f[2]); err == nil {
-				kaliUID = u
-			}
-			if g, err := strconv.Atoi(f[3]); err == nil {
-				kaliGID = g
-			}
-			return
-		}
+	if gid, err := strconv.Atoi(os.Getenv("MUTEKI_WORKSPACE_GID")); err == nil && gid >= 0 {
+		workspaceGID = gid
 	}
 }
 
-// startWorker forks the spec'd argv as a new worker. The caller streams its output
-// via the returned channels. stdout/stderr are merged-but-tagged: each is its own
-// channel so the host can distinguish (the driver only re-parses stdout, but stderr
-// is surfaced for diagnostics).
 func startWorker(id string, spec *WorkerSpec) (*worker, <-chan Frame, error) {
 	return startWorkerWithRuntime(id, spec, runtimeChildReaper, runtimeOOMTracker)
 }
 
 func startWorkerWithRuntime(id string, spec *WorkerSpec, reaper *childReaper, oomTracker *oomTracker) (*worker, <-chan Frame, error) {
+	if spec.TimeoutSec > int(math.MaxInt64/int64(time.Second)) || spec.TimeoutSec < 0 {
+		return nil, nil, &startErr{"worker timeout exceeds supported duration"}
+	}
 	if len(spec.Argv) == 0 {
 		return nil, nil, &startErr{"empty argv"}
 	}
 	cmd := exec.Command(spec.Argv[0], spec.Argv[1:]...)
 	cmd.Dir = spec.Cwd
 
-	// Build the worker env. Start from a minimal sane base, overlay the host's keys.
 	env := baseEnv()
-	for k, v := range spec.Env {
-		env[k] = v
-	}
-	// Apply the *_FILE → env indirection the old shell prelude did (claude/cursor/
-	// anthropic/openai tokens are mounted as files; the CLIs want them in env).
+	mergeSpecEnv(env, spec.Env)
+	env["USER"], env["LOGNAME"] = "root", "root"
+	env["IS_SANDBOX"] = "1"
 	applyTokenFiles(env)
 	cmd.Env = flattenEnv(env)
 
-	// Own process group so signals reach the whole tree; drop to kali (with sudo).
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	if kaliUID >= 0 && kaliGID >= 0 {
-		cmd.SysProcAttr.Credential = &syscall.Credential{
-			Uid: uint32(kaliUID), Gid: uint32(kaliGID),
-		}
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Setpgid:    true,
+		Credential: &syscall.Credential{Uid: 0, Gid: 0},
 	}
 
 	stdout, err := cmd.StdoutPipe()
@@ -110,14 +172,16 @@ func startWorkerWithRuntime(id string, spec *WorkerSpec, reaper *childReaper, oo
 	if err != nil {
 		return nil, nil, err
 	}
-	// Ordinary workers get instant EOF (codex hangs on an open stdin). A secure
-	// prompt gets an explicit pipe + completion frame: cmd.Start alone is NOT proof
-	// that os/exec's asynchronous Reader copy reached the child.
 	var stdinPipe io.WriteCloser
 	var stdinPayload []byte
-	if spec.Stdin != "" {
+	if spec.StdinMode == "stream" {
+		stdinPipe, err = cmd.StdinPipe()
+		if err != nil {
+			return nil, nil, err
+		}
+	} else if spec.Stdin != "" {
 		stdinPayload = []byte(spec.Stdin)
-		spec.Stdin = "" // drop the decoded request copy before spawning
+		spec.Stdin = ""
 		stdinPipe, err = cmd.StdinPipe()
 		if err != nil {
 			for i := range stdinPayload {
@@ -129,30 +193,19 @@ func startWorkerWithRuntime(id string, spec *WorkerSpec, reaper *childReaper, oo
 		cmd.Stdin = nil
 	}
 
-	// Make the dirs the worker writes owned by the kali user it runs as. Both the
-	// worker's cwd (a per-worker dir like workspace/workers/cli-<seat>-N) AND its HOME
-	// (a per-worker workspace/homes/cli-<id>) are created HOST-side by the ROOT web
-	// process and bind-mount in owned root:root. The worker runs as kali and writes
-	// BOTH dirs — codex app-server state + PATH aliases, claude session/config, PoC
-	// files. A root-owned cwd/home makes every such write fail with EACCES, and the
-	// engine then exits SILENTLY producing ZERO output (codex first warns "could not
-	// create PATH aliases" then aborts the in-process app-server; claude exits 0 with
-	// no stdout at all). chownWorkspaceRoot only fixes the workspace root, not these
-	// per-worker subdirs. So chown the cwd and the (env-declared) HOME to kali right
-	// before spawning, and pre-create the engine state dirs — the raw-setuid spawn
-	// can't always mkdir them the way a `su` login shell can.
-	if kaliUID >= 0 && kaliGID >= 0 {
-		chownToKali := func(d string) {
+
+	if workspaceUID >= 0 && workspaceGID >= 0 {
+		chownToWorkspaceOwner := func(d string) {
 			if d == "" {
 				return
 			}
 			if err := os.MkdirAll(d, 0o755); err == nil {
-				if err := os.Chown(d, kaliUID, kaliGID); err != nil {
-					log.Printf("runtime-agent: chown %s -> kali(%d:%d): %v", d, kaliUID, kaliGID, err)
+				if err := os.Chown(d, workspaceUID, workspaceGID); err != nil {
+					log.Printf("runtime-agent: chown %s -> workspace owner(%d:%d): %v", d, workspaceUID, workspaceGID, err)
 				}
 			}
 		}
-		chownToKali(cmd.Dir)
+		chownToWorkspaceOwner(cmd.Dir)
 		home := "/home/kali"
 		for _, kv := range cmd.Env {
 			if strings.HasPrefix(kv, "HOME=") {
@@ -162,13 +215,13 @@ func startWorkerWithRuntime(id string, spec *WorkerSpec, reaper *childReaper, oo
 				break
 			}
 		}
-		chownToKali(home)
+		chownToWorkspaceOwner(home)
 		for _, sub := range []string{
 			"/.codex", "/.claude", "/.local", "/.local/bin",
 			"/.local/share", "/.config", "/.cache",
 		} {
 			if err := os.MkdirAll(home+sub, 0o775); err == nil {
-				_ = os.Chown(home+sub, kaliUID, kaliGID)
+				_ = os.Chown(home+sub, workspaceUID, workspaceGID)
 			}
 		}
 	}
@@ -183,6 +236,7 @@ func startWorkerWithRuntime(id string, spec *WorkerSpec, reaper *childReaper, oo
 		return nil, nil, &startErr{"cannot measure worker directory"}
 	}
 	oomObservation := oomTracker.begin()
+	kimiUsage := checkpointKimiUsage(spec, env)
 	if err := reaper.start(cmd); err != nil {
 		oomTracker.cancel(oomObservation)
 		if stdinPipe != nil {
@@ -195,17 +249,42 @@ func startWorkerWithRuntime(id string, spec *WorkerSpec, reaper *childReaper, oo
 	}
 	pgid, _ := syscall.Getpgid(cmd.Process.Pid)
 	w := &worker{id: id, ownerRunID: spec.OwnerRunID, ownerToken: spec.OwnerToken, tag: spec.Tag, cmd: cmd, pgid: pgid}
+	if spec.StdinMode == "stream" {
+		w.stdinPipe = stdinPipe
+	}
 
-	events := make(chan Frame, 256)
+	events := make(chan Frame, 16)
 	var streamWG sync.WaitGroup
 	streamWG.Add(2)
 	outputLimitBytes := resolveByteLimit(spec.OutputLimitBytes, "MUTEKI_WORKER_OUTPUT_LIMIT", defaultOutputLimitBytes)
 	var streamBytes sync.Mutex
 	var totalStreamBytes int64
-	// Bounded byte streaming replaces bufio.Scanner (4 MiB max-token): long
-	// JSONL tool lines must not fail silently, and total capture stays capped.
+	const maxEncodedOutputLine = 500 * 1024
+	stopOutput := func(reason string) {
+		w.mu.Lock()
+		w.outputLimit = true
+		w.killRequested = true
+		w.mu.Unlock()
+		_ = w.signalTree(syscall.SIGKILL)
+		events <- Frame{T: "err", Line: reason}
+	}
 	pump := func(r io.Reader, t string) {
 		defer streamWG.Done()
+		emit := func(line []byte) bool {
+			if len(line) > maxEncodedOutputLine {
+				stopOutput("Worker output line exceeds the 500 KiB frame budget")
+				return false
+			}
+			text := string(line)
+			encoded, err := json.Marshal(text)
+			if err != nil || len(encoded) > maxEncodedOutputLine {
+				stopOutput("Worker encoded output line exceeds the 500 KiB frame budget")
+				return false
+			}
+			w.appendRing(line)
+			events <- Frame{T: t, Line: text}
+			return true
+		}
 		buf := make([]byte, 64*1024)
 		var pending []byte
 		for {
@@ -234,33 +313,25 @@ func startWorkerWithRuntime(id string, spec *WorkerSpec, reaper *childReaper, oo
 					searchStart = 0
 					line := pending[:idx]
 					pending = pending[idx+1:]
-					events <- Frame{T: t, Line: string(line)}
-				}
-				if over {
-					if len(pending) > 0 {
-						events <- Frame{T: t, Line: string(pending)}
+					if !emit(line) {
+						return
 					}
-					w.mu.Lock()
-					w.outputLimit = true
-					w.killRequested = true
-					w.mu.Unlock()
-					_ = w.signalTree(syscall.SIGKILL)
+				}
+				if len(pending) > maxEncodedOutputLine {
+					stopOutput("Worker incomplete output line exceeds the 500 KiB frame budget")
 					return
 				}
-				// Cap pending incomplete line so a single huge line cannot grow forever.
-				if int64(len(pending)) > outputLimitBytes && outputLimitBytes > 0 {
-					w.mu.Lock()
-					w.outputLimit = true
-					w.killRequested = true
-					w.mu.Unlock()
-					_ = w.signalTree(syscall.SIGKILL)
+				if over {
+					if len(pending) > 0 && !emit(pending) {
+						return
+					}
+					stopOutput("Worker combined output exceeds its configured byte budget")
 					return
 				}
 			}
 			if readErr != nil {
 				if len(pending) > 0 {
-					events <- Frame{T: t, Line: string(pending)}
-					pending = nil
+					emit(pending)
 				}
 				return
 			}
@@ -270,7 +341,7 @@ func startWorkerWithRuntime(id string, spec *WorkerSpec, reaper *childReaper, oo
 	go pump(stderr, "err")
 
 	var stdinWG sync.WaitGroup
-	if stdinPipe != nil {
+	if stdinPipe != nil && spec.StdinMode != "stream" {
 		stdinWG.Add(1)
 		go func(payload []byte) {
 			defer stdinWG.Done()
@@ -289,8 +360,6 @@ func startWorkerWithRuntime(id string, spec *WorkerSpec, reaper *childReaper, oo
 			if closeErr := stdinPipe.Close(); closeErr != nil {
 				ok = false
 			}
-			// Best-effort zero the mutable transport copy immediately after the pipe
-			// completes; do not retain it for the worker's 30s status grace period.
 			for i := range payload {
 				payload[i] = 0
 			}
@@ -302,17 +371,10 @@ func startWorkerWithRuntime(id string, spec *WorkerSpec, reaper *childReaper, oo
 		}(stdinPayload)
 	}
 
-	// Wall-clock cap: SIGKILL the whole tree once it has spent TimeoutSec ACTIVELY
-	// running (authoritative, replaces the in-container `timeout -s KILL`). M7: the
-	// budget is pause-aware — while the operator has the worker SIGSTOP-frozen
-	// (w.paused), the clock does NOT advance, so a long HITL pause can't trip the
-	// timeout and mislabel a deliberately paused worker as timed_out. A polling
-	// goroutine (vs a fixed AfterFunc) so it can discount paused intervals.
-	// Same loop also enforces workdir growth budget (#170).
 	timerDone := make(chan struct{})
 	go func() {
 		budget := time.Duration(maxInt(1, spec.TimeoutSec)) * time.Second
-		var active time.Duration // wall-clock spent NOT paused
+		var active time.Duration
 		const tick = 200 * time.Millisecond
 		var diskTicks int
 		last := time.Now()
@@ -347,10 +409,6 @@ func startWorkerWithRuntime(id string, spec *WorkerSpec, reaper *childReaper, oo
 					}
 				}
 				if active >= budget {
-					// Publish the supervisor-authored KILL cause before delivering the
-					// signal. The child can exit and Cmd.Wait can return immediately;
-					// setting this afterwards would leave a window where a concurrent
-					// cgroup delta could be falsely attributed as an OOM.
 					w.mu.Lock()
 					w.killRequested = true
 					w.mu.Unlock()
@@ -366,13 +424,19 @@ func startWorkerWithRuntime(id string, spec *WorkerSpec, reaper *childReaper, oo
 	}()
 
 	go func() {
-		// The stdin receipt must precede exit/channel-close. Wait for its writer and
-		// both output pumps, THEN reap — otherwise Wait can close pipes mid-transfer.
 		stdinWG.Wait()
 		streamWG.Wait()
 		err := reaper.wait(cmd)
+		if kimiUsage != nil {
+			events <- kimiUsage.frame()
+		}
+		w.stdinMu.Lock()
+		if w.stdinPipe != nil {
+			_ = w.stdinPipe.Close()
+			w.stdinPipe = nil
+		}
+		w.stdinMu.Unlock()
 		close(timerDone)
-		// Fast writers may finish before the periodic monitor's first tick.
 		if cur := dirSizeBytes(budgetRoot); diskLimitBytes > 0 && cur >= 0 && cur-cwdBaseline > diskLimitBytes {
 			w.mu.Lock()
 			w.diskLimit = true
@@ -391,8 +455,6 @@ func startWorkerWithRuntime(id string, spec *WorkerSpec, reaper *childReaper, oo
 		if oomEvidence.delta > 0 && !oom {
 			log.Printf("runtime-agent: observed container oom_kill delta=%d for worker %s but attribution was ambiguous or contradicted by the exit cause", oomEvidence.delta, id)
 		}
-		// Supervisors that killed for output/disk keep those typed causes; OOM still
-		// wins when the kernel also claimed the tree (cgroup evidence attributable).
 		if oom {
 			outputLimitHit = false
 			diskLimitHit = false
@@ -419,8 +481,29 @@ func startWorkerWithRuntime(id string, spec *WorkerSpec, reaper *childReaper, oo
 	return w, events, nil
 }
 
-// signalTree sends sig to the worker's whole process group (negative pgid). Used for
-// STOP/CONT/KILL/TERM. Safe to call after exit (best-effort).
+func (w *worker) writeStdin(data string) error {
+	w.stdinMu.Lock()
+	defer w.stdinMu.Unlock()
+	if w.stdinPipe == nil {
+		return errors.New("worker stdin is unavailable")
+	}
+	raw := []byte(data)
+	if len(raw) == 0 || raw[len(raw)-1] != '\n' {
+		raw = append(raw, '\n')
+	}
+	for len(raw) > 0 {
+		n, err := w.stdinPipe.Write(raw)
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+		raw = raw[n:]
+	}
+	return nil
+}
+
 func (w *worker) signalTree(sig syscall.Signal) error {
 	if w.pgid > 0 {
 		return syscall.Kill(-w.pgid, sig)
@@ -446,10 +529,6 @@ func (w *worker) signal(name string) error {
 		return &startErr{"unknown signal " + name}
 	}
 	if name == "KILL" {
-		// See the timer path above: cause publication must happen before the
-		// signal, otherwise the waiter can win the race and label an operator KILL
-		// from unrelated container-wide OOM evidence. A failed attempt may leave
-		// this true, which is an intentional conservative false-negative boundary.
 		w.mu.Lock()
 		w.killRequested = true
 		w.mu.Unlock()
@@ -490,12 +569,10 @@ func (w *worker) status() (state string, rc *int, paused, oom, timedOut bool) {
 	return state, &r, false, w.oom, w.timedOut
 }
 
-// startErr is a tiny error type so we avoid pulling in fmt/errors churn.
 type startErr struct{ msg string }
 
 func (e *startErr) Error() string { return e.msg }
 
-// exitInfo extracts (rc, terminating-signal) from a cmd.Wait() error.
 func exitInfo(err error) (int, int) {
 	if err == nil {
 		return 0, 0
@@ -512,10 +589,6 @@ func exitInfo(err error) (int, int) {
 	return -1, 0
 }
 
-// readOOMKill reads the container cgroup's cumulative oom_kill counter (v2
-// memory.events, v1 fallback). -1 if unreadable. A nonzero delta across a worker's
-// lifetime means the kernel OOM-killer SIGKILL'd something — the discriminator that
-// tells a real wall-clock timeout (137 at budget) from an OOM victim (137 early).
 func readOOMKill() int {
 	for _, p := range []string{
 		"/sys/fs/cgroup/memory.events",
@@ -537,11 +610,9 @@ func readOOMKill() int {
 	return -1
 }
 
-// default stream / workdir budgets when the host omits override and env is unset.
-// Intentionally not TSec's 64MiB/256MiB/4GiB product numbers (#170).
 const (
-	defaultOutputLimitBytes int64 = 64 * 1024 * 1024       // 64 MiB combined stdout+stderr
-	defaultDiskLimitBytes   int64 = 4 * 1024 * 1024 * 1024 // 4 GiB workdir growth
+	defaultOutputLimitBytes int64 = 64 * 1024 * 1024
+	defaultDiskLimitBytes   int64 = 4 * 1024 * 1024 * 1024
 )
 
 func indexByte(b []byte, c byte) int {
@@ -553,8 +624,6 @@ func indexByte(b []byte, c byte) int {
 	return -1
 }
 
-// resolveByteLimit prefers an explicit StartWorker value, then a docker-style
-// MUTEKI_WORKER_* env (e.g. "64m"), then the built-in default.
 func resolveByteLimit(explicit int64, envKey string, fallback int64) int64 {
 	if explicit > 0 {
 		return explicit
@@ -607,7 +676,6 @@ func parseDockerSize(raw string) (int64, bool) {
 	if s == "" {
 		return 0, false
 	}
-	// Accept integers only for simplicity (host already normalizes).
 	n, err := strconv.ParseInt(s, 10, 64)
 	if err != nil || n <= 0 || n > math.MaxInt64/mult {
 		return 0, false
@@ -615,8 +683,6 @@ func parseDockerSize(raw string) (int64, bool) {
 	return n * mult, true
 }
 
-// dirSizeBytes walks a directory tree and sums regular file sizes. Returns -1
-// on error so a transient walk failure never falsely trips the disk budget.
 func dirSizeBytes(root string) int64 {
 	if root == "" {
 		return -1

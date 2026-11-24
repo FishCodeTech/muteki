@@ -1,0 +1,120 @@
+name: Compat
+
+# Holds the checkout to what NSH's releases froze: runs
+# longbridge/nsh-compat (the record of each compatible release and the
+# checks, kept apart so no change here can rewrite them) against it, as
+# `cargo xtask compat` does: the apps of `tests/compat/` built by this
+# checkout's `nsh` and run, every recorded release's API still offered and
+# its apps still running (docs/dev/compatibility.md).
+#
+# Its job, `compat`, is one main's ruleset requires, so it runs on every
+# pull request and reports: one that changes nothing it builds (the
+# filter's list, held to the dependency graph by .github/ci/paths.py)
+# passes in seconds without building.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  merge_group:
+    types: [checks_requested]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  # The filter reads a pull request's changed files.
+  pull-requests: read
+
+concurrency:
+  group: compat-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # CI builds each crate once: no incremental state and no debug info
+  # (faster builds, smaller caches; panics still name their file and line).
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  # The toolchain file's iOS and Android targets are only the release's.
+  RUSTUP_TOOLCHAIN: stable
+
+jobs:
+  compat:
+    # Disabled until the API is ready to freeze.
+    if: false
+    runs-on: ubuntu-24.04
+    steps:
+      # A pull request runs the checks when it changes what they build;
+      # main and manual runs always do.
+      - name: Find what changed
+        id: changes
+        if: github.event_name == 'pull_request'
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            compat:
+              - "crates/nsh-base/**"
+              - "crates/nsh-bundler/**"
+              - "crates/nsh-cli/**"
+              - "crates/nsh-core/**"
+              - "crates/nsh-dev/**"
+              - "crates/nsh-engine/**"
+              - "crates/nsh-js/**"
+              - "crates/nsh-macros/**"
+              - "crates/nsh-package/**"
+              - "crates/nsh-testing/**"
+              - "tests/compat/**"
+              - "examples/counter/**"
+              - "examples/desktop/**"
+              - "examples/gallery/**"
+              - "examples/hopper/**"
+              - "Cargo.toml"
+              - "Cargo.lock"
+              - ".cargo/**"
+              - "rust-toolchain.toml"
+              - ".github/workflows/compat.yml"
+
+      - name: Decide
+        id: run
+        run: echo "check=${{ github.event_name != 'pull_request' || steps.changes.outputs.compat == 'true' }}" >> "$GITHUB_OUTPUT"
+
+      # Side by side: nsh-compat's crates depend on `../nsh`.
+      - uses: actions/checkout@v4
+        if: steps.run.outputs.check == 'true'
+        with:
+          path: nsh
+
+      - uses: actions/checkout@v4
+        if: steps.run.outputs.check == 'true'
+        with:
+          repository: longbridge/nsh-compat
+          path: nsh-compat
+
+      # QuickJS is C (bindgen needs libclang).
+      - name: Install clang
+        if: steps.run.outputs.check == 'true'
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
+
+      - name: Setup Rust
+        if: steps.run.outputs.check == 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      # Dependencies only: main's runs save it, pull requests restore it.
+      - name: Cache Cargo
+        if: steps.run.outputs.check == 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: nsh
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build nsh
+        if: steps.run.outputs.check == 'true'
+        working-directory: nsh
+        run: cargo build -p nsh-cli
+
+      # The checkout's versions, so the cache serves both.
+      - name: Check
+        if: steps.run.outputs.check == 'true'
+        working-directory: nsh-compat
+        run: |
+          cp ../nsh/Cargo.lock .
+          cargo test --target-dir ../nsh/target

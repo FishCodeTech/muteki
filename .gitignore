@@ -1,118 +1,28 @@
-# Python-generated files
-__pycache__/
-*.py[oc]
-build/
-dist/
-wheels/
-*.egg-info
-
-# Worker image build artifact — the cross-compiled Go supervisor. Source lives in
-# cmd/runtime-agent/; build.sh regenerates this into the docker build context.
-docker/worker/runtime_agent
-docker/worker/runtime_agent-*
-docker/worker/blackboard.py
-docker/worker/deepseek_harness_worker.py
-docker/worker/blackboard.SKILL.md
-docker/worker/offline_acp_bridge.py
-docker/worker/omp_offline_config.yml
-docker/worker/kimi_offline_agent.md
-docker/worker/grok_offline_agent.md
-docker/worker/muteki-runtime/
-
-# Slim worker image build context. build.sh cross-compiles runtime_agent and copies
-# skill/bridges/profiles from maintained sources. AGENTS.md is tracked here with
-# slim-specific capability guidance (not a copy of the Kali full prompt).
-docker/worker-slim/runtime_agent
-docker/worker-slim/runtime_agent-*
-docker/worker-slim/blackboard.py
-docker/worker-slim/deepseek_harness_worker.py
-docker/worker-slim/blackboard.SKILL.md
-docker/worker-slim/offline_acp_bridge.py
-docker/worker-slim/omp_offline_config.yml
-docker/worker-slim/kimi_offline_agent.md
-docker/worker-slim/grok_offline_agent.md
-docker/worker-slim/muteki-runtime/
-
-# Virtual environments
-.venv
-
-# OS / editor cruft
-.DS_Store
-
-# Runtime output (artifacts the kernel writes, session event logs, eval runs,
-# distilled knowledge templates)
-artifacts/
-sessions/
-/state/
-/*-state/
-/.manual-runtime/
-/run-*/
-eval_runs/
-knowledge/
-output/
-
-# pytest / tooling caches
-.pytest_cache/
-.ruff_cache/
-.mypy_cache/
-harness-assessment.html
-
-# Secrets — NEVER commit real API keys / MCP bearer tokens.
-# .mcp.json is the LOCAL knowledge-base MCP client config (may point at a private
-# service + token) and is NOT committed; .mcp.json.example is the sanitized template.
+.cache/
+.muteki/
+.state/
+.state
 .env
 .env.*
 !.env.example
-.mcp.json
-.mcp.local.json
-!.mcp.json.example
-*.local.json
-secrets/
-.secrets/
-.claude/scheduled_tasks.lock
-
-# VPS residue archive (272MB pretask backup — not part of the codebase)
-vps_archive_backup/
-
-# Re-test marathon runtime data — ledgers, session JSONL, staged inputs, logs,
-# pulled challenge containers' artifacts. Pure eval output, not source. The
-# distilled public report lives in public_eval/ (committed); the raw run data here
-# (retest_runs/ledger.jsonl, _sessions/*.jsonl, _inputs_*, _logs) stays out.
-retest_runs/
-
-# Go binary built into the source dir by a bare `go build .` (the real build
-# artifact goes to docker/worker/runtime_agent via build.sh).
+node_modules/
+.next/
+.next-*/
+target/
+dist/
+*.tsbuildinfo
+.DS_Store
+vendor/**/.git/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+.impeccable/
+.playwright-cli/
+output/
+docker/worker*/runtime_agent-*
 cmd/runtime-agent/runtime-agent
-
-# internal dev-tracking files (not part of the OSS distribution)
-progress.md
-feature_list.json
-session-handoff.md
-
-# Local-only working notes — kept on disk for reference, NOT part of the
-# distribution (working notes, not user-facing documentation).
-docs/_local/
-docs/internal-design/
-docs/wechat/
-docs/assets/wechat-promo/
-.codegraph/
-
-# Local machine residue — not part of the distribution.
-exports/
-data/
-.muteki/
-.pi/
-
-# Local development output and generated build contexts.
-/.apodex/
-/.playwright-cli/
-/.cursor/
-/tmp/
-/docker/tsec-hosted/.build-ctx/
-
-/apps/web/ui/.next-readme/
-/apps/web/ui/.next-desktop/
-/apps/desktop/dist-dev/
-
-# Local design prototypes (not part of the app build)
-/prototypes/
+docker/worker*/.last-engine-versions.txt
+docker/web/web-release.tar.gz
+reports/*-build.log
+reports/*-build-*.log

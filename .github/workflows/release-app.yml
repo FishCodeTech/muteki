@@ -1,0 +1,209 @@
+name: release-app
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      draft_tag:
+        description: Optional existing Rust release tag; leave empty to validate this branch
+        required: false
+        type: string
+      publish:
+        description: Publish packages and Web images for draft_tag after validation
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-app-${{ inputs.draft_tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    if: github.repository == 'FishCodeTech/muteki'
+    runs-on: ubuntu-24.04
+    outputs:
+      ref: ${{ steps.release.outputs.ref }}
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+      publish: ${{ steps.release.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Resolve the Rust source and publication mode
+        id: release
+        env:
+          REQUESTED_TAG: ${{ inputs.draft_tag }}
+          PUBLISH: ${{ github.event_name == 'push' || inputs.publish }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="$REQUESTED_TAG"
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then tag="$GITHUB_REF_NAME"; fi
+          if [[ "$PUBLISH" == true && "$GITHUB_REF" != "refs/tags/$tag" ]]; then
+            echo "Publication must run from the release tag, not a branch" >&2
+            exit 1
+          fi
+          ref="$GITHUB_SHA"
+          if [[ -n "$tag" ]]; then ref="refs/tags/$tag"; fi
+          sha=$(git rev-parse --verify "$ref^{commit}")
+          version=$(git show "$sha:crates/server/Cargo.toml" | sed -n 's/^version = "\([^"]*\)"/\1/p' | head -1)
+          if [[ "$PUBLISH" == true && ( -z "$tag" || "$tag" != "v$version" ) ]]; then
+            echo "Publication requires an existing Rust tag matching Cargo version v$version" >&2
+            exit 1
+          fi
+          echo "ref=$sha" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "publish=$PUBLISH" >> "$GITHUB_OUTPUT"
+
+  packages:
+    needs: prepare
+    uses: ./.github/workflows/build-packages.yml
+    with:
+      ref: ${{ needs.prepare.outputs.ref }}
+      upload_packages: true
+
+  legacy-upgrade:
+    needs: [prepare, packages]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.ref }}
+          persist-credentials: false
+      - uses: actions/setup-python@v7.1.0
+        with:
+          python-version: "3.13"
+      - uses: astral-sh/setup-uv@v10.4.0
+        with:
+          version: "0.12.5"
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          pattern: muteki-package-*
+          path: packages
+          merge-multiple: true
+      - name: Require every supported native Web package
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for target in darwin-arm64 linux-amd64 linux-arm64; do
+            test "$(find packages -type f -name "Muteki-Web-$RELEASE_VERSION-$target.tar.gz" | wc -l)" -eq 1
+          done
+      - name: Verify direct upgrade from the released Python v0.4.7
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+        run: python3 scripts/verify_legacy_upgrade.py --version "$RELEASE_VERSION" --assets packages
+      - name: Build the legacy updater bridge and release manifest
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          python3 scripts/package-legacy-upgrade.py \
+            --version "$RELEASE_VERSION" \
+            --assets packages \
+            --output legacy-release \
+            --repository "$GITHUB_REPOSITORY"
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: muteki-legacy-upgrade
+          retention-days: 3
+          path: |
+            legacy-release/muteki-*-upgrade.tar.gz
+            legacy-release/release-manifest.json
+          if-no-files-found: error
+
+  web-images:
+    if: needs.prepare.outputs.publish == 'true'
+    needs: [prepare, packages]
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.ref }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          name: muteki-package-linux-${{ matrix.arch }}
+          path: dist
+      - uses: docker/setup-buildx-action@v4.4.1
+      - uses: docker/login-action@v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish the already validated Linux Web package
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          TARGET_ARCH: ${{ matrix.arch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd dist/web-releases && shasum -a 256 -c Muteki-Web-*.tar.gz.sha256)
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/muteki-web"
+          asset=$(basename dist/web-releases/Muteki-Web-*.tar.gz)
+          docker build -f docker/web/Dockerfile --build-arg "RELEASE_ASSET=$asset" -t "$image:$RELEASE_TAG-$TARGET_ARCH" dist/web-releases
+          bash scripts/smoke-web-container.sh "$image:$RELEASE_TAG-$TARGET_ARCH"
+          docker push "$image:$RELEASE_TAG-$TARGET_ARCH"
+
+  publish:
+    if: needs.prepare.outputs.publish == 'true'
+    needs: [prepare, packages, legacy-upgrade, web-images]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: docker/setup-buildx-action@v4.4.1
+      - uses: docker/login-action@v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish the validated multiarch Web index
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/muteki-web"
+          docker buildx imagetools create -t "$image:$RELEASE_TAG" -t "$image:latest" "$image:$RELEASE_TAG-amd64" "$image:$RELEASE_TAG-arm64"
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          pattern: muteki-package-*
+          path: packages
+          merge-multiple: true
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          name: muteki-legacy-upgrade
+          path: packages/legacy-upgrade
+      - name: Attach archives and checksums to a draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          RELEASE_SHA: ${{ needs.prepare.outputs.ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          while IFS= read -r -d '' checksum; do
+            (cd "$(dirname "$checksum")" && shasum -a 256 -c "$(basename "$checksum")")
+          done < <(find packages -type f -name '*.sha256' -print0)
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --target "$RELEASE_SHA" --draft --title "$RELEASE_TAG"
+          mapfile -d '' assets < <(find packages -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.sha256' -o -name 'release-manifest.json' \) -print0)
+          test "${#assets[@]}" -gt 0
+          gh release upload "$RELEASE_TAG" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --clobber

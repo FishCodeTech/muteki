@@ -1,0 +1,4 @@
+{
+  "claimed": "facts:\n  - id: fact_origin\n    title: \"题目信息:\"\n    content: |-\n      Inspect attached data.\n      附件: input.zip\ngoals:\n  - id: goal_final\n    kind: final\n    criterion: 解决这道 CTF 题目，并提交全部 FLAG，多 FLAG 题目要找到全部 FLAG 并有效提交\nsteps:\n  - id: step_001\n    action: \"Inspect archive.\"\n    from:\n      - fact_origin\n    actor: agent\n    priority: normal\n    state: open",
+  "committed": "facts:\n  - id: fact_origin\n    title: \"题目信息:\"\n    content: |-\n      Inspect attached data.\n      附件: input.zip\n  - id: fact_001\n    title: \"Archive contents\"\n    producedBy: step_001\n    content: \"Contains one image.\"\ngoals:\n  - id: goal_final\n    kind: final\n    criterion: 解决这道 CTF 题目，并提交全部 FLAG，多 FLAG 题目要找到全部 FLAG 并有效提交\nsteps:\n  - id: step_001\n    action: \"Inspect archive.\"\n    from:\n      - fact_origin\n    actor: agent\n    priority: normal\n    state: done\n    to: fact_001"
+}

@@ -1,0 +1,31 @@
+[package]
+name = "tcode"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "tcode"
+path = "src/main.rs"
+
+[package.metadata.bundle]
+name = "Tcode"
+identifier = "com.tryanks.tcode"
+icon = ["../../assets/icons/app/tcode.icns"]
+
+[dependencies]
+tcode-client = { path = "../client" }
+tcode-services = { path = "../services" }
+tcode-protocol = { path = "../protocol" }
+tcode-traverse = { path = "../traverse", features = ["native"] }
+tcode-runtime = { path = "../runtime" }
+tcode-ui = { path = "../ui" }
+computer-use-mcp = { path = "../computer-use-mcp" }
+gpui = { package = "gpui-fast", version = "0.1.10", default-features = false }
+gpui_platform = { package = "gpui-fast-platform", version = "0.1.10", features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
+env_logger = "0.11"
+log = "0.4"
+smol = "2"
+async-channel = "2"
+
+[build-dependencies]
+embed-resource = "3.0.11"

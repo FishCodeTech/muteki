@@ -1,0 +1,26 @@
+[package]
+name = "tcode-headless"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "tcode-headless"
+path = "src/main.rs"
+
+[features]
+default = []
+web = []
+
+[dependencies]
+agent = { path = "../agent", default-features = false }
+env_logger = "0.11"
+qrcode = { version = "0.14", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tcode-client = { path = "../client" }
+tcode-core = { path = "../core" }
+tcode-protocol = { path = "../protocol" }
+tcode-runtime = { path = "../runtime" }
+tcode-services = { path = "../services" }
+tcode-traverse = { path = "../traverse", features = ["browser", "native"] }
+url = "2"

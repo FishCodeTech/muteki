@@ -1,0 +1,25 @@
+[package]
+name = "nsh-windows-app"
+description = "Release app runner on Windows: the executable of packaged nsh apps (no development features)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+readme.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = ["js"]
+# JS apps (the bundle in the package). Without it the runner runs a Rust
+# app only (`run_rust`) and links no QuickJS.
+js = ["nsh-platform-windows/js"]
+
+[dependencies]
+log.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+nsh-platform-windows.workspace = true
+serde_json.workspace = true

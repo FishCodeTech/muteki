@@ -1,0 +1,349 @@
+.workspace-frame-content > .capability-center { width: 100%; min-height: 100%; }
+.capability-center {
+  width: 100%;
+  max-width: 1480px;
+  margin: 0 auto;
+  padding: clamp(16px, 2vw, 28px);
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  background: transparent;
+  color: var(--text);
+  font-family: var(--font-sans);
+}
+
+.capability-center :where(button, input, select) { font: inherit; }
+.capability-center button { cursor: pointer; }
+.capability-center button:disabled { cursor: not-allowed; opacity: 0.52; }
+
+.cap-topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+.cap-topbar-meta {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.cap-topbar-title {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--bright);
+  letter-spacing: -0.02em;
+}
+.cap-topbar-desc {
+  margin: 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+.cap-topbar.is-actions-only {
+  justify-content: flex-end;
+}
+
+.cap-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 7px;
+  border-radius: 5px;
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+  background: color-mix(in srgb, var(--muted) 12%, transparent);
+  color: var(--muted);
+}
+.cap-state i {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+.cap-state.ok {
+  background: color-mix(in srgb, var(--green) 12%, transparent);
+  color: var(--green);
+}
+.cap-state.bad {
+  background: color-mix(in srgb, var(--red) 12%, transparent);
+  color: var(--red);
+}
+.cap-state.warn {
+  background: color-mix(in srgb, var(--amber) 12%, transparent);
+  color: var(--amber);
+}
+.cap-state.info {
+  background: color-mix(in srgb, var(--blue) 12%, transparent);
+  color: var(--blue);
+}
+
+.cap-threads-layout {
+  display: grid;
+  grid-template-columns: minmax(280px, 340px) minmax(0, 1fr);
+  gap: 14px;
+  align-items: start;
+}
+.cap-thread-picker {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--panel);
+}
+.cap-thread-picker-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.cap-thread-picker-head span {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--bright);
+}
+.cap-thread-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 600px;
+  overflow-y: auto;
+  padding-right: 2px;
+}
+.cap-thread-card {
+  width: 100%;
+  height: auto;
+  min-height: 78px;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  justify-content: flex-start;
+  gap: 5px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel2);
+  color: var(--text);
+  text-align: left;
+  white-space: normal;
+  transition: color var(--control-feedback-dur) var(--cx-ease-out), background-color var(--control-feedback-dur) var(--cx-ease-out), border-color var(--control-feedback-dur) var(--cx-ease-out), box-shadow var(--control-feedback-dur) var(--cx-ease-out);
+  position: relative;
+}
+.cap-thread-card:hover {
+  border-color: var(--line2);
+  background: color-mix(in srgb, var(--bright) 3%, var(--panel2));
+}
+.cap-thread-card.active {
+  border-color: color-mix(in srgb, var(--blue) 50%, var(--line2));
+  background: color-mix(in srgb, var(--blue) 6%, var(--panel2));
+}
+.cap-thread-card-top {
+  width: 100%;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+.cap-thread-card-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--bright);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cap-thread-card-meta {
+  width: 100%;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--dim);
+}
+
+.cap-binding-editor {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--panel);
+}
+.cap-binding-editor-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+  flex-wrap: wrap;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--line);
+}
+.cap-binding-editor-info {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+.cap-binding-editor-title {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--bright);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.cap-badge {
+  padding: 2px 7px;
+  border-radius: 5px;
+  font-size: 11px;
+  font-weight: 500;
+  border: 1px solid var(--line);
+  background: var(--panel2);
+  color: var(--muted);
+}
+.cap-badge.primary {
+  border-color: color-mix(in srgb, var(--blue) 35%, var(--line));
+  background: color-mix(in srgb, var(--blue) 8%, var(--panel));
+  color: var(--blue);
+}
+.cap-badge.success {
+  border-color: color-mix(in srgb, var(--green) 35%, var(--line));
+  background: color-mix(in srgb, var(--green) 8%, var(--panel));
+  color: var(--green);
+}
+.cap-binding-editor-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.cap-tools-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  max-height: 480px;
+  overflow-y: auto;
+  padding-right: 2px;
+}
+.cap-tool-card {
+  padding: 10px 12px;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel2);
+  cursor: pointer;
+  transition: color var(--control-feedback-dur) var(--cx-ease-out), background-color var(--control-feedback-dur) var(--cx-ease-out), border-color var(--control-feedback-dur) var(--cx-ease-out), box-shadow var(--control-feedback-dur) var(--cx-ease-out);
+  user-select: none;
+}
+.cap-tool-card[hidden] {
+  display: none;
+}
+.cap-tool-card:hover {
+  border-color: var(--line2);
+  background: color-mix(in srgb, var(--bright) 2%, var(--panel2));
+}
+.cap-tool-card.selected {
+  border-color: color-mix(in srgb, var(--blue) 45%, var(--line2));
+  background: color-mix(in srgb, var(--blue) 5%, var(--panel2));
+}
+.cap-tool-checkbox {
+  position: relative;
+}
+.cap-tool-checkbox:has(input:focus-visible) .checkbox__control {
+  outline: 2px solid var(--cx-focus);
+  outline-offset: 2px;
+}
+.cap-tool-card-body {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+  flex: 1;
+}
+.cap-tool-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+.cap-tool-card-name {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--bright);
+  font-family: var(--font-mono);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cap-tool-card-desc {
+  margin: 0;
+  font-size: 11px;
+  color: var(--muted);
+  line-height: 1.4;
+}
+.cap-tool-card-footer {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 2px;
+  flex-wrap: wrap;
+  font-size: 11px;
+  color: var(--dim);
+}
+
+.cap-binding-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+  flex-wrap: wrap;
+}
+.cap-dirty-notice {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--muted);
+}
+.cap-dirty-notice.changed {
+  color: var(--amber);
+  font-weight: 500;
+}
+
+.cap-thread-list.cap-virtual-scroll,
+.cap-tools-grid.cap-virtual-scroll {
+  display: block;
+  gap: 0;
+}
+.cap-thread-virtual-row {
+  padding-bottom: 6px;
+  box-sizing: border-box;
+}
+.cap-tools-virtual-row {
+  display: grid;
+  gap: 8px;
+  padding-bottom: 8px;
+  box-sizing: border-box;
+  align-items: stretch;
+}
+.cap-tools-virtual-row > .cap-tool-card {
+  min-width: 0;
+  height: 100%;
+}

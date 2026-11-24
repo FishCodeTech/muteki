@@ -1,0 +1,49 @@
+.single-task-workers {
+  width: 100%; height: 100%; min-width: 0; min-height: 0;
+  display: flex; overflow: hidden; background: var(--bg);
+}
+.single-task-workers-body { flex: 1; min-width: 0; min-height: 0; overflow: hidden; }
+.single-task-workers .wsettings-skeleton {
+  --ws-fs-micro: 11px;
+  --ws-fs-hint: 12px;
+  --ws-fs-small: 12px;
+  --ws-fs-body: 13px;
+  --ws-fs-title: 14px;
+  --ws-fs-head: 18px;
+  --wsettings-content-max: 1120px;
+  --wsettings-content-pad: 28px;
+  width: 100%; height: 100%; min-height: 0;
+  grid-template-columns: 192px minmax(0, 1fr); grid-template-rows: minmax(0, 1fr);
+  overflow: hidden;
+}
+.single-task-workers .wsettings-content { background: var(--bg); }
+.single-task-workers .wsettings-credentials { height: 100%; min-height: 0; overflow-y: auto; }
+.single-task-workers .wsettings-orchestration {
+  display: grid; height: 100%; min-height: 0;
+  grid-template-columns: minmax(300px, 344px) minmax(0, 1fr);
+}
+.single-task-workers .wsettings-skel-rail { display: flex; flex-direction: column; align-items: stretch; border-right: 1px solid var(--line); padding: 24px 16px; }
+.single-task-workers .wsettings-skeleton :is(.sk-label, .sk-row) { display: block; }
+@media (max-width: 1150px) {
+  .single-task-workers .wsettings-orchestration { grid-template-columns: 300px minmax(0, 1fr); }
+}
+@media (max-width: 960px) {
+  .single-task-workers .wsettings-skeleton { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); }
+
+}
+@media (max-width: 720px) {
+  .single-task-workers .wsettings-orchestration { grid-template-columns: minmax(0, 1fr); }
+
+}
+
+.single-task-workers .switch .switch__control { border: 1px solid var(--line); box-shadow: inset 0 0 0 1px var(--line2, #cdd3dc); }
+.single-task-workers .switch__thumb { box-shadow: 0 1px 2px rgba(0,0,0,.2); }
+
+.single-task-workers .wsettings-orchestration { overflow: hidden; }
+
+.single-task-workers .wsettings-draft { display: inline-flex; }
+
+
+.single-task-workers .runner-dispatch-list { grid-column: 1 / -1; min-width: 0; overflow-wrap: anywhere; }
+.single-task-workers .runner-dispatch-list summary { cursor: pointer; }
+.single-task-workers .runner-dispatch-list ul { padding-inline-start: 20px; }

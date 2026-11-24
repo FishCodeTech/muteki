@@ -2,6 +2,31 @@
 
 All notable public release changes are tracked here.
 
+## 0.5.0 - 2026-11-25
+
+### Changed
+
+- Replaced the Python/FastAPI application and Electron shell with the Rust service, Next.js 15 frontend and native macOS shell.
+- Added integrated Chat, CTF, competition, penetration-testing and SRC workspaces with shared Agent, evidence, approval, usage and project controls.
+- Split container execution into the Web service, an independently supervised Runner and curated Worker images.
+- Added native Web archives for macOS arm64, Linux amd64 and Linux arm64, plus multi-architecture Web and Worker container images.
+
+### Upgrade
+
+- Existing managed v0.4.7 Web installations can run `muteki upgrade v0.5.0`.
+- The released v0.4.7 updater downloads a small compatibility bridge, verifies the selected native archive by size and SHA-256, and switches only after the native command starts successfully.
+- Before switching, the bridge imports v0.4.7 configuration and history into an isolated Rust state directory while retaining the original data root for rollback.
+- The release workflow initializes the official v0.4.7 service, imports a sentinel record, performs the direct upgrade, starts the managed v0.5.0 Web service from migrated state, rolls back and repeats the upgrade.
+- Existing task data, credentials and installation metadata remain under the managed installation data root.
+- The v0.4.7 Docker Compose layout is not migrated by the managed Web command. Deploy the v0.5.0 Compose file with versioned `muteki-web` and `muteki-worker` images after draining active Workers.
+
+### Validation
+
+- Custom lint, TypeScript, ESLint, frontend property tests, Rust Clippy, Rust property tests and generated contracts passed.
+- The packaged macOS arm64 Web archive served API readiness, the application UI and static JavaScript.
+- Real-browser and native-desktop checks verified the v0.5.0 version page, including a 390px Web viewport.
+- Linux amd64/arm64 packages, containers and published image indexes are validated by the public release workflows.
+
 ## 0.4.7 - 2026-10-28
 
 ### Fixed

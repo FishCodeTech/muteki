@@ -1,41 +1,38 @@
 #!/usr/bin/env bash
-# Build the muteki worker image (ONE generic image — not a per-recipe tag).
-# Local development helper only — formal multi-arch release goes through
-# .github/workflows/release-images.yml (do not docker push GHCR from here).
-# Two steps:
-#   1) cross-compile the Go runtime-agent (supervisor) to
-#      docker/worker/runtime_agent-amd64 (the docker build context).
-#   2) docker build the amd64 image, tagging both the version and :latest.
-#
-# Usage: ./docker/worker/build.sh [repo] [version]
-#   repo:    image repository (default: muteki-worker; e.g. ghcr.io/fishcodetech/muteki-worker)
-#   version: version tag       (default: v0.4.7; GHCR release tags keep the leading v)
-# Tags built: <repo>:<version> AND <repo>:latest (code defaults to :latest).
 set -euo pipefail
 
 REPO_IMAGE="${1:-muteki-worker}"
-VERSION="${2:-v0.4.7}"
-TAG="${REPO_IMAGE}:${VERSION}"
-LATEST="${REPO_IMAGE}:latest"
+host_arch="$(uname -m)"
+case "$host_arch" in
+  arm64|aarch64) host_arch=arm64 ;;
+  x86_64|amd64) host_arch=amd64 ;;
+esac
+ARCH="${2:-$host_arch}"
+case "$ARCH" in
+  amd64|arm64) ;;
+  *) echo "unsupported architecture: $ARCH" >&2; exit 2 ;;
+esac
+TAG="${REPO_IMAGE}:latest"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
+python3 "$REPO/scripts/prepare_worker_capabilities.py"
 
-echo ">> [1/3] cross-compiling runtime-agent (linux/amd64, static)..."
-RUNTIME_AGENT="$HERE/runtime_agent-amd64"
+echo ">> [1/3] cross-compiling runtime-agent (linux/$ARCH, static)..."
+RUNTIME_AGENT="$HERE/runtime_agent-$ARCH"
 if command -v go >/dev/null 2>&1; then
-  CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+  CGO_ENABLED=0 GOOS=linux GOARCH="$ARCH" \
     go build -C "$REPO/cmd/runtime-agent" -trimpath -ldflags="-s -w" \
       -o "$RUNTIME_AGENT" .
 else
-  echo ">> host Go unavailable; compiling with golang:1.26-bookworm..."
+  echo ">> host Go unavailable; compiling with golang:latest..."
   docker run --rm \
     --user "$(id -u):$(id -g)" \
-    -e CGO_ENABLED=0 -e GOOS=linux -e GOARCH=amd64 \
+    -e CGO_ENABLED=0 -e GOOS=linux -e GOARCH="$ARCH" \
     -e GOCACHE=/tmp/go-cache -e GOMODCACHE=/tmp/go-mod \
     -v "$REPO:/src" -w /src/cmd/runtime-agent \
-    golang:1.26-bookworm \
+    golang:latest \
     go build -trimpath -ldflags="-s -w" \
-      -o /src/docker/worker/runtime_agent-amd64 .
+      -o "/src/docker/worker/runtime_agent-$ARCH" .
 fi
 ls -la "$RUNTIME_AGENT"
 file "$RUNTIME_AGENT" 2>/dev/null || true
@@ -43,26 +40,10 @@ file "$RUNTIME_AGENT" 2>/dev/null || true
 echo ">> syncing muteki-blackboard skill into docker build context..."
 cp "$REPO/skills/muteki-blackboard/SKILL.md" "$HERE/blackboard.SKILL.md"
 cp "$REPO/skills/muteki-blackboard/blackboard.py" "$HERE/blackboard.py"
-cp "$REPO/muteki/solver/offline_acp_bridge.py" "$HERE/offline_acp_bridge.py"
-cp "$REPO/muteki/solver/omp_offline_config.yml" "$HERE/omp_offline_config.yml"
-cp "$REPO/muteki/solver/kimi_offline_agent.md" "$HERE/kimi_offline_agent.md"
-cp "$REPO/muteki/solver/grok_offline_agent.md" "$HERE/grok_offline_agent.md"
-rm -rf -- "$HERE/muteki-runtime"
-mkdir -p "$HERE/muteki-runtime"
-cp -R "$REPO/muteki" "$HERE/muteki-runtime/muteki"
 chmod +x "$HERE/blackboard.py"
 
-# --platform linux/amd64 (full form, not the "amd64" shorthand) + --load forces the
-# docker exporter into the local image store. On arm64 Docker Desktop with the
-# containerd image store, the default OCI exporter has hit "operating system is not
-# supported" at load time for this image even after layers export fine; --load avoids
-# that path. If your build still trips it, see the docker-load fallback note below.
-echo ">> [2/3] docker build --platform linux/amd64 --load -t $TAG -t $LATEST $HERE ..."
-build_args=(--build-arg "IMAGE_VERSION=${VERSION}")
-# Docker build stages cannot reach a proxy bound to the host loopback address.
-# Forward the developer shell's proxy through Docker Desktop's stable host name.
-# apt reads the lowercase variables while several installers read the uppercase
-# variants, so always populate both spellings from whichever one the shell has.
+echo ">> [2/3] docker build --platform linux/$ARCH --load -t $TAG $HERE ..."
+build_args=()
 http_proxy_value="${http_proxy:-${HTTP_PROXY:-}}"
 https_proxy_value="${https_proxy:-${HTTPS_PROXY:-}}"
 all_proxy_value="${all_proxy:-${ALL_PROXY:-}}"
@@ -102,13 +83,14 @@ fi
 if [[ -n "${MUTEKI_NPM_REGISTRY:-}" ]]; then
   build_args+=(--build-arg "NPM_REGISTRY=${MUTEKI_NPM_REGISTRY}")
 fi
-docker build --platform linux/amd64 --load \
+if [[ -n "${MUTEKI_PIP_INDEX_URL:-}" ]]; then
+  build_args+=(--build-arg "PIP_INDEX_URL=${MUTEKI_PIP_INDEX_URL}")
+fi
+docker build --pull --platform "linux/$ARCH" --load \
   "${build_args[@]}" \
-  -t "$TAG" -t "$LATEST" "$HERE"
+  -t "$TAG" "$HERE"
 
-echo ">> [3/3] verifying ten container engines + core tools..."
-DIGEST="$(docker image inspect --format '{{.Id}}' "$TAG")"
-echo ">> image id: $DIGEST"
-"$REPO/scripts/verify_worker_image.sh" --image "$TAG" --variant full --platform linux/amd64 \
+echo ">> [3/3] verifying nine container engines + core tools..."
+"$REPO/scripts/verify_worker_image.sh" --image "$TAG" --variant curated --platform "linux/$ARCH" \
   --versions-file "$HERE/.last-engine-versions.txt"
-echo ">> done: $TAG (+ $LATEST); 10 engines + core tools verified (local helper only — formal release uses release-images.yml)"
+echo ">> done: $TAG; 9 engines + core tools verified (local helper only — formal release uses release-images.yml)"

@@ -1,0 +1,80 @@
+name: Tcode
+
+options:
+  bundleIdPrefix: com.tryanks
+  deploymentTarget:
+    iOS: "27.0"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    IPHONEOS_DEPLOYMENT_TARGET: "27.0"
+    MARKETING_VERSION: "1.0.0"
+    TARGETED_DEVICE_FAMILY: "1,2"
+    ENABLE_USER_SCRIPT_SANDBOXING: NO
+    CODE_SIGN_STYLE: Automatic
+    DEVELOPMENT_TEAM: ""
+
+targets:
+  Tcode:
+    type: application
+    platform: iOS
+    deploymentTarget: "27.0"
+    sources:
+      - path: Sources
+      - path: ../../client/src/speech/apple/Transcription.swift
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.tryanks.tcode
+        PRODUCT_NAME: Tcode
+        INFOPLIST_FILE: Sources/Info.plist
+        SWIFT_OBJC_BRIDGING_HEADER: Sources/BridgingHeader.h
+        EXCLUDED_ARCHS[sdk=iphonesimulator*]: x86_64
+        ONLY_ACTIVE_ARCH: YES
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        LIBRARY_SEARCH_PATHS:
+          - "$(PROJECT_DIR)/lib"
+        DEAD_CODE_STRIPPING: NO
+        OTHER_LDFLAGS:
+          - "-force_load"
+          - "$(PROJECT_DIR)/lib/libtcode_ios.a"
+          - "-framework"
+          - UIKit
+          - "-framework"
+          - Foundation
+          - "-framework"
+          - AVFoundation
+          - "-framework"
+          - Speech
+          - "-framework"
+          - QuartzCore
+          - "-framework"
+          - Metal
+          - "-framework"
+          - MetalKit
+          - "-framework"
+          - CoreText
+          - "-framework"
+          - CoreGraphics
+          - "-framework"
+          - CoreFoundation
+          - "-framework"
+          - IOSurface
+          - "-framework"
+          - Security
+          - "-framework"
+          - Network
+          # netdev and system-configuration read DNS and proxy settings from
+          # SCDynamicStore.
+          - "-framework"
+          - SystemConfiguration
+          - "-lc++"
+
+schemes:
+  Tcode:
+    build:
+      targets:
+        Tcode: all
+    run:
+      config: Debug

@@ -1,0 +1,5 @@
+The paired-line projection, context folding and word-emphasis algorithms in
+rows.rs and model.rs are adapted from GPUI Kit 0.7.3's diff component
+(https://github.com/longbridge/gpui-kit), licensed under Apache-2.0.
+Tcode owns the implementation, host text loading, notices and review integration.
+The modified implementation is distributed with the Apache license in this folder.

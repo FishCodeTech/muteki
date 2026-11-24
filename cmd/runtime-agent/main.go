@@ -1,16 +1,3 @@
-// runtime-agent — muteki's in-container Runtime Control Plane supervisor.
-//
-// It is the container's PID1 (ENTRYPOINT). It does NOT listen on any port. At startup
-// it DIALS the host's control receiver (host.docker.internal:<port>), sends a Hello
-// with {run_id, token}, and then serves the host's commands on that one connection:
-// StartWorker / Signal / Status / TeardownRun / Health. It is a DUMB EXECUTOR — it
-// forks workers, forwards their raw output, routes signals, reports status. It does
-// NOT touch flag judgment, fact provenance, graph writes, or key lookups; those stay
-// in the backend (§8). It opens NO port, so the worker (trusted, runs as kali+sudo)
-// has no entry point to drive it — the reverse-connect model is what makes it a true
-// "controlled端" rather than a network service.
-//
-// Single static binary, standard library only (CGO_ENABLED=0).
 package main
 
 import (
@@ -21,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"net"
 	"os"
@@ -32,7 +20,7 @@ import (
 	"time"
 )
 
-const agentVersion = "muteki-runtime-agent/2"
+const agentVersion = "muteki-runtime-agent/4"
 
 var startedAt = time.Now()
 
@@ -41,32 +29,36 @@ type supervisor struct {
 	sharedPool bool
 	token      string
 	workspace  string
+	tempDir    string
 
-	// the single reverse connection to the host + a write mutex (all worker streams
-	// multiplex onto it, so writes must be serialized).
 	connMu      sync.Mutex
 	enc         *json.Encoder
-	helloReader *bufio.Reader // buffered reader positioned past the Hello handshake
+	helloReader *bufio.Reader
 
-	mu      sync.Mutex
-	workers map[string]*worker
-	owners  map[string]sharedOwner
-	seq     int
+	mu            sync.Mutex
+	workers       map[string]*worker
+	owners        map[string]sharedOwner
+	seq           int
+	lease         executionLease
+	streams       sync.WaitGroup
+	scopedWorkers map[string]scopedWorker
 }
 
 type sharedOwner struct {
 	token     string
 	workspace string
+	scope     *runScope
 }
 
 func main() {
+	scopeMode := flag.Bool("scope-child", false, "internal Run subreaper control over inherited pipes")
+	leaseRequired := flag.Bool("lease-required", false, "require renewable remote execution lease")
 	connect := flag.String("connect", "", "host control receiver host:port to dial (e.g. host.docker.internal:9100). Required.")
 	runID := flag.String("run-id", "", "this run's id, sent in the Hello frame")
 	sharedPool := flag.Bool("shared-pool", false, "serve multiple explicitly trusted Runs")
 	tokenPath := flag.String("token", "", "path to the per-run token file (default: /run/muteki/control/token)")
 	tokenInline := flag.String("token-value", "", "the per-run token directly (overrides --token file)")
 	workspace := flag.String("workspace", "/home/kali/workspace", "worker workspace (mount target)")
-	// kept for backward-compat with the baked ENTRYPOINT (--sock ... is ignored now).
 	_ = flag.String("sock", "", "(ignored — reverse-connect model uses --connect)")
 	_ = flag.String("addr", "", "(ignored — reverse-connect model uses --connect)")
 	flag.Parse()
@@ -74,7 +66,16 @@ func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	log.SetPrefix("[runtime-agent] ")
 
-	resolveKali()
+	if *scopeMode {
+		os.Exit(scopeChild(*runID, *workspace))
+	}
+	if *sharedPool && os.Getpid() != 1 {
+		log.Fatal("Shared runtime agent must be container PID1")
+	}
+	if os.Geteuid() != 0 {
+		log.Fatal("Runtime Agent must run as container root")
+	}
+	resolveWorkspaceOwner()
 
 	s := &supervisor{
 		runID:      *runID,
@@ -84,7 +85,20 @@ func main() {
 		owners:     map[string]sharedOwner{},
 	}
 
-	// Token: inline value wins, else read the file.
+	if *leaseRequired {
+		s.lease.initialize(time.Now())
+		go func() {
+			ticker := time.NewTicker(50 * time.Millisecond)
+			defer ticker.Stop()
+			for now := range ticker.C {
+				if s.lease.expired(now) {
+					log.Print("execution lease expired; exiting container")
+					os.Exit(75)
+				}
+			}
+		}()
+	}
+
 	if *tokenInline != "" {
 		s.token = strings.TrimSpace(*tokenInline)
 	} else {
@@ -95,38 +109,20 @@ func main() {
 		s.token = s.readToken(tp)
 	}
 
-	// The host bind-mounts the workspace dir created by the (root) web process, so
-	// it lands here owned by root:root. The worker runs as kali and writes its cwd
-	// (codex app-server state, claude session/config, PoC files) DIRECTLY in the
-	// workspace root — a root-owned root makes every such write fail with EACCES
-	// ("could not create PATH aliases: Permission denied" for codex; a silent
-	// no-output for claude). Chown the workspace root to kali BEFORE seeding/working
-	// so the worker owns its own cwd. (seedWorkspaceDocs already chowns the files it
-	// writes; this fixes the directory the host handed us.)
 	s.chownWorkspaceRoot()
+	stopOwnership := s.maintainWorkspaceOwnership()
+	defer stopOwnership()
 
-	// Bootstrap the workspace tool-awareness files (坑 A): the host bind-mounts an
-	// (initially empty) workspace over /home/kali/workspace, shadowing anything baked
-	// there. We cp the baked /opt/muteki/{AGENTS,CLAUDE}.md in AFTER the mount so the
-	// CLIs auto-read them. Muteki-managed docs carry a version marker and are upgraded
-	// in place; operator-owned files without the marker are never overwritten.
 	if !s.sharedPool {
 		s.seedWorkspaceDocs()
 	}
 
-	// Reap-on-signal: as PID1, handle TERM/INT so `docker stop` is graceful.
-	// Managed workers retain Cmd.Wait as their sole reaper; SIGCHLD only reaps
-	// adopted, unregistered descendants (see childReaper).
 	_ = s.installSignalHandlers(os.Exit)
 
 	if *connect == "" {
 		log.Fatalf("no --connect host:port given (reverse-connect model requires it)")
 	}
 
-	// Dial the host receiver, retrying until it's up (the backend may start the
-	// receiver a moment after `docker run`). The connection is the lifeline; if it
-	// drops, the run is over (the host treats a dropped connection as degraded), so
-	// we exit and let `docker rm -f` clean up rather than silently re-dialing forever.
 	conn := s.dialHost(*connect, 60*time.Second)
 	if conn == nil {
 		log.Fatalf("could not reach host control receiver at %s", *connect)
@@ -139,8 +135,6 @@ func main() {
 	log.Printf("control connection closed; exiting")
 }
 
-// dialHost dials the host receiver and completes the Hello handshake. Returns the
-// live connection or nil on failure after the deadline.
 func (s *supervisor) dialHost(addr string, deadline time.Duration) net.Conn {
 	t0 := time.Now()
 	for time.Since(t0) < deadline {
@@ -149,7 +143,6 @@ func (s *supervisor) dialHost(addr string, deadline time.Duration) net.Conn {
 			time.Sleep(500 * time.Millisecond)
 			continue
 		}
-		// send Hello, await HelloAck.
 		enc := json.NewEncoder(conn)
 		if err := enc.Encode(Hello{Hello: 1, RunID: s.runID, Token: s.token, Version: agentVersion}); err != nil {
 			conn.Close()
@@ -167,14 +160,10 @@ func (s *supervisor) dialHost(addr string, deadline time.Duration) net.Conn {
 		if json.Unmarshal(trimNL(line), &ack) != nil || !ack.OK {
 			log.Printf("host rejected hello: %s", strings.TrimSpace(string(line)))
 			conn.Close()
-			return nil // auth failure is terminal, don't retry
+			return nil
 		}
-		// The bootstrap token is a one-shot capability.  Once the host has accepted
-		// Hello, the authenticated socket replaces it as the control authority; do
-		// not retain a replayable copy for the lifetime of the supervisor.
 		s.token = ""
 		s.enc = enc
-		// stash the reader so serve() continues from where Hello left off.
 		s.helloReader = r
 		return conn
 	}
@@ -191,7 +180,11 @@ func (s *supervisor) serve(conn net.Conn) {
 		if len(line) > 0 {
 			var req Request
 			if json.Unmarshal(trimNL(line), &req) == nil {
-				s.dispatch(&req)
+				if s.sharedPool && req.Op == OpTeardownRun {
+					go s.dispatch(&req)
+				} else {
+					s.dispatch(&req)
+				}
 			}
 		}
 		if err != nil {
@@ -203,13 +196,16 @@ func (s *supervisor) serve(conn net.Conn) {
 	}
 }
 
-// dispatch handles one host command. StartWorker runs the worker and streams its
-// frames asynchronously (so the control connection keeps accepting commands); the
-// others reply synchronously.
 func (s *supervisor) dispatch(req *Request) {
+	if s.sharedPool && (req.Op == OpSignal || req.Op == OpStatus || req.Op == OpWriteStdin) {
+		s.routeScopedControl(req)
+		return
+	}
 	switch req.Op {
 	case OpStartWorker:
 		s.opStartWorker(req)
+	case OpWriteStdin:
+		s.opWriteStdin(req)
 	case OpRegisterRun:
 		s.opRegisterRun(req)
 	case OpSignal:
@@ -221,21 +217,28 @@ func (s *supervisor) dispatch(req *Request) {
 			if req.OwnerRunID == "" {
 				s.send(Frame{T: "resp", ReqID: req.ReqID, OK: false})
 			} else {
-				s.send(Frame{T: "resp", ReqID: req.ReqID, OK: s.killOwned(req.OwnerRunID, req.OwnerToken)})
+				s.send(Frame{T: "resp", ReqID: req.ReqID, OK: s.killOwned(req.OwnerRunID, req.OwnerToken), ScopedTeardown: true})
 			}
 		} else {
 			s.killAll()
 			s.send(Frame{T: "resp", ReqID: req.ReqID, OK: true})
 		}
+	case OpRenewLease:
+		err := s.lease.renew(time.Now(), req.LeaseMillis, req.LeaseExpiresAt)
+		frame := Frame{T: "resp", ReqID: req.ReqID, OK: err == nil, ExecutionLease: true}
+		if err != nil {
+			frame.Error = err.Error()
+		}
+		s.send(frame)
 	case OpHealth:
 		s.opHealth(req)
+	case OpVerifyOutput:
+		s.opVerifyOutput(req)
 	default:
 		s.send(Frame{T: "resp", ReqID: req.ReqID, OK: false})
 	}
 }
 
-// send serializes one frame onto the shared connection (worker streams + command
-// replies all funnel through here, so the mutex prevents interleaved JSON).
 func (s *supervisor) send(f Frame) {
 	s.connMu.Lock()
 	defer s.connMu.Unlock()
@@ -245,6 +248,10 @@ func (s *supervisor) send(f Frame) {
 }
 
 func (s *supervisor) opStartWorker(req *Request) {
+	if !s.lease.admits(time.Now()) {
+		s.send(Frame{T: "started", ReqID: req.ReqID, Error: "execution lease is not active"})
+		return
+	}
 	if req.Spec == nil {
 		s.send(Frame{T: "started", ReqID: req.ReqID, Error: "missing spec"})
 		return
@@ -262,16 +269,36 @@ func (s *supervisor) opStartWorker(req *Request) {
 			s.send(Frame{T: "started", ReqID: req.ReqID, Error: "invalid shared Run workspace ownership"})
 			return
 		}
-		s.seedWorkspaceDocsAt(owner)
+		if registered.scope == nil {
+			s.send(Frame{T: "started", ReqID: req.ReqID, Error: "Run subreaper is unavailable"})
+			return
+		}
+		if err := registered.scope.forward(req); err != nil {
+			s.send(Frame{T: "started", ReqID: req.ReqID, Error: err.Error()})
+		}
+		return
 	} else {
 		req.Spec.OwnerRunID = s.runID
 	}
+	if s.tempDir != "" {
+		if req.Spec.Env == nil {
+			req.Spec.Env = map[string]string{}
+		}
+		for _, key := range []string{"TMPDIR", "TMP", "TEMP", "MUTEKI_RUN_TEMP_DIR"} {
+			req.Spec.Env[key] = s.tempDir
+		}
+	}
 	s.mu.Lock()
 	s.seq++
-	id := "w-" + itoa(s.seq) + "-" + shortRand()
+	scopeHash := sha256.Sum256([]byte(s.runID))
+	nonce := shortRand()
+	id := fmt.Sprintf("w-%x-%s-%s", scopeHash[:16], itoa(s.seq), nonce)
 	s.mu.Unlock()
+	if nonce == "" {
+		s.send(Frame{T: "started", ReqID: req.ReqID, Error: "Worker identity entropy unavailable"})
+		return
+	}
 
-	// Ensure the tool-awareness docs are in place right before a worker starts.
 	if !s.sharedPool {
 		s.seedWorkspaceDocs()
 	}
@@ -285,17 +312,16 @@ func (s *supervisor) opStartWorker(req *Request) {
 	s.workers[id] = w
 	s.mu.Unlock()
 
-	// started ack carries the worker id; the host keys subsequent frames on it.
 	s.send(Frame{T: "started", ReqID: req.ReqID, WorkerID: id, Tag: req.Spec.Tag})
 
-	// pump this worker's events onto the shared connection, tagged with worker id.
+	s.streams.Add(1)
 	go func(id string, reqID int64) {
 		for ev := range events {
 			ev.ReqID = reqID
 			ev.WorkerID = id
 			s.send(ev)
 		}
-		// drop from registry after a grace so a late Status still sees terminal state.
+		s.streams.Done()
 		time.Sleep(30 * time.Second)
 		s.mu.Lock()
 		delete(s.workers, id)
@@ -315,26 +341,66 @@ func (s *supervisor) opRegisterRun(req *Request) {
 		return
 	}
 	s.mu.Lock()
+	previous, exists := s.owners[req.OwnerRunID]
+	s.mu.Unlock()
+	if exists {
+		ok := previous.token == req.OwnerToken && previous.workspace == owner && previous.scope != nil
+		if ok {
+			previous.scope.mu.Lock()
+			ok = !previous.scope.stopping
+			previous.scope.mu.Unlock()
+			select {
+			case <-previous.scope.done:
+				ok = false
+			default:
+			}
+		}
+		s.send(Frame{T: "resp", ReqID: req.ReqID, OK: ok})
+		return
+	}
+	scope, err := s.startRunScope(req.OwnerRunID, req.OwnerToken, owner)
+	if err != nil {
+		s.send(Frame{T: "resp", ReqID: req.ReqID, Error: err.Error()})
+		return
+	}
+	s.mu.Lock()
 	if s.owners == nil {
 		s.owners = map[string]sharedOwner{}
 	}
-	previous, exists := s.owners[req.OwnerRunID]
-	ok := !exists || (previous.token == req.OwnerToken && previous.workspace == owner)
-	if ok {
-		s.owners[req.OwnerRunID] = sharedOwner{token: req.OwnerToken, workspace: owner}
-	}
+	s.owners[req.OwnerRunID] = sharedOwner{token: req.OwnerToken, workspace: owner, scope: scope}
 	s.mu.Unlock()
-	s.send(Frame{T: "resp", ReqID: req.ReqID, OK: ok})
+	s.send(Frame{T: "resp", ReqID: req.ReqID, OK: true})
 }
 
 func (s *supervisor) opSignal(req *Request) {
 	w := s.lookup(req.WorkerID)
 	if w == nil {
-		s.send(Frame{T: "resp", ReqID: req.ReqID, OK: false})
+		s.send(Frame{T: "resp", ReqID: req.ReqID, OK: false, Error: "worker unavailable"})
 		return
 	}
-	ok := w.signal(strings.ToUpper(req.Signal)) == nil
-	s.send(Frame{T: "resp", ReqID: req.ReqID, OK: ok})
+	if s.sharedPool && (req.OwnerRunID != w.ownerRunID || req.OwnerToken != w.ownerToken) {
+		s.send(Frame{T: "resp", ReqID: req.ReqID, OK: false, Error: "shared worker ownership mismatch"})
+		return
+	}
+	if err := w.signal(strings.ToUpper(req.Signal)); err != nil {
+		s.send(Frame{T: "resp", ReqID: req.ReqID, OK: false, Error: err.Error()})
+		return
+	}
+	state, rc, paused, _, _ := w.status()
+	s.send(Frame{T: "resp", ReqID: req.ReqID, OK: true, State: state, RcPtr: rc, Paused: paused})
+}
+
+func (s *supervisor) opWriteStdin(req *Request) {
+	w := s.lookup(req.WorkerID)
+	if w == nil {
+		s.send(Frame{T: "resp", ReqID: req.ReqID, OK: false, Error: "worker unavailable"})
+		return
+	}
+	if err := w.writeStdin(req.Data); err != nil {
+		s.send(Frame{T: "resp", ReqID: req.ReqID, OK: false, Error: err.Error()})
+		return
+	}
+	s.send(Frame{T: "resp", ReqID: req.ReqID, OK: true})
 }
 
 func (s *supervisor) opStatus(req *Request) {
@@ -347,6 +413,28 @@ func (s *supervisor) opStatus(req *Request) {
 	s.send(Frame{T: "resp", ReqID: req.ReqID, OK: true, State: state, RcPtr: rc, Paused: paused})
 }
 
+func (s *supervisor) opVerifyOutput(req *Request) {
+	w := s.lookup(req.WorkerID)
+	if w == nil {
+		s.send(Frame{T: "resp", ReqID: req.ReqID, OK: false, Error: "worker unavailable"})
+		return
+	}
+	if s.sharedPool && (req.OwnerRunID != w.ownerRunID || req.OwnerToken != w.ownerToken) {
+		s.send(Frame{T: "resp", ReqID: req.ReqID, OK: false, Error: "shared worker ownership mismatch"})
+		return
+	}
+	matched, total, shaHex, excerpt := w.verifyOutput(req.Needle)
+	s.send(Frame{
+		T:          "resp",
+		ReqID:      req.ReqID,
+		OK:         true,
+		MatchFound: matched,
+		RingBytes:  total,
+		RingSHA256: shaHex,
+		Excerpt:    excerpt,
+	})
+}
+
 func (s *supervisor) opHealth(req *Request) {
 	s.mu.Lock()
 	n := 0
@@ -355,11 +443,18 @@ func (s *supervisor) opHealth(req *Request) {
 			n++
 		}
 	}
+	for _, worker := range s.scopedWorkers {
+		if worker.running {
+			n++
+		}
+	}
 	s.mu.Unlock()
+	total, available, sampled := hostMemory()
 	s.send(Frame{
+		MemorySampled: sampled, HostMemoryTotal: total, HostMemoryAvailable: available,
 		T: "resp", ReqID: req.ReqID, OK: true, Version: agentVersion,
-		ScopedTeardown: true,
-		Workers:        n, Uptime: int64(time.Since(startedAt).Seconds()),
+		ScopedTeardown: true, ExecutionLease: true, ScopedProcesses: supportsRunSubreaper(),
+		Workers: n, Uptime: int64(time.Since(startedAt).Seconds()),
 	})
 }
 
@@ -369,62 +464,96 @@ func (s *supervisor) readToken(path string) string {
 		log.Printf("no token file at %s (%v) — cannot authenticate", path, err)
 		return ""
 	}
-	// Unlink immediately after the root supervisor reads it, before any worker can
-	// be started.  The bind-mounted bootstrap directory remains, but is empty.
 	token := strings.TrimSpace(string(data))
 	for i := range data {
 		data[i] = 0
 	}
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-		// Fail closed: retaining a replayable file until workers start would defeat
-		// the private one-shot bootstrap boundary.
 		log.Printf("could not remove bootstrap token %s: %v", path, err)
 		return ""
 	}
 	return token
 }
 
-// chownWorkspaceRoot makes the bind-mounted workspace directory owned by the kali
-// user the worker runs as. The host (root) created and mounted it root:root, which
-// would block every cwd write the worker CLI does. Best-effort: log and continue if
-// kali isn't resolvable or chown fails (e.g. unusual mount) — the worker may still
-// manage in some cases, and we don't want to abort the supervisor over it.
 func (s *supervisor) chownWorkspaceRoot() {
-	if kaliUID < 0 || kaliGID < 0 {
+	if workspaceUID < 0 || workspaceGID < 0 {
 		return
 	}
 	if err := os.MkdirAll(s.workspace, 0o755); err != nil {
 		log.Printf("chown workspace: mkdir %s: %v", s.workspace, err)
 		return
 	}
-	if err := os.Chown(s.workspace, kaliUID, kaliGID); err != nil {
-		log.Printf("chown workspace %s -> kali(%d:%d): %v", s.workspace, kaliUID, kaliGID, err)
+	if err := os.Chown(s.workspace, workspaceUID, workspaceGID); err != nil {
+		log.Printf("chown workspace %s -> workspace owner(%d:%d): %v", s.workspace, workspaceUID, workspaceGID, err)
 		return
 	}
-	log.Printf("chowned workspace %s to kali(%d:%d)", s.workspace, kaliUID, kaliGID)
+	log.Printf("chowned workspace %s to workspace owner(%d:%d)", s.workspace, workspaceUID, workspaceGID)
 }
 
-// workspaceDocMarker prefixes Muteki-managed AGENTS.md / CLAUDE.md. Operator-owned
-// files without this marker are never overwritten on image upgrade.
+func (s *supervisor) maintainWorkspaceOwnership() func() {
+	if workspaceUID == 0 && workspaceGID == 0 {
+		return func() {}
+	}
+	done := make(chan struct{})
+	stopped := make(chan struct{})
+	handoff := func() {
+		root, err := os.OpenRoot(s.workspace)
+		if err != nil {
+			log.Printf("workspace ownership: %v", err)
+			return
+		}
+		defer root.Close()
+		err = fs.WalkDir(root.FS(), ".", func(name string, entry fs.DirEntry, walkErr error) error {
+			if os.IsNotExist(walkErr) {
+				return nil
+			}
+			if walkErr != nil {
+				return walkErr
+			}
+			info, err := entry.Info()
+			if os.IsNotExist(err) {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			stat, ok := info.Sys().(*syscall.Stat_t)
+			if !ok || (int(stat.Uid) == workspaceUID && int(stat.Gid) == workspaceGID) {
+				return nil
+			}
+			err = root.Lchown(name, workspaceUID, workspaceGID)
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return err
+		})
+		if err != nil {
+			log.Printf("workspace ownership handoff incomplete: %v", err)
+		}
+	}
+	go func() {
+		defer close(stopped)
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				handoff()
+			case <-done:
+				handoff()
+				return
+			}
+		}
+	}()
+	return func() { close(done); <-stopped }
+}
+
 const workspaceDocMarker = "<!-- muteki-workspace-doc:"
 
 func managedWorkspaceDoc(data []byte) bool {
-	if bytes.HasPrefix(data, []byte(workspaceDocMarker)) {
-		return true
-	}
-	// Exact former baked guides only; ordinary operator notes remain untouched.
-	// The second digest is the guide shipped in the v0.3.2 full/slim images.
-	switch fmt.Sprintf("%x", sha256.Sum256(data)) {
-	case "121761a2406c6e363bab817b9b954582d4485bdca902b21b55827f344ee334ac",
-		"670954408282afece055035a4139f03a3a8b49f7c378dc8c988aeffe812f4b8c":
-		return true
-	default:
-		return false
-	}
+	return bytes.HasPrefix(data, []byte(workspaceDocMarker))
 }
 
-// seedManagedWorkspaceDoc writes or upgrades one Muteki-managed workspace doc.
-// Returns: "seeded", "upgraded", "unchanged", "skip-operator", or "skip-missing-src".
 func seedManagedWorkspaceDoc(workspace, name string, srcData []byte) (string, error) {
 	if len(srcData) == 0 {
 		return "skip-missing-src", nil
@@ -473,8 +602,8 @@ func seedManagedWorkspaceDoc(workspace, name string, srcData []byte) (string, er
 	if err = os.Rename(tmp.Name(), dst); err != nil {
 		return "", err
 	}
-	if kaliUID >= 0 {
-		_ = os.Chown(dst, kaliUID, kaliGID)
+	if workspaceUID >= 0 {
+		_ = os.Chown(dst, workspaceUID, workspaceGID)
 	}
 	if existed {
 		return "upgraded", nil
@@ -530,57 +659,32 @@ func pathWithin(child, parent string) bool {
 
 func (s *supervisor) killOwned(ownerRunID, ownerToken string) bool {
 	s.mu.Lock()
-	registered, active := s.owners[ownerRunID]
-	if active && registered.token != ownerToken {
-		s.mu.Unlock()
-		return false
-	}
-	ws := make([]*worker, 0)
-	for _, w := range s.workers {
-		if w.ownerRunID == ownerRunID {
-			if !active || w.ownerToken != ownerToken {
-				if state, _, _, _, _ := w.status(); state == "running" {
-					s.mu.Unlock()
-					return false
-				}
-				continue
-			}
-			ws = append(ws, w)
-		}
-	}
-	if !active {
-		s.mu.Unlock()
+	owner, exists := s.owners[ownerRunID]
+	s.mu.Unlock()
+	if !exists {
 		return true
 	}
-	s.mu.Unlock()
-	for _, w := range ws {
-		if state, _, _, _, _ := w.status(); state == "running" {
-			_ = w.signal("KILL")
+	if owner.token != ownerToken || owner.scope == nil {
+		return false
+	}
+	if err := owner.scope.stop(); err != nil {
+		s.scopeFailure(ownerRunID, err.Error())
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if current, ok := s.owners[ownerRunID]; !ok || current.scope != owner.scope {
+		return false
+	}
+	delete(s.owners, ownerRunID)
+	for id, worker := range s.scopedWorkers {
+		if worker.scope == owner.scope {
+			delete(s.scopedWorkers, id)
 		}
 	}
-	deadline := time.Now().Add(15 * time.Second)
-	for time.Now().Before(deadline) {
-		allExited := true
-		for _, w := range ws {
-			if state, _, _, _, _ := w.status(); state == "running" {
-				allExited = false
-				break
-			}
-		}
-		if allExited {
-			s.mu.Lock()
-			delete(s.owners, ownerRunID)
-			s.mu.Unlock()
-			return true
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	return false
+	return true
 }
 
-// installSignalHandlers installs the same signal path used by production and
-// returns a stopper for integration tests. exit is injectable so tests never call
-// os.Exit while still exercising real SIGCHLD delivery.
 func (s *supervisor) installSignalHandlers(exit func(int)) func() {
 	sigc := make(chan os.Signal, 16)
 	done := make(chan struct{})

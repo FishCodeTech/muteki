@@ -1,0 +1,192 @@
+# What a user does and sees (compat/apps.rs): each case after its tap.
+# mod-standard-access
+tap id:case-mod-standard-access
+# What the app did not declare rejects with ERR_ACCESS_DENIED; wrong uses
+# with a TypeError (a bad URL of the global WebSocket throws SyntaxError).
+expect Standard grants files=true tcp=true websocket=true global=true
+covers [fs/promises] default
+covers [fs/promises] readFile
+covers [fs/promises] writeFile
+covers [fs/promises] readdir
+covers [fs/promises] exists
+covers [fs/promises] unlink
+covers [fs/promises] rmdir
+covers [fs/promises] mkdir
+covers [fs/promises] stat
+covers [fs/promises] lstat
+covers [fs/promises] rename
+covers [fs/promises] readlink
+covers [net] default
+covers [net] connect
+covers [websocket] WebSocket
+covers [globals] WebSocket
+covers [net] Socket
+covers [websocket] WebSocketConnection
+# mod-accessibility
+tap id:case-mod-accessibility
+# no screen reader and asks for no less motion.
+expect Screen reader: false
+expect Reduce motion: false
+expect Calls: not called
+tap id:call
+expect Calls: done
+covers [nsh] announce
+covers [nsh] setAccessibilityFocus
+covers [nsh] reduceMotion
+covers [nsh] screenReaderEnabled
+# mod-android
+tap id:case-mod-android
+# nsh/mobile's BackHandler does nothing there and the app runs on.
+expect Android: false
+expect Exit: function
+expect Calls: not called
+tap id:call
+expect Calls: done, remove function
+covers [nsh/mobile] BackHandler
+# mod-clipboard
+tap id:case-mod-clipboard
+# the headless runtime: writes go through, reads are promises that stay
+# pending (and none fails).
+expect Calls: not called
+expect Failed: none
+tap id:copy
+expect Calls: 5 promises
+wait 300
+expect Failed: none
+covers [nsh] Clipboard
+# mod-picker
+tap id:case-mod-picker
+# a pick is a promise that never throws: options out of range reject it with
+# a RangeError; a pick no picker answers there stays pending.
+expect Picked: not picked
+tap id:pick
+expect Refused: rejected RangeError
+expect Picked: pending
+wait 300
+expect Picked: pending
+covers [nsh] Picker
+# mod-desktop
+tap id:case-mod-desktop
+# no title bar area, the window and menu functions do nothing, and a popup
+# closes at once.
+expect Desktop: false
+expect Title bar: 0 0 0
+expect Calls: not called
+expect Popup: not shown
+tap id:window
+expect Calls: window done, close function, minimize function
+tap id:menu
+expect Calls: menu done
+expect Popup: closed
+tap id:toggles
+expect Calls: toggles done
+covers [nsh/desktop] isAvailable
+covers [nsh/desktop] titleBar
+covers [nsh/desktop] Window
+covers [nsh/desktop] Menu
+# mod-device
+tap id:case-mod-device
+# iOS phone at 1 pixel per point, in the light scheme.
+expect OS: ios
+expect Idiom: phone
+expect Catalyst: false
+expect Version: 0.0
+expect Select: ios
+expect Select mobile: mobile
+expect Ratio: 1
+expect Font scale: 1
+expect Window: 390x844
+expect Scheme: light
+tap id:dark
+expect Scheme: dark
+absent Scheme: light
+tap id:system
+expect Scheme: light
+# openUrl: a promise for a web page, rejected with a TypeError for a
+# `javascript:` URL.
+expect Open: not opened
+tap id:open
+expect Open: function, refused TypeError
+covers [nsh] openUrl
+covers [nsh] platform
+covers [nsh] pixelRatio
+covers [nsh] colorScheme
+covers [nsh] setColorScheme
+covers [nsh] fontScale
+covers [nsh] windowSize
+# mod-host-channel
+tap id:case-mod-host-channel
+# no embedding app: no parameters, posts go nowhere and calls reject at
+# once with ERR_FEATURE_UNAVAILABLE_ON_PLATFORM.
+expect Params: 0 object
+expect Calls: not called
+expect Call failed: none
+tap id:call
+expect Calls: function, post done
+expect Call failed: Error ERR_FEATURE_UNAVAILABLE_ON_PLATFORM
+covers [nsh] host
+# mod-ios
+tap id:case-mod-ios
+# the accessory view's content exists, and takes no room in its parent.
+expect iOS: true
+expect Accessory bar
+expect Rendered
+frame id:above 0 0 390 30
+frame id:below 0 30 390 30
+frame id:column 0 81 390 60
+covers [nsh/mobile] InputAccessoryView
+# mod-keymap
+tap id:case-mod-keymap
+# an Apple platform: Apple's symbols, and Command+Q kept by the platform.
+expect Label: ⇧⌘L
+expect Label F5: F5
+expect Label alt: ⌥↩
+expect Invalid: refused
+expect Kept: refused
+expect Bound: not bound
+tap id:bind
+expect Bound: function function
+covers [nsh] keymap
+# mod-mobile
+tap id:case-mod-mobile
+expect Mobile: true
+# The system's bar, in the frame the app's style gives it; the app owns
+# which tab is selected and follows the user's choice (`onChange`).
+expect Tab: 0
+frame id:tab-bar 0 784 390 60
+tap id:tab-next
+expect Tab: 1
+tap id:tab-rename
+frame id:tab-bar 0 784 390 60
+covers [nsh/mobile] isAvailable
+covers [nsh/mobile] TabBar
+# mod-storage
+tap id:case-mod-storage
+# a key set twice keeps its last value, and a missing key reads null.
+expect Storage empty
+tap id:set
+expect Storage set: a=1,b=two missing=null
+tap id:remove
+expect Storage removed: a=1 missing=null
+tap id:clear
+expect Storage cleared: none missing=null
+# A value past the quota rejects with a code and is not kept.
+tap id:full
+expect Storage full: Error ERR_NSH_QUOTA_EXCEEDED kept=false
+covers [nsh] Storage
+# mod-host
+tap id:case-mod-host
+# no host on this platform: the call rejects at once with
+# ERR_FEATURE_UNAVAILABLE_ON_PLATFORM; the root's events reach the listener.
+expect Host available: false
+expect Host call: not called
+tap id:call
+expect Host call: rejected Error ERR_FEATURE_UNAVAILABLE_ON_PLATFORM
+event id:heard onHost type=event event=tick payload=1
+expect Host heard: [1]
+# Stopped, the listener hears no more.
+tap id:stop
+event id:heard onHost type=event event=tick payload=2
+wait 50
+expect Host heard: [1]
+covers [nsh] host

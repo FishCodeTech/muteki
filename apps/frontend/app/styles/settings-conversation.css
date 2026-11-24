@@ -1,0 +1,211 @@
+/* ── DeepSeek Harness-derived conversation shell ───────────────────────────
+   Geometry and interaction hierarchy are adapted from deepseek-harness
+   packages/client/ui-{layout,sidebar,conversation}, MIT licensed.
+   Muteki data, commands and theme values remain authoritative. */
+.ai-conv-shell {
+  --dsh-chat-content-width: 768px;
+  --dsh-composer-card-max-width: 752px;
+  --dsh-composer-side-clearance: 16px;
+  width: 100%;
+  height: 100%;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+    "Hiragino Sans GB", "Microsoft YaHei", "Helvetica Neue", Arial, sans-serif;
+}
+
+.ai-conv-sidebar {
+  position: relative;
+  flex: none;
+  overflow: visible;
+  border-right: 1px solid var(--cx-border-subtle);
+  background: var(--cx-sidebar);
+  transition: width 240ms var(--cx-ease-drawer), border-color var(--control-feedback-dur) var(--cx-ease-out);
+}
+.ai-conv-sidebar.resizing { transition: none; }
+.ai-conv-sidebar[data-collapsed="false"] { width: var(--conv-sidebar-width, 264px); }
+.ai-conv-sidebar[data-collapsed="true"] {
+  width: 0;
+  min-width: 0;
+  border-right-width: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.ai-conv-main { background: var(--cx-bg); }
+
+.ai-composer-capability-list { min-height: 68px; overflow: auto; padding: 4px; scrollbar-gutter: stable; }
+.ai-composer-capability-list > button {
+  width: 100%;
+  min-height: 40px;
+  padding: 4px 7px;
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 7px;
+  border: 0;
+  border-radius: 7px;
+  color: var(--ink-2);
+  text-align: left;
+  cursor: pointer;
+  transition: color var(--control-feedback-dur) var(--ease-out), background-color var(--control-feedback-dur) var(--ease-out);
+}
+.ai-composer-capability-list > button.is-active {
+  color: var(--ink);
+  background: var(--hover);
+}
+.ai-chat-stream { padding-top: 22px; }
+.ai-chat-stream > div { max-width: var(--dsh-chat-content-width); }
+.ai-markdown-body {
+  min-width: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+.ai-markdown-body > :first-child { margin-top: 0; }
+.ai-markdown-body > :last-child { margin-bottom: 0; }
+.ai-markdown-body p,
+.ai-markdown-body ul,
+.ai-markdown-body ol,
+.ai-markdown-body blockquote,
+.ai-markdown-body pre,
+.ai-markdown-body .ai-markdown-table-wrap {
+  margin: 0.65em 0;
+}
+.ai-markdown-body h1,
+.ai-markdown-body h2,
+.ai-markdown-body h3,
+.ai-markdown-body h4 {
+  margin: 1em 0 0.5em;
+  font-weight: 600;
+  line-height: 1.35;
+  color: var(--ink);
+}
+.ai-markdown-body h1 { font-size: 1.2em; }
+.ai-markdown-body h2 { font-size: 1.12em; }
+.ai-markdown-body h3 { font-size: 1.05em; }
+.ai-markdown-body h4 { font-size: 1em; }
+.ai-markdown-body ul,
+.ai-markdown-body ol {
+  padding-left: 1.35em;
+}
+.ai-markdown-body li + li { margin-top: 0.25em; }
+.ai-markdown-body blockquote {
+  padding: 0.35em 0.85em;
+  border-left: 2px solid var(--cx-border-strong);
+  color: var(--ink-2);
+  background: color-mix(in srgb, var(--cx-bg-subtle) 65%, transparent);
+  border-radius: 0 6px 6px 0;
+}
+.ai-markdown-inline-code {
+  padding: 0.12em 0.38em;
+  border-radius: 6px;
+  border: 1px solid color-mix(in srgb, var(--cx-border) 80%, transparent);
+  background: color-mix(in srgb, var(--cx-bg-subtle) 88%, transparent);
+  font-family: var(--font-mono);
+  font-size: 0.92em;
+  color: var(--ink);
+}
+.ai-markdown-link {
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.ai-markdown-link:hover { opacity: 0.85; }
+.ai-markdown-table-wrap {
+  max-width: 100%;
+  overflow-x: auto;
+  border: 1px solid var(--cx-border);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--cx-elevated) 92%, transparent);
+}
+.ai-markdown-table {
+  width: max-content;
+  min-width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+.ai-markdown-table th,
+.ai-markdown-table td {
+  padding: 0.45em 0.75em;
+  border-bottom: 1px solid var(--cx-border);
+  text-align: left;
+  vertical-align: top;
+  white-space: nowrap;
+}
+.ai-markdown-table tr:last-child td { border-bottom: 0; }
+.ai-markdown-table th {
+  font-weight: 600;
+  color: var(--ink);
+  background: color-mix(in srgb, var(--cx-bg-subtle) 80%, transparent);
+}
+.ai-markdown-table td { color: var(--ink-2); }
+
+
+.composer-context-chip-status { font-size: 11px; opacity: 0.92; }
+
+[data-message-id].is-cite-highlight {
+  outline: 2px solid color-mix(in oklab, var(--cx-accent) 55%, transparent);
+  outline-offset: 4px;
+  border-radius: 12px;
+  transition: outline-color 200ms ease;
+}
+
+.composer-stash-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 8px;
+  max-height: min(280px, 40vh);
+  overflow: auto;
+}
+.composer-stash-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--cx-border);
+  border-radius: 12px;
+  background: var(--inset);
+}
+
+
+html, body {
+  height: 100vh;
+  height: 100dvh;
+  overscroll-behavior: none;
+}
+
+.workspace-frame {
+  padding-top: env(safe-area-inset-top, 0px);
+}
+
+.ai-conv-sidebar {
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+
+.ai-conv-shell {
+  --conv-fs-body: 15px;
+  --cx-msg-fs: var(--conv-fs-body);
+}
+.ai-conv-shell .ai-message-body {
+  font-size: var(--conv-fs-body);
+}
+.ai-conv-shell[data-conv-density="compact"] .conversation-turn-process-trigger {
+  min-height: 28px;
+}
+.ai-conv-shell[data-conv-density="compact"] .ai-chat-stream > div {
+  gap: 0.75rem;
+}
+.ai-conv-shell[data-conv-density="compact"] .absolute.left-0.top-0.w-full.pb-6 {
+  padding-bottom: 0.75rem;
+}
+.conversation-reading-prefs-popover {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.conversation-stats-chip-list {
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: center;
+}

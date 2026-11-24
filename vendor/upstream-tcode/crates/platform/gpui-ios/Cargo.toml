@@ -1,0 +1,35 @@
+[package]
+name = "gpui-ios"
+version = "0.3.7"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+description = "iOS platform backend for gpui-fast (Metal via gpui_wgpu)"
+
+[dependencies]
+gpui-mobile-pacing = { path = "../frame-pacing" }
+gpui-mobile-touch = { path = "../touch" }
+gpui = { package = "gpui-fast", version = "0.1.10", default-features = false }
+gpui_wgpu = { package = "gpui-fast-wgpu", version = "0.1.10" }
+anyhow = "1"
+log = "0.4"
+parking_lot = "0.12"
+futures = "0.3"
+raw-window-handle = "0.6"
+smallvec = "1"
+unicode-segmentation = "1"
+
+[dev-dependencies]
+gpui = { package = "gpui-fast", version = "0.1.10", features = ["test-support"], default-features = false }
+gpui-base = { version = "0.8.0", features = ["gpui-fast"] }
+
+[target.'cfg(target_os = "ios")'.dependencies]
+core-foundation = "0.10"
+core-graphics = "0.25"
+core-text = "22"
+font-kit = { package = "zed-font-kit", version = "0.14.1-zed" }
+# libc 0.2.190 gates dyld bindings and in6_ifreq to macOS; backtrace 0.3.76
+# and netdev 0.46.3 require them on iOS (#668).
+libc = ">=0.2, <0.2.190"
+pathfinder_geometry = "0.5"
+uuid = { version = "1", features = ["v5"] }

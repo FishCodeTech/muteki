@@ -5,25 +5,21 @@ import (
 	"strings"
 )
 
-// baseEnv is the minimal environment a worker starts with before the host's overlay.
-// We keep it small and deterministic; the host passes the engine-specific vars
-	// (MUTEKI_*, ANTHROPIC_*, CLAUDE_*, CODEX_*, CURSOR_*, OPENAI_*, OPENCODE_*,
-	// DEEPSEEK_*, HOME) explicitly.
 func baseEnv() map[string]string {
 	env := map[string]string{
-		// cursor-agent installs to ~/.local/bin which is NOT on a non-login PATH —
-		// include it so `cursor-agent` resolves (the old container bug). claude/codex
-		// live in /usr/local/bin.
 		"PATH":             "/home/kali/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
 		"HOME":             "/home/kali",
-		"USER":             "kali",
-		"LOGNAME":          "kali",
+		"USER":             "root",
+		"LOGNAME":          "root",
 		"LANG":             "C.UTF-8",
 		"PYTHONUNBUFFERED": "1",
 		"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
 	}
-	// Inherit a TERM/TZ if the supervisor has one.
-	for _, k := range []string{"TERM", "TZ"} {
+	for _, k := range []string{
+		"TERM", "TZ", "MUTEKI_WORKSPACE_UID", "MUTEKI_WORKSPACE_GID",
+		"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+		"http_proxy", "https_proxy", "all_proxy", "no_proxy",
+	} {
 		if v := os.Getenv(k); v != "" {
 			env[k] = v
 		}
@@ -31,16 +27,34 @@ func baseEnv() map[string]string {
 	return env
 }
 
-// applyTokenFiles resolves the *_FILE → value indirection the old docker-exec shell
-// prelude did. The account projection mounts secrets as files and passes their paths
-// as <VAR>_FILE; the CLIs want the literal value in <VAR>. If the file is readable,
-// its trimmed contents become the env var (host overlay still wins if it already set
-// the bare var).
+var proxyEnvKeys = map[string]bool{
+	"HTTP_PROXY":  true,
+	"HTTPS_PROXY": true,
+	"ALL_PROXY":   true,
+	"NO_PROXY":    true,
+	"http_proxy":  true,
+	"https_proxy": true,
+	"all_proxy":   true,
+	"no_proxy":    true,
+}
+
+func mergeSpecEnv(env, overlay map[string]string) {
+	for k, v := range overlay {
+		if proxyEnvKeys[k] && v == "" {
+			delete(env, k)
+			continue
+		}
+		env[k] = v
+	}
+}
+
 func applyTokenFiles(env map[string]string) {
 	pairs := []struct{ fileVar, valueVar string }{
 		{"CLAUDE_CODE_OAUTH_TOKEN_FILE", "CLAUDE_CODE_OAUTH_TOKEN"},
 		{"ANTHROPIC_AUTH_TOKEN_FILE", "ANTHROPIC_AUTH_TOKEN"},
 		{"CURSOR_API_KEY_FILE", "CURSOR_API_KEY"},
+		{"CURSOR_AUTH_TOKEN_FILE", "CURSOR_AUTH_TOKEN"},
+		{"FACTORY_API_KEY_FILE", "FACTORY_API_KEY"},
 		{"ANTHROPIC_API_KEY_FILE", "ANTHROPIC_API_KEY"},
 		{"OPENAI_API_KEY_FILE", "OPENAI_API_KEY"},
 		{"OPENCODE_API_KEY_FILE", "OPENCODE_API_KEY"},

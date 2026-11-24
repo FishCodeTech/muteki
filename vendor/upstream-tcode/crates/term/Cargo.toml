@@ -1,0 +1,21 @@
+[package]
+name = "term"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+# The PTY-backed `Terminal`. Off leaves the bare `GridEmulator`, which the host
+# also drives to render stored command output. No client links this crate.
+default = ["pty"]
+pty = ["rio-vt/pty", "dep:libc", "dep:portable-pty"]
+
+[dependencies]
+async-channel = "2"
+rio-vt = { version = "0.5.24", default-features = false }
+tcode-protocol = { path = "../protocol", default-features = false }
+
+[target.'cfg(unix)'.dependencies]
+libc = { version = "0.2", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+portable-pty = { version = "0.9", optional = true }

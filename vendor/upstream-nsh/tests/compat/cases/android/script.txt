@@ -1,0 +1,35 @@
+# What a user does and sees (compat/apps.rs): each case after its tap.
+platform android
+# base-dialog-android
+tap id:case-base-dialog-android
+expect Translucent dialog
+expect Opaque dialog
+prop id:translucent android.statusBarTranslucent true
+noprop id:translucent supportedOrientations
+prop id:opaque statusBarTranslucent false
+# The back button: a close attempt without a reason is "cancel".
+event text:"Translucent dialog" onCancel
+expect Reason: cancel
+absent Translucent dialog
+expect Opaque dialog
+covers [nsh/base] Dialog
+covers [props] android.statusBarTranslucent
+# props-platform-android
+tap id:case-props-platform-android
+expect Card
+prop id:card elevation 6
+prop id:flat elevation 0
+covers [props] android
+# props-view-android
+tap id:case-props-view-android
+# `android={{…}}`.
+prop id:ripple android.ripple color=#ff0000ff borderless=true radius=20
+noprop id:plain ripple
+prop id:card android.elevation 4
+prop id:plain elevation 0
+prop id:live android.accessibilityLiveRegion polite
+prop id:plain accessibilityLiveRegion none
+covers [props] android
+covers [props] android.ripple
+covers [props] android.elevation
+covers [props] android.accessibilityLiveRegion

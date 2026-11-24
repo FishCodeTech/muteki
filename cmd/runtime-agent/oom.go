@@ -5,10 +5,6 @@ import (
 	"syscall"
 )
 
-// oomObservation records container-level cgroup evidence over one worker's
-// lifetime. The cgroup counter does not identify the victim PID, so overlapping
-// observations are permanently ambiguous: a delta must never be copied onto every
-// concurrent worker as though it were per-process evidence.
 type oomObservation struct {
 	before    int
 	ambiguous bool
@@ -63,9 +59,6 @@ func (t *oomTracker) finish(obs *oomObservation) oomEvidence {
 	return oomEvidence{delta: delta, ambiguous: obs.ambiguous}
 }
 
-// attributable is deliberately conservative. A container counter delta is an OOM
-// label only when one worker owned the whole observation window, that worker died
-// by SIGKILL, and the supervisor did not itself issue the KILL (timeout/operator).
 func (e oomEvidence) attributable(sig int, timedOut, killRequested bool) bool {
 	return e.delta > 0 && !e.ambiguous && sig == int(syscall.SIGKILL) && !timedOut && !killRequested
 }

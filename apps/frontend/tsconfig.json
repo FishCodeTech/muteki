@@ -1,0 +1,81 @@
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "lib": [
+      "dom",
+      "dom.iterable",
+      "esnext"
+    ],
+    "allowJs": true,
+    "skipLibCheck": true,
+    "strict": true,
+    "noEmit": true,
+    "esModuleInterop": true,
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "jsx": "preserve",
+    "incremental": true,
+    "preserveSymlinks": true,
+    "plugins": [
+      {
+        "name": "next"
+      }
+    ],
+    "paths": {
+      "@/*": [
+        "./*"
+      ],
+      "@muteki/ui": [
+        "./node_modules/@muteki/ui/src/index.ts"
+      ],
+      "@muteki/ui/agent": [
+        "./node_modules/@muteki/ui/src/agent/index.ts"
+      ],
+      "@muteki/ui/engines/shiki": [
+        "./node_modules/@muteki/ui/src/engines/shiki.ts"
+      ],
+      "@muteki/ui/engines/markdown": [
+        "./node_modules/@muteki/ui/src/engines/markdown.tsx"
+      ],
+      "@muteki/ui/engines/math": [
+        "./node_modules/@muteki/ui/src/engines/math.ts"
+      ],
+      "@muteki/ui/engines/math-view": [
+        "./node_modules/@muteki/ui/src/engines/mathView.tsx"
+      ],
+      "@muteki/ui/engines/terminal": [
+        "./node_modules/@muteki/ui/src/engines/terminal.ts"
+      ],
+      "@muteki/ui/engines/code-editor": [
+        "./node_modules/@muteki/ui/src/engines/codeEditor.ts"
+      ],
+      "@muteki/ui/engines/virtual": [
+        "./node_modules/@muteki/ui/src/engines/virtual.ts"
+      ]
+    }
+  },
+  "include": [
+    "**/*.ts",
+    "**/*.tsx",
+    ".next-build/types/**/*.ts",
+    ".next-desktop/types/**/*.ts",
+    ".next-dev-verify/types/**/*.ts",
+    ".next-dev/types/**/*.ts",
+    ".next-package/types/**/*.ts",
+    ".next-sidechat/types/**/*.ts",
+    ".next-verify-499/types/**/*.ts",
+    ".next-verify/types/**/*.ts",
+    ".next/dev-report/types/**/*.ts",
+    ".next/types/**/*.ts",
+    "next-env.d.ts",
+    "out/types/**/*.ts",
+    ".next-dev-compare/types/**/*.ts"
+  ],
+  "exclude": [
+    "node_modules",
+    "out",
+    "scripts"
+  ]
+}

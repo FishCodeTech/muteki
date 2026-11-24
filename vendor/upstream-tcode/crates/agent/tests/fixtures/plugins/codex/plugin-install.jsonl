@@ -1,0 +1,2 @@
+{"id":8,"method":"plugin/install","params":{"pluginName":"alpha","marketplacePath":"/private/tmp/tcode-probe/codex-mkt/.agents/plugins/marketplace.json"}}
+{"id":8,"result":{"authPolicy":"ON_INSTALL","appsNeedingAuth":[]}}

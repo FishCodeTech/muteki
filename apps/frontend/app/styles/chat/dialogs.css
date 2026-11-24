@@ -1,0 +1,27 @@
+
+.cx-reading-prefs {
+  color: var(--cx-fg);
+  -webkit-font-smoothing: antialiased;
+}
+@layer base {
+  .cx-reading-prefs,
+  .cx-reading-prefs * {
+    box-sizing: border-box;
+  }
+  .cx-reading-prefs :where(button, input) {
+    color: inherit;
+  }
+  .cx-reading-prefs :where(h3, p) {
+    margin: 0;
+  }
+}
+.cx-reading-prefs :is(button, input) {
+  font: revert-layer;
+}
+.cx-reading-prefs .cx-slider {
+  width: 100%;
+}
+
+.cx-details-sheet .cx-dialog-section .cx-code {
+  margin: 0;
+}

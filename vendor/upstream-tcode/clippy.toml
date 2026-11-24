@@ -1,0 +1,10 @@
+# Process and blocking-work boundaries. Child processes go through the
+# console-suppressing helpers in `crates/services/src/process.rs` and
+# `crates/agent/src/process.rs`; blocking work goes through
+# `Host::unblock` in `crates/runtime/src/host.rs` or the agent crate's
+# `process::unblock`. Each approved site carries an explicit allow.
+disallowed-methods = [
+    { path = "std::process::Command::new", reason = "use services::process::command or agent's process::command so Windows never flashes a console" },
+    { path = "smol::process::Command::new", reason = "use services::process::async_command or agent's process::async_command so Windows never flashes a console" },
+    { path = "smol::unblock", reason = "use Host::unblock or the agent crate's process::unblock so blocking work is scheduled in one place" },
+]

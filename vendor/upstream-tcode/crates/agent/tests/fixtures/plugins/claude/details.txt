@@ -1,0 +1,21 @@
+alpha 1.0.0
+  Description: Skill, command, SessionStart hook and an unreachable HTTP MCP server
+  Source: alpha@tcode-probe
+
+Component inventory
+  Skills (2)  greet, hello
+  Agents (0)
+  Hooks (1)  SessionStart  (harness-only — no model context cost)
+  MCP servers (1)  alpha-dead  (tool schemas resolved at runtime; not counted)
+  LSP servers (0)
+
+Projected token cost
+  Always-on:   ~32 tok   added to every session
+
+Per-component (rounded)
+  component  always-on  on-invoke
+  greet           < 20       < 20
+  hello           < 20       < 20
+
+  On-invoke cost is paid each time a skill or agent fires.
+  Token counts are estimates and may differ from actual usage.

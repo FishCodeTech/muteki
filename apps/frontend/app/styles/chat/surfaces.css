@@ -1,0 +1,61 @@
+
+@font-face {
+  font-family: "Muteki Terminal Symbols";
+  src: url("/fonts/terminal-symbols/symbols.woff") format("woff");
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: block;
+  unicode-range: U+E000-F8FF, U+F0000-FFFFD, U+100000-10FFFD;
+}
+
+.cx-preview-progress {
+  transform-origin: left center;
+  animation: cx-progress 1.1s var(--cx-ease-in-out) infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .cx-preview-progress {
+    transform: scaleX(0.45);
+    transform-origin: left center;
+    animation: muteki-reduced-pulse 2.2s ease-in-out infinite;
+  }
+}
+html[data-motion="reduce"] .cx-preview-progress {
+  transform: scaleX(0.45);
+  transform-origin: left center;
+  animation: muteki-reduced-pulse 2.2s ease-in-out infinite;
+}
+
+.cx-preview-stage {
+  background:
+    radial-gradient(circle at 1px 1px, color-mix(in srgb, var(--ink) 10%, transparent) 1px, transparent 0) 0 0 / 16px 16px,
+    var(--cx-bg-subtle);
+}
+
+.cx-checker {
+  background:
+    conic-gradient(color-mix(in srgb, var(--ink) 6%, transparent) 25%, transparent 0 50%, color-mix(in srgb, var(--ink) 6%, transparent) 0 75%, transparent 0) 0 0 / 16px 16px,
+    var(--cx-bg);
+}
+
+.cx-doc {
+  font-size: var(--text-cx-base);
+  line-height: 1.75;
+  color: var(--cx-fg);
+}
+
+.cx-terminal-host {
+  background: color-mix(in srgb, var(--ink) 3%, var(--surface));
+}
+.dark .cx-terminal-host {
+  background: color-mix(in srgb, black 30%, var(--surface));
+}
+.cx-terminal-host .xterm,
+.cx-terminal-host .xterm-viewport,
+.cx-terminal-host .xterm-screen {
+  background: transparent !important;
+}
+.cx-terminal-host .xterm-viewport {
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--ink) 18%, transparent) transparent;
+}
+.cx-composer-hint,.cx-composer-guide,.cx-draft-hint{font-size:var(--text-cx-xs);color:var(--cx-fg-2)}

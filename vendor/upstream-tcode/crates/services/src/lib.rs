@@ -1,0 +1,32 @@
+//! GPUI-free infrastructure services shared by the tcode application layers.
+
+pub mod acp_registry;
+pub mod azure;
+pub mod bitbucket;
+pub mod desktop;
+pub mod export;
+pub mod forge;
+pub mod forgejo;
+pub mod fs_tree;
+pub mod git;
+pub mod github;
+pub mod gitlab;
+pub mod image_bytes;
+pub mod image_previews;
+pub mod import;
+pub mod process;
+pub mod project_config;
+pub mod project_icons;
+pub mod provider_auth;
+pub mod provider_probe;
+pub mod provider_usage;
+pub mod relaunch;
+pub mod session_search;
+pub mod settings;
+pub mod shell_env;
+pub mod store;
+pub mod thread_index;
+pub mod user_files;
+pub mod version_check;
+pub mod workspace;
+pub mod worktree;

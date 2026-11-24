@@ -1,7 +1,7 @@
 # muteki-pwn: linux/amd64 runtime for DYNAMIC pwn (running/debugging x86-64 ELFs).
 # arm64 macOS can't natively run/gdb a Linux x86-64 binary; the pwn SDK shells
 # into this container to develop the exploit locally, then fires at the remote.
-FROM --platform=linux/amd64 ubuntu:24.04
+FROM --platform=linux/amd64 ubuntu:latest
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \

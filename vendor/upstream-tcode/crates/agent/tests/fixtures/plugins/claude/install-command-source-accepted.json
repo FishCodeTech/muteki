@@ -1,0 +1,4 @@
+"gamma" is installed by running a command from marketplace "tcode-probe" on this machine:
+  echo /tmp/tcode-probe/gamma-src
+  (mode "copy": its output directory is copied into the plugin cache)
+{"command":"install","outcome":"ok","plugin":"gamma@tcode-probe","pluginId":"gamma@tcode-probe","scope":"user","message":"Successfully installed plugin: gamma@tcode-probe (scope: user)"}

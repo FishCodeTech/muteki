@@ -1,0 +1,119 @@
+.conversation-title-menu-trigger {
+  width: 26px;
+  height: 26px;
+  flex: none;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: 7px;
+  color: var(--cx-fg-3);
+  background: transparent;
+  cursor: pointer;
+}
+.conversation-title-menu-trigger:hover,
+.conversation-title-menu-trigger[aria-expanded="true"] {
+  color: var(--cx-fg);
+  background: color-mix(in srgb, var(--cx-fg) 7%, transparent);
+}
+.conversation-output-content {
+  width: 100%;
+  min-height: 0;
+  max-height: inherit;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  padding: 0;
+}
+.conversation-environment-list { display: flex; flex-direction: column; gap: 3px; }
+.conversation-environment-list > div {
+  min-height: 36px;
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  padding: 0 6px;
+  border-radius: 8px;
+}
+.conversation-environment-list > div:hover { background: color-mix(in srgb, var(--cx-fg) 7%, transparent); }
+.conversation-environment-list > div > span { min-width: 0; overflow: hidden; color: var(--cx-fg); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.conversation-environment-list > div > strong { color: var(--cx-fg-3); font: 500 11px/1.2 var(--font-mono); }
+.conversation-process-list,
+.conversation-source-list { display: flex; flex-direction: column; gap: 2px; }
+.conversation-process-list > button,
+.conversation-source-list > button {
+  width: 100%;
+  min-height: 34px;
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 7px;
+  padding: 0 6px;
+  border: 0;
+  border-radius: 8px;
+  color: var(--cx-fg-2);
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+.conversation-process-list > button:hover,
+.conversation-source-list > button:hover { color: var(--cx-fg); background: color-mix(in srgb, var(--cx-fg) 7%, transparent); }
+.conversation-process-list span,
+.conversation-source-list span { overflow: hidden; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.conversation-process-list em { color: var(--blue); font: 500 11px/1 var(--font-mono); font-style: normal; }
+.conversation-terminal-list {
+  margin: 0;
+  padding: 6px 8px 10px;
+  list-style: none;
+  min-height: 0;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+.conversation-details-tab {
+  min-width:max-content;
+  min-height:30px;
+  flex:0 0 auto;
+  padding:0 10px;
+  border:0;
+  border-radius:8px;
+  color:var(--cx-fg-3);
+  background:transparent;
+  font-size:12px;
+  white-space:nowrap;
+  cursor:pointer;
+}
+.conversation-details-tab:hover { color:var(--cx-fg); background:color-mix(in srgb, var(--cx-fg) 7%, transparent); }
+.conversation-details-tab[data-active="true"] { color:var(--cx-fg); background:var(--cx-elevated); box-shadow:var(--shadow-hairline); }
+
+.conversation-browser-activity-list,
+.conversation-file-list { display: flex; flex-direction: column; gap: 3px; padding: 9px; }
+.conversation-browser-activity-list > button,
+.conversation-file-list > button {
+  width: 100%;
+  min-height: 54px;
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr) 16px;
+  align-items: center;
+  gap: 9px;
+  padding: 7px 8px;
+  border: 0;
+  border-radius: 9px;
+  color: var(--cx-fg-2);
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+.conversation-browser-activity-list > button:hover,
+.conversation-file-list > button:hover { color: var(--cx-fg); background: color-mix(in srgb, var(--cx-fg) 7%, transparent); }
+.conversation-browser-activity-list > button > span:first-child { width: 28px; height: 28px; display: grid; place-items: center; border-radius: 7px; color: var(--cx-fg-3); background: color-mix(in srgb, var(--cx-fg) 7%, transparent); }
+.conversation-browser-activity-list > button > span:nth-child(2),
+.conversation-file-list > button > span:nth-child(2) { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.conversation-browser-activity-list strong,
+.conversation-file-list strong { overflow: hidden; color: var(--cx-fg); font-size: 12px; font-weight: 500; text-overflow: ellipsis; white-space: nowrap; }
+.conversation-browser-activity-list small,
+.conversation-file-list small { overflow: hidden; color: var(--cx-fg-3); font: 11px/1.35 var(--font-mono); text-overflow: ellipsis; white-space: nowrap; }

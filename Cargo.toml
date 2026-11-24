@@ -1,0 +1,30 @@
+[workspace]
+members = ["crates/server", "crates/desktop"]
+default-members = ["crates/server"]
+exclude = ["vendor/upstream-tcode", "vendor/upstream-nsh", "vendor/tcode", "crates/ui", "crates/web"]
+resolver = "3"
+
+[profile.dev]
+debug = 0
+incremental = true
+[profile.test]
+debug = 0
+incremental = true
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = "debuginfo"
+
+[profile.local]
+inherits = "release"
+lto = "off"
+codegen-units = 256
+incremental = true
+
+[profile.web]
+inherits = "release"
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"

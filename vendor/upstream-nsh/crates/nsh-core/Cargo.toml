@@ -1,0 +1,68 @@
+[package]
+name = "nsh-core"
+description = "Platform-independent core: shadow tree, styles, layout and mount instructions."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+readme.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+unicode-linebreak.workspace = true
+rustc-hash.workspace = true
+slab.workspace = true
+taffy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+nsh-macros.workspace = true
+tokio = { workspace = true, features = ["rt", "time"] }
+log.workspace = true
+ordered-float.workspace = true
+resvg = { workspace = true, optional = true }
+flate2 = { workspace = true, optional = true }
+url.workspace = true
+sha2.workspace = true
+# Picked images' sizes and types (`picker.rs`).
+imagesize.workspace = true
+naga.workspace = true
+
+[features]
+# SVG images for the native backends (`svg`: sniffing, sizes and rasters with
+# resvg). The web runtime leaves it off: the browser draws SVG itself.
+svg = ["dep:resvg", "dep:flate2"]
+# Shaders as GLSL ES 3.00 (`Shader::glsl_es`), for the web runtime's WebGL 2.
+glsl = ["naga/glsl-out"]
+
+# Native socket/file implementations. Browser WebSockets and files use
+# the host services; their shared checks do not need these dependencies.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { workspace = true, features = ["net", "io-util", "sync", "macros"] }
+cap-std.workspace = true
+futures-util.workspace = true
+tokio-tungstenite.workspace = true
+rustls.workspace = true
+webpki-roots.workspace = true
+# `process`'s children: their process groups and exits (`runtime/process.rs`).
+libc.workspace = true
+# The image disk cache (`image/cache.rs`).
+httpdate.workspace = true
+crc32fast.workspace = true
+
+# `process`'s children on Windows: their jobs (`runtime/process.rs`).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+  "Win32_Foundation",
+  "Win32_System_Diagnostics_ToolHelp",
+  "Win32_System_IO",
+  "Win32_System_JobObjects",
+  "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+# The `unit_types` check reads the crate's public API.
+syn = { workspace = true, features = ["visit"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "time"] }

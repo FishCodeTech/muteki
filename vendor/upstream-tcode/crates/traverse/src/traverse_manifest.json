@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "updatedAt": "2026-09-22T00:00:00Z",
+  "relays": [
+    { "url": "https://use1-1.relay.n0.iroh.link./", "quic_port": 7842, "region": "na-east" },
+    { "url": "https://usw1-1.relay.n0.iroh.link./", "quic_port": 7842, "region": "na-west" },
+    { "url": "https://euc1-1.relay.n0.iroh.link./", "quic_port": 7842, "region": "eu" },
+    { "url": "https://aps1-1.relay.n0.iroh.link./", "quic_port": 7842, "region": "ap" }
+  ],
+  "pkarr": [ "https://dns.iroh.link/pkarr" ]
+}

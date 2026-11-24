@@ -3,6 +3,8 @@
 package main
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -10,11 +12,6 @@ import (
 	"syscall"
 )
 
-// reapOrphans reaps only adopted/unmanaged children. Linux exposes the direct
-// children of each task in /proc; enumerate every task because Go may fork from
-// any runtime thread. Holding r.mu makes the snapshot mutually exclusive with a
-// managed cmd.Start + registration, so a just-started worker cannot be mistaken
-// for an orphan even if it exits immediately.
 func (r *childReaper) reapOrphans() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -35,25 +32,30 @@ func (r *childReaper) reapOrphans() {
 		if !reaped {
 			return
 		}
-		// Reaping an adopted process can expose another generation of orphaned
-		// descendants. Refresh /proc until a complete pass makes no progress.
 	}
 }
 
-func directChildPIDs() []int {
+func directChildPIDs() []int { children, _ := directChildPIDsChecked(); return children }
+
+func directChildPIDsChecked() ([]int, error) {
 	tasks, err := os.ReadDir("/proc/self/task")
 	if err != nil {
-		return nil
+		return nil, err
 	}
+	inspected := 0
 	seen := make(map[int]struct{})
 	for _, task := range tasks {
 		if !task.IsDir() {
 			continue
 		}
 		data, err := os.ReadFile(filepath.Join("/proc/self/task", task.Name(), "children"))
-		if err != nil {
+		if os.IsNotExist(err) || errors.Is(err, syscall.ESRCH) {
 			continue
 		}
+		if err != nil {
+			return nil, err
+		}
+		inspected++
 		for _, field := range strings.Fields(string(data)) {
 			pid, err := strconv.Atoi(field)
 			if err == nil && pid > 0 {
@@ -65,5 +67,8 @@ func directChildPIDs() []int {
 	for pid := range seen {
 		out = append(out, pid)
 	}
-	return out
+	if inspected == 0 {
+		return nil, fmt.Errorf("No live task membership could be inspected")
+	}
+	return out, nil
 }

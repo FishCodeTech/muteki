@@ -1,0 +1,275 @@
+name: Release
+
+# Builds the distribution (`cargo xtask dist`: the CLI, the prebuilt runtimes
+# and the embedding SDKs) on macOS, Linux and Windows, and publishes it as a
+# GitHub release.
+#
+# - Pushing a tag `vX.Y.Z` (the workspace version in Cargo.toml) builds every
+#   platform and, once all of them have built, creates a draft release with
+#   their archives; publish it from the releases page.
+# - Running it by hand without a tag builds the archives only (workflow
+#   artifacts): a dry run before tagging, and the check of a change to this
+#   workflow or to how xtask builds the distribution. With a tag it releases
+#   that tag.
+#
+# Pull requests and the merge queue never run it: its three builds are CI's
+# longest and held the runners every queued pull request waited for.
+#
+# Asset names carry no version (`nsh-macos-arm64.tar.gz`, each with a
+# `.sha256`), so `releases/latest/download/<asset>` always resolves: the
+# installers (`website/public/install.sh`, `install.ps1`, also attached to
+# each release), mise's `github:` backend and the Scoop manifest download by
+# that name. Every archive holds one directory, `nsh/`, laid out as
+# `dist/nsh`. Publishing the draft runs `packages.yml` (Homebrew).
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (e.g. v0.1.0); empty: build only"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+  TAG: ${{ inputs.tag || (github.ref_type == 'tag' && github.ref_name) || '' }}
+
+jobs:
+  dist:
+    name: dist (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The iOS runtimes and SDK need Xcode; the macOS runtime is built
+          # for this machine (Apple silicon).
+          - name: macos-arm64
+            os: macos-15
+          # 24.04 has GTK 4.14 and Pango 1.52+, what the Linux runtime needs;
+          # its binaries need glibc 2.39 and GTK 4.14 or newer where they run.
+          - name: linux-x86_64
+            os: ubuntu-24.04
+          - name: windows-x86_64
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # A release run builds the tag, never the branch it was started on.
+          ref: ${{ env.TAG || github.ref }}
+
+      - name: Check the version
+        if: env.TAG != ''
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          if [[ "$TAG" != "v$version" ]]; then
+            echo "::error::tag $TAG does not match the workspace version $version"
+            exit 1
+          fi
+
+      # Temporary directories (tests, tools) outside the checkout.
+      - name: Set up the environment
+        run: |
+          mkdir -p "$RUNNER_TEMP/tmp"
+          echo "TMPDIR=$RUNNER_TEMP/tmp" >> "$GITHUB_ENV"
+          echo "ARCHIVE=nsh-${{ matrix.name }}" >> "$GITHUB_ENV"
+
+      - name: Set up Windows
+        if: runner.os == 'Windows'
+        run: |
+          # QuickJS is C: bindgen needs libclang, which the image's LLVM has.
+          echo "LIBCLANG_PATH=C:\\Program Files\\LLVM\\bin" >> "$GITHUB_ENV"
+          # rustc can overflow its default stack on the `windows` crate.
+          echo "RUST_MIN_STACK=268435456" >> "$GITHUB_ENV"
+
+      # QuickJS is C (bindgen needs libclang); the Linux runtime links GTK 4,
+      # the GPUI runtime X11, Wayland, xkbcommon, fontconfig and FreeType,
+      # GTK 3 and WebKitGTK 4.1 (web views) and GStreamer (videos).
+      - name: Install clang, GTK 4 and GPUI's libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm libclang-dev libgtk-4-dev libwebkitgtk-6.0-dev \
+            libfontconfig-dev libfreetype-dev libwayland-dev libx11-xcb-dev libxcb1-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev libzstd-dev libgtk-3-dev libwebkit2gtk-4.1-dev \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
+
+      # The Android runtime: `javac` + `d8` (Java 17), the SDK's
+      # `platforms;android-35` and an NDK (the images have the SDK and NDKs).
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Install the Android platform
+        run: |
+          if [[ ! -f "$ANDROID_HOME/platforms/android-35/android.jar" ]]; then
+            sdkmanager=$(ls "$ANDROID_HOME"/cmdline-tools/latest/bin/sdkmanager* | head -1)
+            yes | "$sdkmanager" "platforms;android-35" > /dev/null || true
+          fi
+          test -f "$ANDROID_HOME/platforms/android-35/android.jar"
+          ls "$ANDROID_HOME/ndk" || true
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      # The web runtime's C code (zstd) needs upstream LLVM: Apple's clang
+      # does not target wasm32. Check the C tools before building runtimes.
+      - name: Set up WebAssembly C tools
+        run: |
+          suffix=""
+          if [[ "$RUNNER_OS" == macOS ]]; then
+            brew list llvm > /dev/null 2>&1 || brew install llvm
+            llvm_bin="$(brew --prefix llvm)/bin"
+          elif [[ "$RUNNER_OS" == Windows ]]; then
+            llvm_bin="C:/Program Files/LLVM/bin"
+            suffix=".exe"
+          else
+            llvm_bin=/usr/bin
+          fi
+          cc="$llvm_bin/clang$suffix"
+          ar="$llvm_bin/llvm-ar$suffix"
+          if [[ "$RUNNER_OS" == Windows ]]; then
+            # quickjs-jit-sys canonicalizes its vendored WASI include directory
+            # to a verbatim Windows path. Give clang ordinary drive paths
+            # so nested includes such as bits/alltypes.h resolve correctly.
+            cat > "$RUNNER_TEMP/nsh-wasm-clang.py" <<'PYTHON'
+          import os
+          import subprocess
+          import sys
+
+          def normalize(argument):
+              for prefix in ("-isystem", "-I", "-L", ""):
+                  marker = prefix + "\\\\?\\"
+                  if argument.startswith(marker):
+                      path = argument[len(marker):]
+                      if len(path) > 2 and path[1:3] == ":\\":
+                          return prefix + path.replace("\\", "/")
+              return argument
+
+          if __name__ == "__main__":
+              sys.exit(subprocess.call([os.environ["NSH_WASM_CLANG"], *map(normalize, sys.argv[1:])]))
+          PYTHON
+            printf '@echo off\r\npython "%%~dp0nsh-wasm-clang.py" %%*\r\n' > "$RUNNER_TEMP/nsh-wasm-clang.cmd"
+            export NSH_WASM_CLANG="$cc"
+            echo "NSH_WASM_CLANG=$cc" >> "$GITHUB_ENV"
+            cc="$(cygpath -m "$RUNNER_TEMP")/nsh-wasm-clang.cmd"
+          fi
+          printf 'int nsh_wasm_probe(void) { return 0; }\n' | \
+            "$cc" --target=wasm32-unknown-unknown -x c -c - -o "$RUNNER_TEMP/wasm-probe.o"
+          "$ar" rcs "$RUNNER_TEMP/wasm-probe.a" "$RUNNER_TEMP/wasm-probe.o"
+          echo "CC_wasm32_unknown_unknown=$cc" >> "$GITHUB_ENV"
+          echo "AR_wasm32_unknown_unknown=$ar" >> "$GITHUB_ENV"
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-release-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-release-cargo-
+
+      - name: Build the distribution
+        run: cargo xtask dist -v
+
+      # The packaged CLI makes and bundles a new app.
+      - name: Smoke test
+        run: |
+          nsh=dist/nsh/bin/nsh
+          [[ "$RUNNER_OS" != Windows ]] || nsh=dist/nsh/bin/nsh.exe
+          "$nsh" --version
+          app="$RUNNER_TEMP/smoke-app"
+          "$nsh" init "$app"
+          "$nsh" build "$app" -o "$RUNNER_TEMP/smoke-out" --release
+          ls "$RUNNER_TEMP/smoke-out"
+          find dist/nsh -type f | sort
+
+      - name: Package
+        run: |
+          mkdir -p target/release-assets
+          cd target/release-assets
+          cp -R ../../dist/nsh nsh
+          cp ../../README.md ../../LICENSE-APACHE nsh/
+          if [[ "$RUNNER_OS" == Windows ]]; then
+            7z a -tzip "$ARCHIVE.zip" nsh > /dev/null
+            sha256sum "$ARCHIVE.zip" > "$ARCHIVE.zip.sha256"
+          else
+            tar -czf "$ARCHIVE.tar.gz" nsh
+            shasum -a 256 "$ARCHIVE.tar.gz" > "$ARCHIVE.tar.gz.sha256"
+          fi
+          # The embedding SDKs on their own, for native apps that embed nsh
+          # and need no CLI (iOS from macOS, Android from Linux).
+          embed() {
+            local name="nsh-embed-$1"
+            mkdir -p "$name"
+            cp -R "nsh/embed/$1/." "$name/"
+            zip -qry "$name.zip" "$name"
+            shasum -a 256 "$name.zip" > "$name.zip.sha256"
+          }
+          [[ "$RUNNER_OS" != macOS ]] || embed ios
+          [[ "$RUNNER_OS" != Linux ]] || embed android
+          rm -rf nsh nsh-embed-*/
+          ls -l
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nsh-${{ matrix.name }}
+          path: target/release-assets/*
+          if-no-files-found: error
+
+  release:
+    name: Release
+    needs: dist
+    if: inputs.tag != '' || github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: nsh-*
+          path: assets
+          merge-multiple: true
+
+      # The installers go with the archives they download, and Scoop installs
+      # from the manifest attached to the latest release:
+      # `scoop install https://github.com/<repo>/releases/latest/download/nsh.json`.
+      - name: Add the installers and the Scoop manifest
+        run: |
+          cp website/public/install.sh website/public/install.ps1 assets/
+          read -r hash _ < assets/nsh-windows-x86_64.zip.sha256
+          # shellcheck disable=SC2016 # envsubst's list of variables
+          NSH_VERSION="${TAG#v}" NSH_HASH="$hash" NSH_REPO="$GITHUB_REPOSITORY" \
+            envsubst '$NSH_VERSION $NSH_HASH $NSH_REPO' < .github/packages/nsh.json > assets/nsh.json
+          cat assets/nsh.json
+
+      # Created only after every platform has built; a draft until it is
+      # published by hand.
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          name: nsh ${{ env.TAG }}
+          draft: true
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: assets/*

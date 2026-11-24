@@ -1,0 +1,24 @@
+# A self-hosted Traverse instance. Next to this file:
+#   docker run --rm ghcr.io/tryanks/tcode-traverse:latest --print-default-config > traverse.toml
+# then set hostname and contact (README.md#tls) and run `docker compose up -d`.
+services:
+  traverse:
+    image: ghcr.io/tryanks/tcode-traverse:${TRAVERSE_VERSION:-latest}
+    restart: unless-stopped
+    ports:
+      - "80:80/tcp" # HTTP routes and captive-portal probes
+      - "443:443/tcp" # Relay, pkarr store and manifest over HTTPS; ACME TLS-ALPN-01
+      - "7842:7842/udp" # QUIC address discovery
+    volumes:
+      - ./traverse.toml:/etc/tcode-traverse/traverse.toml:ro
+      # Let's Encrypt certificates and the pkarr store (data_dir in traverse.toml).
+      - traverse-data:/var/lib/tcode-traverse
+    # Probes the [http] bind; change the port here if traverse.toml moves it.
+    healthcheck:
+      test: [CMD, curl, -fsS, -o, /dev/null, "http://127.0.0.1:80/healthz"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+
+volumes:
+  traverse-data:

@@ -1,0 +1,24 @@
+[package]
+name = "tcode-android"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "tcode_android"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+gpui = { package = "gpui-fast", version = "0.1.10", default-features = false }
+gpui-android = { path = "../platform/gpui-android" }
+log = "0.4"
+tcode-client = { path = "../client" }
+tcode-traverse = { path = "../traverse", default-features = false, features = ["native"] }
+tcode-ui = { path = "../ui", default-features = false, features = ["native-preview"] }
+async-channel = "2"
+
+[target.'cfg(target_os = "android")'.dependencies]
+android-activity = { version = "0.6", features = ["native-activity"] }
+android_logger = "0.15"
+futures = "0.3"
+jni = "0.22"

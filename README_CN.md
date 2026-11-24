@@ -13,26 +13,26 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/FishCodeTech/muteki/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-blue.svg" alt="License"></a>
-  <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-≥3.13-3776AB.svg?logo=python&logoColor=white" alt="Python"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-blue.svg" alt="License"></a>
+  <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/backend-Rust-000000.svg?logo=rust&logoColor=white" alt="Rust backend"></a>
   <a href="https://github.com/FishCodeTech/muteki/stargazers"><img src="https://img.shields.io/github/stars/FishCodeTech/muteki?style=social" alt="Stars"></a>
-  <a href="https://atomgit.com/FishCodeTech/muteki"><img src="https://atomgit.com/FishCodeTech/muteki/star/badge.svg" alt="AtomGit Star"></a>
+  <a href="https://atomgit.com/FishCodeTech/muteki"><img src="https://atomgit.com/FishCodeTech/muteki/star/badge.svg" alt="AtomGit project mirror"></a>
   <a href="https://github.com/FishCodeTech/muteki/issues"><img src="https://img.shields.io/github/issues/FishCodeTech/muteki" alt="Issues"></a>
   <a href="https://github.com/FishCodeTech/muteki/pulls"><img src="https://img.shields.io/github/issues-pr/FishCodeTech/muteki" alt="PRs"></a>
-  <img src="https://img.shields.io/badge/NYU_CTF_Bench-200%2F200_solved-brightgreen" alt="Benchmark">
-  <img src="https://img.shields.io/badge/engines-8_active_CLIs-orange" alt="八类可用 CLI 引擎；DeepSeek Harness 仅登记并暂不支持">
+  <img src="https://img.shields.io/badge/NYU_CTF_Bench_(Python)-200%2F200_solved-brightgreen" alt="Benchmark">
+  <img src="https://img.shields.io/badge/engines-9_CLIs-orange" alt="九类 CLI 引擎；实际可用性取决于凭据与运行环境">
 </p>
 
 <p align="center">
-  <a href="README.md">English</a> · <strong>简体中文</strong> · <a href="CHANGELOG.md">版本更新</a> · <a href="DISCLAIMER.md">免责声明</a> · <a href="docs/development.md">开发版编译与更新</a>
+  <a href="README.md">English</a> · <strong>简体中文</strong> · <a href="https://github.com/FishCodeTech/muteki/blob/v0.4.7/CHANGELOG.md">Python 更新记录</a> · <a href="DISCLAIMER.md">免责声明</a> · <a href="#开发与打包">开发版编译与更新</a>
 </p>
 
 <p align="center">
-  <a href="https://www.star-history.com/#fishcodetech/muteki&amp;Date">
+  <a href="https://www.star-history.com/#FishCodeTech/muteki&amp;Date">
     <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=fishcodetech/muteki&amp;type=Date&amp;theme=dark">
-      <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=fishcodetech/muteki&amp;type=Date">
-      <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=fishcodetech/muteki&amp;type=Date">
+      <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=FishCodeTech/muteki&amp;type=Date&amp;theme=dark">
+      <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=FishCodeTech/muteki&amp;type=Date">
+      <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=FishCodeTech/muteki&amp;type=Date">
     </picture>
   </a>
 </p>
@@ -41,7 +41,7 @@
 
 **無敵 · Project Muteki** 是一款基于Remix Engineering 的开源 多agent协作网络安全框架。
 
-本项目核心是实现了一套ai agent的调度方案，自动、智能化协调控制每个agent的上下文，像蜂群一样，各有分工，但都是为了完成最终的目标。并且可以兼容市面大部分的agent引擎，用于使用，当前可用 Worker 引擎为 Claude、Codex、Cursor、Pi、OMP、Kimi、Grok、OpenCode，后续将逐步支持更多引擎。
+本项目核心是实现了一套ai agent的调度方案，自动、智能化协调控制每个agent的上下文，像蜂群一样，各有分工，但都是为了完成最终的目标。并且可以兼容市面大部分的agent引擎，用于使用，当前可用 Worker 引擎为 Claude、Codex、Cursor、Pi、OMP、Kimi、Grok、OpenCode、Droid，后续将逐步支持更多引擎。
 项目未来将不断更新，成为all in one，而不是局限于单一安全场景，未来将不断迭代升级，成为成熟的开源agent产品。
 
 
@@ -88,38 +88,45 @@ tsecbench 托管模式下+deepseek-flash，排名13
 
 总之经过为期一个月的工程化优化，架构能力调教。bug修复，本项目正式开源，没有欺骗star，没有吹逼文案，没有打击你们的自信，没有子群，没有社区，没有骗钱，没有付费，没有营销，直接开源共享。
 
-欢迎使用并一同建设升级，遇到的任何问题请随时提issue。我们共同建设世界最强的ctf agent。
+欢迎使用并一同建设升级，遇到的任何问题请随时提issue，欢迎加入交流群。我们共同建设世界最强的ctf agent。
 
 ---
 
-## 版本更新
+## 项目仓库与版本
 
-当前版本为 **0.4.7**。新增功能、行为变化、移除内容及升级说明见 [CHANGELOG.md](CHANGELOG.md)。
+| 入口 | 用途 |
+| --- | --- |
+| [FishCodeTech/muteki](https://github.com/FishCodeTech/muteki) | 公开源码、公开 Release 和用户 Issue；对外分享、Star 和反馈使用此地址 |
+| [AtomGit](https://atomgit.com/FishCodeTech/muteki) | 项目镜像；同步情况以镜像实际内容为准 |
 
-[0.4.7 发布页](https://github.com/FishCodeTech/muteki/releases/tag/v0.4.7) 提供 Apple 芯片和 Intel Mac 的 macOS 客户端，内置本地服务，也可连接远程 Muteki 服务。本次不提供 Windows、Linux 桌面安装包，Web 和容器部署继续支持。
+当前公开版本为 [v0.5.0](https://github.com/FishCodeTech/muteki/releases/tag/v0.5.0)。主应用已从 v0.4.7 使用的 Python/FastAPI 与 Electron 迁移到本仓库的 Rust 服务、Next.js 前端和 macOS 原生壳。
 
-本次 macOS 安装包使用临时签名，尚未公证。已发布的 0.4.1 桌面版没有应用内更新界面，需要先手动安装一次 0.4.2。0.4.2 可在全局设置中检查并安装官方版本，安装前会校验 GitHub SHA-256 和严格签名。本地候选版本更新需要稳定的 Developer ID 签名。
+已有的 v0.4.7 托管 Web 安装可以直接使用稳定命令升级。更新器会校验兼容桥和当前平台的原生发布包，全部通过后才切换安装：
 
----
+```bash
+muteki upgrade v0.5.0
+```
 
-## 快速开始
+## Rust 开发版快速开始
 
 > **从 CTF 或渗透测试工作区开始。** 首页默认显示这两个工作区。对话和比赛工作区可按下文说明，在外观设置中开启。
 
 ### 1. 准备环境并启动
 
-需要 [uv](https://docs.astral.sh/uv/)（Python 依赖管理）、Python 3.13 或更新版本，以及 Node.js/npm（Web 界面）。本地做题还需要至少安装并登录一个受支持的 Agent CLI。`./init.sh` 会同步 Python 依赖；首次启动 Web 时会安装和构建前端依赖。下面是手动启动的最短路径；macOS、Ubuntu 和虚拟机的工具安装步骤见[推荐运行方式与工具安装](#推荐运行方式与工具安装)。
+准备 **Node.js 22/npm**、**支持 edition 2024 的 stable Rust 工具链**和 **sccache**。仓库的 Cargo 包装脚本要求 sccache。原生构建需要 C/C++ 工具链、CMake、pkg-config 和 dav1d；Linux 还需要 OpenSSL 开发头文件。各平台依赖可参照 [发布工作流](.github/workflows/build-packages.yml)。本地解题还需安装并登录至少一种受支持的 Agent CLI。
 
 ```bash
 git clone https://github.com/FishCodeTech/muteki.git
 cd muteki
-./init.sh
-./run.sh web
+npm --prefix apps/frontend ci
+node scripts/cargo.mjs build -p muteki-server --release -j 1
+npm --prefix apps/frontend run build
+node scripts/dev.mjs --web --release --skip-build
 ```
 
-浏览器打开 **http://127.0.0.1:3001**。默认仅监听本机地址；后端默认端口为 `8000`。第一次构建前端和初始化服务可能需要一些时间，以终端显示的地址和就绪信息为准。停止服务用 `Ctrl+C`。
+打开 **http://127.0.0.1:3101**。Rust API 默认监听 `127.0.0.1:8100`，前端代理 API 请求。启动这份 Rust Web 应用不需要 Python Web 服务或 uv 环境。首次编译可能较久，以终端输出为准。`Ctrl+C` 只停止本次启动的服务，复用的已有服务会保留。
 
-![当前 Web 首页：默认显示单题任务](./assets/readme-cn-home.png)
+![此前界面的单题工作台首页](./assets/readme-cn-home.png)
 
 ### 2. 完成最小配置
 
@@ -142,70 +149,54 @@ cd muteki
 
 > 只对你拥有或获授权的题目与目标运行。Worker 可以执行命令并访问目标服务。
 
-## 推荐运行方式与工具安装
+## 运行方式与 Worker 工具
 
-项目已在 **macOS 26** 和 **Ubuntu 24.04** 上进行相关测试。Windows 主机推荐通过 VMware 运行 Ubuntu 24.04 虚拟机，在虚拟机内安装 Muteki。
-
-| 运行方式 | 应用与 Worker 在哪里运行 | 工具准备 |
+| 运行方式 | 应用与 Worker 所在位置 | 当前状态 / 准备工作 |
 | --- | --- | --- |
-| **macOS 本机** | Web 与 Worker 都在 Mac 上 | 运行 `./ctf-tools/setup.sh` 安装原生 CTF 工具 |
-| **macOS + Docker** | Web 在 Mac 上，Worker 在 Docker 容器内 | 拉取完整 Worker 镜像；容器内已含 CTF 工具链 |
-| **Ubuntu 24.04 本机** | Web 与 Worker 都在 Ubuntu 上 | 安装脚本加 `--with-ctf-tools`，或单独运行 `./ctf-tools/setup-ubuntu.sh` |
-| **Windows + VMware** | Windows 只作为宿主和浏览器；Muteki 与 Worker 在 Ubuntu 24.04 虚拟机内 | 在虚拟机里运行 Ubuntu 一键安装脚本 |
+| **macOS 本地** | Rust Web 或桌面应用；Worker 使用宿主 CLI | Apple silicon 构建及真实模型流程已验证；CLI 与安全工具自行安装 |
+| **macOS + Docker Desktop** | 应用在 Mac，Worker 在 Linux 容器 | 共享/独立容器流程已验证；准备精选 Worker 镜像和可注入凭据 |
+| **Linux Web / Compose** | Rust Web 与独立 Runner | Ubuntu 24.04 原生 arm64 已实测；原生 amd64 模型执行尚未认证 |
+| **Windows** | 根据实际环境部署 Linux 执行环境 | 不声明已有原生 Windows 桌面包，也不声明 Windows/Docker Desktop 已全流程实测 |
 
-### 1. macOS 本机直接运行
+### 精选 Kali Worker 镜像
 
-先安装 Homebrew、Node.js/npm 和准备使用的 Agent CLI；CLI 的登录由各厂商完成。仓库根目录执行：
-
-```bash
-./init.sh
-export PATH="$HOME/.local/bin:$PATH"  # 若新安装的 uv 还不在 PATH
-./ctf-tools/setup.sh
-./run.sh web
-```
-
-`setup.sh` 使用 [`ctf-tools/Brewfile`](ctf-tools/Brewfile) 安装 macOS 原生工具，创建目录内的 Python/Ruby 工具环境，并生成统一命令入口；它**不会替你登录 Agent CLI**。完成后在“单题设置 → 运行环境”选择“本地运行”。`run.sh` 检测到 `ctf-tools/.ready` 后会自动加载工具路径。离线字典、知识库等大体积资料可按 [`ctf-tools/README.md`](ctf-tools/README.md) 从 Worker 镜像单独同步；只需要刷新已有工具的入口时可运行 `./ctf-tools/setup.sh --link-only`。macOS 原生工具与 Kali 容器内的 Linux 工具不完全相同。
-
-### 2. macOS + Docker 容器运行
-
-安装 Docker Desktop 并确认它正在运行，然后在仓库根目录执行：
+默认镜像包含九个 CLI 和精选 CTF/安全工具，专科重型依赖作为可选扩展层。镜像不包含 ZCode。构建本地 `muteki-worker:latest`：
 
 ```bash
-./init.sh
-docker pull ghcr.io/fishcodetech/muteki-worker:latest
-./run.sh web
+./docker/worker/build.sh
 ```
 
-在“单题设置 → 运行环境”选择“容器运行”，检查页面显示 Docker 与 Worker 镜像可用，再给出战 Worker 配置**可注入的凭据**。宿主机的 CLI 登录不会直接进入容器。完整 Worker 镜像已带 CTF 工具链，因此这一方式不需要在 Mac 上运行 `ctf-tools/setup.sh`。Web 控制台仍在 Mac 上运行，Worker 按任务由 Docker 启动。
+这是可选的 Docker 镜像构建，与 Web 应用编译分开，会下载依赖。构建脚本需要 Python 3 生成能力清单；本机有 Go 时使用 Go，否则使用 Go 构建容器。发布工作流会在原生架构上验证精选镜像和可选专科镜像。不要直接把旧仓库的 `latest` 标签当成新的 Rust 配套镜像。
 
-### 3. Ubuntu 24.04 本机直接运行
+### 一个容器多 Run，或者每 Run 一个容器
 
-```bash
-git clone https://github.com/FishCodeTech/muteki.git
-cd muteki
-./scripts/install-ubuntu.sh --backend local --preflight
-./scripts/install-ubuntu.sh --backend local --with-ctf-tools
-./scripts/install-ubuntu.sh --backend local --check
-```
+共享模式让多个 Run 使用兼容的同一容器，各自维护工作区和进程生命周期，停止一个 Run 不应影响邻居。独立模式为每个 Run 分配单独容器。共享模式不构成不可信任务之间的操作系统安全隔离；镜像、网络、权限和凭据信任域决定能否进入同一共享池。
 
-这个安装器准备应用依赖、Node.js、Web 服务和本地 Worker CLI，并调用 `ctf-tools/setup-ubuntu.sh` 安装 Ubuntu 可用的 CTF 工具。当前脚本会安装并检查全部受支持的本地 CLI；Agent CLI 仍需分别完成登录或在设置中配置凭据。默认创建 `muteki-web.service`；Web 密码写在当前用户的 `~/.config/muteki/ubuntu.env`，界面使用 Ubuntu 主机的 `3001` 端口。可选 apt 包可能随镜像源和 CPU 架构不同而缺失，脚本会逐项报告。
+并发数量由实际执行节点根据资源给出推荐值。可以采用推荐、手动设置，或明确关闭调度并发限制；关闭不会取消另设的 CPU/内存配额、任务预算或授权约束。启用限制时，超额任务进入可见队列。暂停进程不等于释放内存。
 
-若已自行安装并启动 Muteki，只想补装本地 CTF 工具，可先确保 `uv` 可用，再运行 `./ctf-tools/setup-ubuntu.sh`。该脚本目前只测试过ubuntu24.04，其他发行版本的linux，建议让ai进行对应的优化和修改。
+### 独立 Runner
 
-安装成功后 `./run.sh web` 会自动加载 `ctf-tools/.ready` 对应的工具路径。
+Web 负责任务策略和记录，Runner 控制 Docker 和 Worker 进程。Compose 中只有 Runner 挂载 Docker socket。远程注册、认证 TLS/WSS、文件传输及重连逻辑已实现；外部 NAT/VPS 和全部故障窗口仍未完整认证。各版本实际执行的原生包、容器和运行时检查以 Release 工作流结果为准。
 
-### 4. Windows + VMware 虚拟机
+### 远程 Runner
 
-在 VMware 中创建 **Ubuntu 24.04** 虚拟机，把仓库克隆到虚拟机内，然后在虚拟机终端执行与 Linux 本机相同的安装命令：
+在 **设置 → CTF Worker → 执行节点** 中管理远程节点：
 
-```bash
-git clone https://github.com/FishCodeTech/muteki.git
-cd muteki
-./scripts/install-ubuntu.sh --backend local --with-ctf-tools
-./scripts/install-ubuntu.sh --backend local --check
-```
+1. 打开“远程节点监听”，填写监听地址（如 `0.0.0.0:7443`）和节点能访问到的公开地址（如 `https://203.0.113.10:7443`），保存后立即生效。首次启用时 Web 在数据目录生成私有 CA 和服务端证书；公开地址的主机名或 IP 会写入证书。页面显示 CA 指纹，也可下载 `ca.pem`。用启动参数 `--runner-tls-listen/--runner-tls-cert/--runner-tls-key` 配置的监听只能在命令行修改，页面只读。
+2. 在“注册新节点”中填写名称和有效期（最长 15 分钟），生成一次性注册命令。命令带有令牌和 CA 指纹，Runner 只信任这一 CA；命令只显示一次，不要写进共享的 shell 历史。
+3. 在远程机器上（需要 Docker 和同版本的 `muteki-server`）依次执行页面给出的命令：
 
-Muteki、Agent CLI、CTF 工具和运行目录都在 Ubuntu 虚拟机内；Windows 只负责打开浏览器。安装完成后在 Windows 浏览器访问 `http://<虚拟机IP>:3001`，使用虚拟机中 `~/.config/muteki/ubuntu.env` 保存的 Web 密码。请让 Windows 能访问虚拟机的 UI 端口；若 VMware 使用 NAT 且无法直连虚拟机 IP，可配置端口转发或改用合适的虚拟网络。后端 API 默认只监听虚拟机回环地址。
+   ```bash
+   printf '%s' '<token>' | muteki-server runner enroll --state-dir "$HOME/.muteki-runner" \
+     --server https://203.0.113.10:7443 --ca-sha256 <fingerprint> --token-file /dev/stdin
+   muteki-server runner --remote --state-dir "$HOME/.muteki-runner"
+   ```
+
+   节点需要经代理访问 Web 时设置 `HTTPS_PROXY=http://proxy:port`（只支持 HTTP CONNECT 代理），`NO_PROXY` 生效。`muteki-server runner status --state-dir ...` 显示本机身份、凭据到期时间和实际使用的代理。
+4. 节点上线后，在“运行环境”中选择它作为执行节点；远程节点只能运行容器 Worker。节点列表可排空（不再接新任务，已在运行的继续）、恢复、轮换凭据、撤销和删除。每个节点有独立的并发设置。
+5. 轮换凭据后页面只显示一次安装命令（`muteki-server runner install-credential --state-dir ... --credential-file /dev/stdin`），在节点上执行后重启 Runner。撤销后旧身份无法恢复，重新生成注册令牌后用 `runner enroll ... --replace` 替换。
+
+超过节点并发上限的 Worker 会排队，运行页显示排队状态；节点离线时任务等待它重新上线。撤销立即使节点会话失效，且不可恢复。发任务时关闭“搜索工具”会对 Claude、Codex 禁用内置搜索/抓取（Pi 本身没有），其他引擎会拒绝启动而不是带着搜索工具运行；这与容器网络策略无关。
 
 ## 配置详情说明
 
@@ -213,7 +204,7 @@ Muteki、Agent CLI、CTF 工具和运行目录都在 Ubuntu 虚拟机内；Windo
 | --- | --- | --- |
 | **单题设置 → Agent 凭据** | 引擎探测、宿主登录、Token/Key、自定义端点、连接测试 | 确认至少一个可用凭据；不要把密钥写入题面或提交到 Git |
 | **单题设置 → 出战配置** | Worker 阵容、引擎、模型、推理强度、启停和每席并发 | 先启用一名可自检通过的 Worker，再逐步增加 |
-| **单题设置 → 运行环境** | 本地/容器、容器作用域、网络、镜像及可选 VPN | 不需要 |
+| **单题设置 → 运行环境** | 本地/容器、容器作用域、网络、镜像及可选 VPN | 选择本地 CLI 或容器；容器需镜像和可注入凭据 |
 | **单题设置 → 调度与预算** | 自动调度/固定并跑、并发、总时长、Worker 数和成本上限 | 先保留默认值；明确资源限制后再调整 |
 | **单题设置 → 推理模型** | Planner、Titler 的端点、模型和生成参数 | 至少测试 Planner 的真实请求 |
 | **设置 → 外观配色 → 工作区模式** | 是否显示对话和比赛 | 要试用扩展工作区时开启“显示对话和比赛模式” |
@@ -222,21 +213,15 @@ Muteki、Agent CLI、CTF 工具和运行目录都在 Ubuntu 虚拟机内；Windo
 
 ### 受支持的 Worker 引擎
 
-当前界面可配置 Claude Code、Codex、Cursor、Pi、OMP、Kimi、Grok 和 OpenCode 等 CLI；具体能否使用取决于本机安装、厂商登录和所选运行环境。至少准备其中一个。DeepSeek Harness 由于其没有acp、等provider内容，目前只保留登记信息，暂不可作为出战 Worker。各 CLI 的安装和授权流程以对应厂商说明为准。
+精选 Worker 注册表列出 **Claude Code、Codex、Cursor、Pi、OMP、Kimi、Grok、OpenCode、Droid** 九个 CLI，安装版本以 [`docker/worker-common/engines.json`](docker/worker-common/engines.json) 为准。已经登记或安装 CLI，不等于所有厂商/模型组合均已验证；仍需要兼容凭据、可用模型与正确运行环境。
 
-Pi 聊天参照 [T3 Code 的 Pi 接入](https://github.com/pingdotgg/t3code/tree/main/packages/provider-pi)，直接调用本机 Pi CLI 的原生 RPC，不再另装 Pi SDK 或 ACP 桥接。思考档位来自所选模型的 RPC 元数据，设置后会核实实际生效档位。输入框提供严格监督、自动接受修改、完全访问三档权限，由工具调用扩展执行审批；它控制 Pi 工具调用，不是操作系统沙箱。已有 Pi ACP 历史记录保持可读，新会话请选择 Pi RPC。
+使用 **Pi + Ollama** 时，添加兼容 OpenAI 的端点（例如宿主 CLI 使用 `http://127.0.0.1:11434/v1`，Docker 内使用 `http://host.docker.internal:11434/v1`），选择 Ollama 实际提供的模型，并在所选环境中测试连接。远程 Runner 要填写该节点能访问的地址，它的 localhost 不是 Web 所在机器。将端点/模型绑定到 Pi Worker，并单独配置 Planner，保存后再发起任务。
 
-**注意：**如果页面显示“待自检”或“没有可用凭据”，先到“Agent 凭据”测试连接，再检查“出战配置”中的凭据绑定、模型和运行环境。自检会发起真实模型请求，可能产生用量。
+页面显示“待自检”或“没有可用凭据”时，先测试账号，再检查 Worker 的凭据、模型和运行环境绑定。自检会发起真实模型请求，可能产生用量。
 
 ### 模型价格表
 
-Muteki 用量总览使用独立公开项目 [model-prices](https://github.com/jiayuqi7813/model-prices) 提供的价格表。该项目通过 GitHub Actions 每天在 **UTC 03:17 / 北京时间 11:17** 同步 LiteLLM、models.dev、Cursor 官方模型价格、Devin 的 SWE-2 公开标价和 Grok Build Fast 官方价格，发布统一的 [prices.json](https://raw.githubusercontent.com/jiayuqi7813/model-prices/main/prices.json)。Muteki 在读取用量时检查该地址，缓存 24 小时；更新失败时保留上次有效价格。JSON 包含生成时间及来源信息，超过 48 小时未更新的快照会显示为缓存价格。
-
-Cursor、Devin 和 Grok Build 优先使用各自渠道的价格。Grok Build 的 `grok-4.7-build-fast` 使用官方 Fast 报价，并区分超过 200,000 prompt tokens 的长上下文价格，不套用标准版 Grok API 价格。Cursor 标准、Fast、长上下文档分别保留；Auto 或缺少必要档位信息的调用继续显示未定价。Pi、OMP、OpenCode 等可切换供应商的引擎按实际供应商和模型查价，不设统一的“Agent 单价”。
-
-在 **设置 → Agents 和接入点 → 模型价格** 中可检测完整模型 ID、确认目录映射，或新增、修改、删除自定义价格。单位为 USD / 百万 Token，可按凭据和供应商限定范围；填写 `0` 表示明确零价，缓存价格留空表示未知。自定义价格不会被每日目录更新覆盖。聊天、CTF 和 Pentest 的费用视图共用计价结果，原始 Token 和上报金额保留用于追溯；工具估价、目录估价和自定义估价分别标明，缺失 Token 不会通过价格表补造。
-
-这些价格用于公开标价估算，不代表订阅账单或中转商实际收费。不同供应商的模型条目分别保留，缺失价格不会补成零；上游改价到每日价格表更新之间可能存在延迟。该价格表用于用量估算，执行预算仍使用独立的价格规则。
+Muteki 使用公开的 [model-prices](https://github.com/jiayuqi7813/model-prices) 目录估算用量，缓存有效目录数据 24 小时。可在 **设置 → Agents 和接入点 → 模型价格** 中配置映射与自定义价格。单位为 USD / 百万 Token；明确零价和未知价格是两种状态，价格表不会补造缺失用量。公开标价估算不等于订阅账单或中转商实际收费。
 
 ## 如何做题
 
@@ -274,7 +259,7 @@ Cursor、Devin 和 Grok Build 优先使用各自渠道的价格。Grok Build 的
 - **复制 Flag 并到题目平台验证。**
 - **标记误报：**如果候选 Flag 被平台判错，在结果区用“标记误报”（单个 Flag 行上的 `×` 也有此作用）。多 Flag 时先选择要否定的那个。此操作会标记候选并重新打开解题。
 - **继续做题：**在已结束页面重新拉起完整蜂群，沿用已有证据继续探索。
-- **追问 / 生成复盘：**结束后可向解题 Worker 追问，或生成复盘报告。生成成功后，正文会显示在对话中，同时写入该 Run 的 `sessions/<run-id>/workspace/writeup.md`（若自定义了 `MUTEKI_SESSIONS_ROOT`，以该目录为起点）。生成会调用实际整个run的全部上下文进行总结。所以会需要一些时间。
+- **追问 / 生成复盘：**结束后可向解题 Worker 追问，或生成复盘报告。生成成功后，正文会显示在对话中，同时写入所选 Rust 数据目录下该 Run 的 `sessions/<run-id>/writeup.md`。生成会调用实际整个run的全部上下文进行总结。所以会需要一些时间。
 
 ## 测试中的扩展功能
 
@@ -299,49 +284,56 @@ Cursor、Devin 和 Grok Build 优先使用各自渠道的价格。Grok Build 的
 
 ![当前扩展设置：安装预览与插件列表](./assets/readme-cn-extensions.png)
 
-## 部署与更新
+## 部署、数据与开发
 
 ### 本地 Web
 
 ```bash
-./run.sh web                         # Web 后端 :8000 + 界面 :3001
-./run.sh web --backend-only          # 只启动后端
-./run.sh web --ui-port 3002          # 更换界面端口
-./run.sh web --rebuild-ui            # 修改 UI 源码后强制重建
+node scripts/dev.mjs --web --release --skip-build  # 使用已有生产构建，UI :3101
+node scripts/dev.mjs --hot --web                   # 前端热预览，UI :3103
 ```
 
-仓库根目录可放 `.env`（从 [`.env.example`](.env.example) 复制）保存 `MUTEKI_*` 环境变量；Shell 已导出的同名变量优先。密钥只放在被 Git 忽略的 `.env` 或 `state/_secrets/` 等路径。若把 Web 绑定到非本机地址，必须设置 `MUTEKI_WEB_PASSWORD`，否则后端会拒绝启动。
+`MUTEKI_STATE_DIR` 指定私有状态根目录，源码开发默认使用 `.state`，macOS 安装包使用应用数据目录。凭据与任务记录应保存在私有数据中，不放进仓库或应用包。切换代码分支不会自动转换 Python 运行数据。
+
+需要局域网访问时，先在环境变量或访问设置中配置 `MUTEKI_WEB_PASSWORD`，再用 `node scripts/dev.mjs --web --release --skip-build --host 0.0.0.0` 启动。如果复用了旧后端，需要在访问配置变化后重启它；此方式的 API 仍保留在 loopback。
 
 ### Docker Compose
 
-Compose 启动 FastAPI 与 Next.js 控制面；Worker 由 Docker daemon 按需启动。先准备 Docker 和 Worker 镜像，再设置宿主数据绝对路径及 Web 密码：
+先准备与版本/架构对应的 **Linux Web 镜像**和 Worker 镜像。下例中的 `muteki-web:latest`、`muteki-worker:latest` 是本地镜像名，不表示远程 registry 中的同名标签已更新。Web 镜像使用 Linux Web 发布包和 [`docker/web/Dockerfile`](docker/web/Dockerfile) 构建；发布包流程见 [工作流](.github/workflows/build-packages.yml)。
 
 ```bash
-docker pull ghcr.io/fishcodetech/muteki-worker:latest
 MUTEKI_HOST_DATA_ROOT=/opt/muteki/data \
-MUTEKI_WEB_PASSWORD='请替换为强密码' \
-  docker compose up --build
+MUTEKI_WEB_IMAGE=muteki-web:latest \
+MUTEKI_WORKER_IMAGE=muteki-worker:latest \
+MUTEKI_WEB_PASSWORD='replace-with-a-strong-password' \
+  docker compose -f docker-compose.web.yml up -d --wait
 ```
 
-界面默认仍在 `http://localhost:3001`。`MUTEKI_HOST_DATA_ROOT` 必须是宿主机上的绝对路径，供控制面和 Worker 访问同一份数据。Docker Desktop 的 macOS 路径经过验证；Windows Compose 路径尚未完成真机端到端验证。更多环境变量见 [`.env.example`](.env.example)，镜像和运行边界见 [SECURITY.md](SECURITY.md)。
+打开 `http://127.0.0.1:3101`。Web 与 Runner 共享绝对路径的数据根，Web 不持有 Docker socket。升级或回滚前先排空活动 Worker，保留数据及旧镜像 digest。原生 Linux arm64 和 Docker Desktop arm64 的实测不能代替其他平台验收。
 
-### 应用更新与回滚
+### 开发与打包
+
+安装前端依赖后，浏览器热预览使用 `node scripts/dev.mjs --hot --web`；macOS 的 `node scripts/dev.mjs --hot` 会打开桌面开发窗口。前端热更新使用 `3103` 和 `.next-dev`，修改 Rust 仍需重新构建并重启后端。开发数据需要隔离时，设置独立的 `MUTEKI_STATE_DIR`。
+
+macOS 桌面打包：
 
 ```bash
-./run.sh upgrade --check   # 检查稳定版
-./run.sh install            # 安装托管版本
-muteki upgrade v0.4.7      # 更新到本次版本
-muteki rollback            # 回滚到上一个已安装版本
-muteki version             # 查看版本与安装形态
+node scripts/cargo.mjs build --workspace --release -j 1
+npm --prefix apps/frontend run build
+node scripts/package-macos.mjs --skip-build
 ```
 
-Web 的“单题设置 → 系统更新”也提供相应操作。升级前保留 `.env`、`sessions/` 和 `state/`；不要把运行记录或凭据提交进仓库。
+产物为 `dist/Muteki.app`，包含 Node、前端与 Rust 服务。当前本地包使用 ad-hoc 签名，未经过 Developer ID 签名或公证。不能把旧 Python Release 的平台支持或更新行为直接套到新构建的 Rust 包。
+
+在对应 macOS/Linux 目标平台按前文构建服务和前端后，运行 `node scripts/package-web.mjs --skip-build` 可生成独立 Web 发布包，输出在 `dist/web-releases/`。旧 `./init.sh`、`./run.sh`、`ctf-tools/` 和 Python Ubuntu 安装器属于归档分支。
+
+Linux 原生 Web 发布包依赖系统共享库。在 Ubuntu 24.04 上先安装 `sudo apt-get install libdav1d7 libstdc++6`；其他发行版需提供兼容的 glibc、dav1d 和 C++ 运行库。可用 `ldd bin/muteki-server` 检查缺失项。Web Docker 镜像已安装这些运行库。
 
 ## 常见问题
 
 | 现象 | 先检查什么 |
 | --- | --- |
-| 页面打不开 | 看 `./run.sh web` 输出的地址和端口；检查 Node/npm、首次前端构建，以及 `state/_logs/backend.log`、`state/_logs/ui.log` |
+| 页面打不开 | 启动器打印的地址、Node/npm、Rust 可执行文件、Next 构建和终端错误输出 |
 | 找不到可用 Worker | 确认 CLI 已安装并登录，Agent 凭据测试通过；检查 Worker 是否启用、绑定了正确凭据和模型 |
 | 容器任务启动失败 | 检查 Docker 服务、Worker 镜像、容器凭据、网络/VPN 和页面“运行环境”状态 |
 | Planner 测试失败 | 核对模型端点、端点模型、Key/Base URL 和网络；Worker CLI 可用不代表 Planner 已配置 |
@@ -351,16 +343,16 @@ Web 的“单题设置 → 系统更新”也提供相应操作。升级前保�
 
 ## 项目与参与
 
-- **代码导航：**`muteki/` 是后端核心；`apps/web/` 是 FastAPI 服务；`apps/web/ui/` 是 Next.js 界面；`docker/` 是镜像配置。。
+- **代码导航：**`crates/server/` 为 Rust API/Runner，`crates/desktop/` 为桌面壳，`apps/frontend/` 为 Next.js，`cmd/runtime-agent/` 管理容器进程，`docker/` 为镜像配方。
 - **问题反馈：**功能缺陷和文档问题请到 [GitHub Issues](https://github.com/FishCodeTech/muteki/issues) 提交复现步骤、版本和已脱敏日志。安全漏洞请按 [SECURITY.md](SECURITY.md) 通过私密渠道报告。
 - **许可证：**本项目以 [GNU AGPL-3.0](LICENSE) 发布。外部 Agent CLI 和模型服务分别适用其自身的许可、服务条款与费用规则。
 
-## 后续todo：
+## 后续建设
 
-- [ ] 渗透模式重构
-- [ ] src漏洞挖掘模式
-- [ ] all in one的agent聊天功能。
-- [ ] 全面插件化
+- 补充原生 amd64、Windows 及外部代理/NAT 环境的验收。
+- 继续完善渗透测试与源代码安全工作流。
+- 扩展融合 Agent 对话和插件生态。
+- 补齐更多故障恢复窗口与跨版本数据迁移验证。
 
 ## 鸣谢
 

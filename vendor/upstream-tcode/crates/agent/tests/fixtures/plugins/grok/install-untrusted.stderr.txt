@@ -1,0 +1,5 @@
+Installing "alpha" from marketplace "mkt" requires confirmation.
+Plugins can run hooks, MCP servers, and skills on your machine, so installation needs explicit trust.
+
+To proceed, re-run with --trust:
+  grok plugin install alpha@mkt --trust

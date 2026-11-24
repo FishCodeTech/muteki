@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import base64
 import hashlib
 import ipaddress
 import json
@@ -10,6 +11,7 @@ import select
 import socket
 import socketserver
 import ssl
+import struct
 import subprocess
 import threading
 import time
@@ -17,7 +19,7 @@ import traceback
 import uuid
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 MAX_HEAD = 64 * 1024
 BUFFER = 64 * 1024
@@ -160,6 +162,8 @@ def _body(sock: socket.socket, headers: list[tuple[str, str]], limit: int, *, eo
                     data.extend(trailer)
                     if trailer == b"\r\n":
                         return bytes(data)
+            if len(data) + size + 2 > limit:
+                raise InspectionError("inspection_unavailable", "body exceeds the configured inspection budget")
             data.extend(_read_exact(sock, size + 2))
             if len(data) > limit:
                 raise InspectionError("inspection_unavailable", "body exceeds the configured inspection budget")
@@ -194,8 +198,22 @@ def _normalized_host(host: str) -> str:
 
 
 def _path_match(path: str, prefix: str) -> bool:
-    path = urlsplit(path).path or "/"
-    prefix = urlsplit(prefix).path.rstrip("/") or "/"
+    def scoped_path(value: str) -> str | None:
+        current = urlsplit(value).path or "/"
+        for _ in range(8):
+            decoded = unquote(current)
+            if decoded == current:
+                break
+            current = decoded
+        if ("\\" in current or re.search(r"%[0-9a-fA-F]{2}", current)
+                or any(segment in {".", ".."} for segment in current.split("/"))):
+            return None
+        return current
+    path = scoped_path(path)
+    prefix = scoped_path(prefix)
+    if path is None or prefix is None:
+        return False
+    prefix = prefix.rstrip("/") or "/"
     return prefix == "/" or path == prefix or path.startswith(prefix + "/")
 
 
@@ -325,11 +343,237 @@ def _openssl(*args: str) -> None:
         raise InspectionError("inspection_unavailable", f"openssl failed: {result.stderr.strip()}")
 
 
-def _connect(host: str, port: int) -> socket.socket:
-    sock = socket.socket(socket.AF_INET6 if ":" in host else socket.AF_INET, socket.SOCK_STREAM)
+def _is_loopback_target(host: str) -> bool:
+    clean = host.strip("[]").lower().rstrip(".")
+    if clean == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(clean).is_loopback
+    except ValueError:
+        return False
+
+
+def _dial_endpoint(host: str, port: int) -> tuple[str, int]:
+    """Loopback inside the gateway netns is the gateway itself, not the operator's machine."""
+    if not _is_loopback_target(host):
+        return host, port
+    try:
+        info = socket.getaddrinfo("host.docker.internal", port, socket.AF_INET, socket.SOCK_STREAM)
+        return info[0][4][0], port
+    except OSError:
+        return host, port
+
+
+class _UpstreamProxyPool:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._enabled = False
+        self._selection = "failover"
+        self._threshold = 5
+        self._cooldown = 600.0
+        self._fallback_direct = False
+        self._nodes: list[dict[str, Any]] = []
+        self._state: dict[str, dict[str, Any]] = {}
+        self._rr = 0
+
+    def reload(self, cfg: dict[str, Any] | None) -> None:
+        with self._lock:
+            if not cfg or not cfg.get("enabled"):
+                self._enabled = False
+                self._nodes = []
+                return
+            self._enabled = True
+            self._selection = str(cfg.get("selection") or "failover")
+            self._threshold = max(1, int(cfg.get("failure_threshold") or 5))
+            self._cooldown = max(10.0, float(cfg.get("cooldown_secs") or 600))
+            self._fallback_direct = bool(cfg.get("fallback_direct"))
+            self._nodes = sorted(
+                [dict(n) for n in (cfg.get("nodes") or []) if n.get("host") and n.get("port")],
+                key=lambda n: int(n.get("priority") or 100),
+            )
+
+    def candidates(self) -> tuple[bool, bool, list[dict[str, Any]]]:
+        now_t = time.monotonic()
+        with self._lock:
+            if not self._enabled or not self._nodes:
+                return False, True, []
+            healthy = []
+            for node in self._nodes:
+                nid = str(node.get("node_id") or f"{node.get('host')}:{node.get('port')}")
+                st = self._state.get(nid, {})
+                until = float(st.get("cooldown_until") or 0.0)
+                if until <= now_t:
+                    healthy.append(node)
+            if self._selection == "round_robin" and len(healthy) > 1:
+                idx = self._rr % len(healthy)
+                self._rr += 1
+                healthy = healthy[idx:] + healthy[:idx]
+            return True, self._fallback_direct, healthy
+
+    def record_outcome(self, node: dict[str, Any], ok: bool, err: str = "") -> None:
+        nid = str(node.get("node_id") or f"{node.get('host')}:{node.get('port')}")
+        with self._lock:
+            st = self._state.setdefault(nid, {"fails": 0, "cooldown_until": 0.0, "last_error": ""})
+            if ok:
+                st["fails"] = 0
+                st["cooldown_until"] = 0.0
+                st["last_error"] = ""
+            else:
+                st["fails"] = int(st.get("fails") or 0) + 1
+                st["last_error"] = err
+                if st["fails"] >= self._threshold:
+                    st["cooldown_until"] = time.monotonic() + self._cooldown
+
+
+_UPSTREAM_POOL = _UpstreamProxyPool()
+
+
+def _recv_exact(sock: socket.socket, n: int) -> bytes:
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise OSError("unexpected EOF from upstream proxy")
+        buf.extend(chunk)
+    return bytes(buf)
+
+
+def _dial_through_node(node: dict[str, Any], host: str, port: int) -> socket.socket:
+    scheme = str(node.get("scheme") or "http").lower()
+    uhost = str(node["host"])
+    uport = int(node["port"])
+    user = str(node.get("username") or "")
+    pwd = str(node.get("password") or "")
+    sock = socket.socket(socket.AF_INET6 if ":" in uhost else socket.AF_INET, socket.SOCK_STREAM)
     sock.settimeout(20.0)
-    sock.connect((host, port))
+    sock.connect((uhost, uport))
+    try:
+        if scheme in {"socks5", "socks5h"}:
+            methods = b"\x00\x02" if (user or pwd) else b"\x00"
+            sock.sendall(bytes([0x05, len(methods)]) + methods)
+            resp = _recv_exact(sock, 2)
+            if resp[0] != 0x05:
+                raise OSError("SOCKS5 invalid greeting")
+            if resp[1] == 0x02:
+                ub, pb = user.encode("utf-8"), pwd.encode("utf-8")
+                sock.sendall(bytes([0x01, len(ub)]) + ub + bytes([len(pb)]) + pb)
+                auth_resp = _recv_exact(sock, 2)
+                if auth_resp[1] != 0x00:
+                    raise OSError("SOCKS5 authentication failed")
+            elif resp[1] != 0x00:
+                raise OSError("SOCKS5 method rejected")
+            req = bytearray(b"\x05\x01\x00")
+            try:
+                ip = ipaddress.ip_address(host.strip("[]"))
+                if ip.version == 4:
+                    req.append(0x01)
+                    req.extend(ip.packed)
+                else:
+                    req.append(0x04)
+                    req.extend(ip.packed)
+            except ValueError:
+                hb = host.encode("utf-8")
+                req.append(0x03)
+                req.append(len(hb))
+                req.extend(hb)
+            req.extend(struct.pack("!H", port))
+            sock.sendall(bytes(req))
+            hdr = _recv_exact(sock, 4)
+            if hdr[0] != 0x05 or hdr[1] != 0x00:
+                raise OSError(f"SOCKS5 connect rejected: code {hdr[1]}")
+            if hdr[3] == 0x01:
+                _recv_exact(sock, 6)
+            elif hdr[3] == 0x03:
+                alen = _recv_exact(sock, 1)[0]
+                _recv_exact(sock, alen + 2)
+            elif hdr[3] == 0x04:
+                _recv_exact(sock, 18)
+            return sock
+
+        if scheme == "https":
+            ctx = ssl.create_default_context()
+            sock = ctx.wrap_socket(sock, server_hostname=uhost)
+        authority = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+        lines = [f"CONNECT {authority} HTTP/1.1", f"Host: {authority}"]
+        if user or pwd:
+            tok = base64.b64encode(f"{user}:{pwd}".encode("utf-8")).decode("ascii")
+            lines.append(f"Proxy-Authorization: Basic {tok}")
+        sock.sendall(("\r\n".join(lines) + "\r\n\r\n").encode("latin1"))
+        head = bytearray()
+        while not (head.endswith(b"\r\n\r\n") or head.endswith(b"\n\n")):
+            ch = sock.recv(1)
+            if not ch:
+                raise OSError("HTTP CONNECT upstream EOF")
+            head.extend(ch)
+            if len(head) > 16384:
+                raise OSError("HTTP CONNECT response too large")
+        status_line = bytes(head).split(b"\n", 1)[0].decode("latin1", errors="replace")
+        parts = status_line.split()
+        code = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+        if not (200 <= code < 300):
+            raise OSError(f"HTTP CONNECT rejected: {status_line.strip()}")
+        return sock
+    except Exception:
+        try:
+            sock.close()
+        except OSError:
+            pass
+        raise
+
+
+def _connect(host: str, port: int) -> socket.socket:
+    if _is_loopback_target(host):
+        dial_host, dial_port = _dial_endpoint(host, port)
+        sock = socket.socket(socket.AF_INET6 if ":" in dial_host else socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(20.0)
+        sock.connect((dial_host, dial_port))
+        return sock
+    pool_enabled, fallback_direct, nodes = _UPSTREAM_POOL.candidates()
+    if pool_enabled:
+        last_err: Exception | None = None
+        for node in nodes:
+            try:
+                sock = _dial_through_node(node, host, port)
+                _UPSTREAM_POOL.record_outcome(node, True)
+                return sock
+            except Exception as exc:
+                last_err = exc
+                _UPSTREAM_POOL.record_outcome(node, False, str(exc))
+        if not fallback_direct:
+            raise InspectionError("proxypool_exhausted", str(last_err or "all upstream proxy circuits open"))
+    dial_host, dial_port = _dial_endpoint(host, port)
+    sock = socket.socket(socket.AF_INET6 if ":" in dial_host else socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(20.0)
+    sock.connect((dial_host, dial_port))
     return sock
+
+
+def _excluded_request(policy, url, method, headers):
+    parsed = urlsplit(url)
+    host = (parsed.hostname or "").lower().rstrip(".")
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    from urllib.parse import parse_qs
+    for rule in policy.get("exclusions", []):
+        if rule.get("enabled") is False:
+            continue
+        expected = str(rule.get("host", "")).lower().rstrip(".")
+        if expected and not (host == expected or expected.startswith("*.") and (host == expected[2:] or host.endswith(expected[1:]))):
+            continue
+        ports = rule.get("port")
+        if ports is not None and port not in (ports if isinstance(ports, list) else [ports]):
+            continue
+        if rule.get("path_prefix") and not (parsed.path or "/").startswith(rule["path_prefix"]):
+            continue
+        if rule.get("method") and method.upper() != rule["method"].upper():
+            continue
+        if rule.get("route_regex") and not re.search(rule["route_regex"], parsed.path or "/"):
+            continue
+        if rule.get("content_type") and rule["content_type"].lower() not in " ".join(_header(headers, "content-type")).lower():
+            continue
+        if rule.get("param_name") and rule["param_name"] not in parse_qs(parsed.query, keep_blank_values=True):
+            continue
+        return True
+    return False
 
 
 class CertificateAuthority:
@@ -387,6 +631,7 @@ class RawHttpProxy:
     def reload(self, policy: dict[str, Any]) -> None:
         with self._policy_lock:
             self.policy = policy
+            _UPSTREAM_POOL.reload(policy.get("upstream_proxies"))
             if policy.get("inspection_requirements", {}).get("mode") == "enforce":
                 self.ca = CertificateAuthority(self.root)
 
@@ -449,6 +694,7 @@ class ProxyHandler(socketserver.BaseRequestHandler):
                 self._handle_plain()
         except (InspectionError, ssl.SSLError, OSError, ValueError) as exc:
             code = exc.code if isinstance(exc, InspectionError) else "inspection_unavailable"
+            self.meta["error_code"] = code
             self.meta["errors"].append(f"{code}: {exc}")
             self.meta["traceback"] = traceback.format_exc()
             self.meta["capture_state"] = "partial"
@@ -467,14 +713,31 @@ class ProxyHandler(socketserver.BaseRequestHandler):
         if path:
             url = f"{scheme}://{host}:{port}{path if path.startswith('/') else '/' + path}"
             return self._request_inspection(url, policy)[0]
+        connect_url = f"{scheme}://{host}:{port}/"
+        for exception in requirements.get("exceptions", []):
+            exc_target = exception.get("target")
+            if exc_target and _target_match(connect_url, exc_target):
+                protocol = exception.get("protocol")
+                expires = float(exception.get("expires_at") or 0)
+                if (not protocol or protocol == scheme) and (not expires or expires > time.time()):
+                    return "off"
         norm_host = _normalized_host(host)
         for target in selected:
-            expected = urlsplit(target)
-            if expected.scheme.lower() != scheme.lower() or not expected.hostname:
+            if _target_match(connect_url, target):
+                return mode
+            raw_target = str(target).strip()
+            if "://" not in raw_target:
+                parsed_bare = urlsplit(f"//{raw_target}")
+                target_host = parsed_bare.hostname or ""
+                if target_host and _normalized_host(target_host) == norm_host and (not parsed_bare.port or parsed_bare.port == port):
+                    return mode
+            expected = urlsplit(raw_target)
+            if not expected.hostname:
                 continue
             expected_port = expected.port or (80 if expected.scheme.lower() == "http" else 443)
             if _normalized_host(expected.hostname) == norm_host and expected_port == port:
-                return mode
+                if expected.scheme.lower() == scheme.lower() or not path:
+                    return mode
         return "off"
 
     def _request_inspection(self, url: str, policy: dict[str, Any]) -> tuple[str, str]:
@@ -541,11 +804,16 @@ class ProxyHandler(socketserver.BaseRequestHandler):
         start, headers = _headers(raw_head[:-4])
         method = start.split(" ", 1)[0]
         if method.upper() == "CONNECT":
-            authority = start.split(" ")[1]
-            host, port = authority.rsplit(":", 1)
-            mode = self._inspection(host.strip("[]"), int(port), "https")
+            authority = start.split(" ")[1].strip()
+            self.meta["connect_authority"] = authority
+            parsed_auth = urlsplit(f"//{authority}")
+            if not parsed_auth.hostname:
+                raise InspectionError("inspection_unavailable", "CONNECT authority is invalid")
+            connect_host = parsed_auth.hostname
+            connect_port = parsed_auth.port or 443
+            mode = self._inspection(connect_host, connect_port, "https")
             if mode != "enforce":
-                self._tunnel(host.strip("[]"), int(port), "uninspected_tls_record" if mode == "record" else "tls_not_selected", connect=True)
+                self._tunnel(connect_host, connect_port, "uninspected_tls_record" if mode == "record" else "tls_not_selected", connect=True)
                 return
             self.request.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             self._handle_tls()
@@ -617,8 +885,17 @@ class ProxyHandler(socketserver.BaseRequestHandler):
         raw_path = path + (f"?{parsed.query}" if parsed.query else "")
         url = f"{scheme}://{host}:{port}{raw_path}"
         policy = self._policy()
-        self.meta.update({"declared_target": url, "observed_url": url, "method": method.upper(), "protocol": version.lower()})
-        if any(_target_match(url, target) for target in policy.get("excluded_targets", [])):
+        run_hdr = (_header(headers, "x-muteki-src-run-id") or [""])[0].strip()
+        worker_hdr = (_header(headers, "x-muteki-worker-id") or [""])[0].strip()
+        self.meta.update({
+            "declared_target": url,
+            "observed_url": url,
+            "method": method.upper(),
+            "protocol": version.lower(),
+            "source_run_id": run_hdr or None,
+            "worker_id": worker_hdr or None,
+        })
+        if _excluded_request(policy, url, method, headers) or any(_target_match(url, target) for target in policy.get("excluded_targets", [])):
             raise InspectionError("policy_denied", "request target is excluded")
         if not any(_target_match(url, target) for target in policy.get("authorized_targets", [])):
             raise InspectionError("authorization_unresolved", "request target is outside authorized targets")
@@ -715,8 +992,11 @@ class ProxyHandler(socketserver.BaseRequestHandler):
                 continue
             if grant.get("policy_digest") != policy_digest or not set(decision.get("rules", [])).issubset(set(grant.get("rule_refs", []))):
                 continue
+            if grant.get("facts_digest") and grant["facts_digest"] != hashlib.sha256(_json(facts)).hexdigest():
+                continue
             expected = grant.get("resource") or {}
-            if all(facts.get(key) == expected.get(key) for key in ("path", "method", "identity_ref", "tenant")):
+            keys = ("path", "method", "identity_ref", "tenant", "url") if "url" in expected else ("path", "method", "identity_ref", "tenant")
+            if all(facts.get(key) == expected.get(key) for key in keys):
                 return {"effect": "allow", "code": "task_grant", "grant_digest": grant.get("digest")}
         return None
 
@@ -757,6 +1037,17 @@ class ProxyHandler(socketserver.BaseRequestHandler):
         raise InspectionError("approval_required", "inspection approval wait expired")
 
     def _tunnel(self, host: str, port: int, reason: str, connect: bool = False) -> None:
+        policy = self._policy()
+        target_url = f"https://[{host}]:{port}/" if ":" in host else f"https://{host}:{port}/"
+        if policy.get("network_mode") == "enforced":
+            if any(_target_match(target_url, t) for t in policy.get("excluded_targets", [])):
+                raise InspectionError("policy_denied", "tunnel target is excluded")
+            allowed = any(_target_match(target_url, t) for t in policy.get("authorized_targets", []))
+            infra = any(str(e.get("host", "")).lower() == host.lower() and int(e.get("port", 0)) == port for e in policy.get("environment_requirements", {}).get("service_exceptions", []))
+            if not allowed and not infra:
+                raise InspectionError("policy_denied", "tunnel target is outside authorized scope")
+            if policy.get("exclusions") and not infra:
+                raise InspectionError("policy_denied", "fine-grained exclusions require inspected HTTP traffic")
         upstream = _connect(host, port)
         if connect:
             self.request.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")

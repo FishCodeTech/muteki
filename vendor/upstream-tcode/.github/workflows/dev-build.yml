@@ -1,0 +1,47 @@
+name: Dev build
+
+# On-demand debug build of the tcode binary for a branch, for smoke-testing on
+# real hardware without a local toolchain (e.g. Windows preview lifecycle).
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-x64:
+    runs-on: windows-2022
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      # The artifact runs on machines without the Graphics Tools SDK layers;
+      # debug_assertions would make gpui request D3D11_CREATE_DEVICE_DEBUG
+      # and die at startup with DXGI_ERROR_SDK_COMPONENT_MISSING.
+      CARGO_PROFILE_DEV_DEBUG_ASSERTIONS: "false"
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Disable Windows Defender real-time scanning
+        shell: pwsh
+        continue-on-error: true
+        run: Set-MpPreference -DisableRealtimeMonitoring $true
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo build data
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-${{ runner.os }}-${{ runner.arch }}
+          save-if: false
+
+      - name: Build
+        run: cargo build --locked --bin tcode
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: tcode-windows-x64-debug
+          path: |
+            target/debug/tcode.exe
+            target/debug/tcode.pdb
+          retention-days: 3

@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>tcode</Name>
+  <Repository>ghcr.io/tryanks/tcode-headless:latest</Repository>
+  <Registry>https://github.com/Tryanks/tcode/pkgs/container/tcode-headless</Registry>
+  <Network>bridge</Network>
+  <Shell>bash</Shell>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/Tryanks/tcode/issues</Support>
+  <Project>https://github.com/Tryanks/tcode</Project>
+  <Overview>Tcode headless machine: Claude Code, Codex, pi, OpenCode, Cursor and Grok in a native GUI on your phone, desktop or browser. Pair a device with the invitation in the container log, or open the browser app on port 47420. The agent CLIs listed in TCODE_AGENTS install into the appdata folder on first start.</Overview>
+  <Category>Productivity: Tools:Utilities</Category>
+  <WebUI>http://[IP]:[PORT:47420]/</WebUI>
+  <TemplateURL>https://raw.githubusercontent.com/Tryanks/tcode/main/crates/headless/container/unraid.xml</TemplateURL>
+  <Icon>https://raw.githubusercontent.com/Tryanks/tcode/main/assets/icons/app/tcode.png</Icon>
+  <ExtraParams>--stop-timeout 30</ExtraParams>
+  <PostArgs>serve --name Unraid --browser-listen 0.0.0.0:47420</PostArgs>
+  <Config Name="Browser app" Target="47420" Default="47420" Mode="tcp" Description="Password-protected browser app" Type="Port" Display="always" Required="true" Mask="false">47420</Config>
+  <Config Name="Native clients" Target="47420" Default="47420" Mode="udp" Description="Traverse and direct LAN connections from paired devices" Type="Port" Display="always" Required="true" Mask="false">47420</Config>
+  <Config Name="Data" Target="/data" Default="/mnt/user/appdata/tcode" Mode="rw" Description="Machine key, pairings, threads and CLI logins. Back it up." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/tcode</Config>
+  <Config Name="Projects" Target="/projects" Default="/mnt/user/projects" Mode="rw" Description="Add projects in Tcode using paths under /projects" Type="Path" Display="always" Required="true" Mask="false">/mnt/user/projects</Config>
+  <Config Name="Password" Target="TCODE_PASSWORD" Default="" Mode="" Description="Browser app password" Type="Variable" Display="always" Required="true" Mask="true"></Config>
+  <Config Name="Agents" Target="TCODE_AGENTS" Default="claude,codex,pi,opencode,cursor,grok" Mode="" Description="Comma-separated native agents; empty for none" Type="Variable" Display="always" Required="false" Mask="false">claude,codex,pi,opencode,cursor,grok</Config>
+  <Config Name="PUID" Target="PUID" Default="99" Mode="" Description="Owner of files agents write into projects" Type="Variable" Display="advanced" Required="true" Mask="false">99</Config>
+  <Config Name="PGID" Target="PGID" Default="100" Mode="" Description="Group of files agents write into projects" Type="Variable" Display="advanced" Required="true" Mask="false">100</Config>
+  <Config Name="TZ" Target="TZ" Default="UTC" Mode="" Description="Time zone, e.g. Europe/Berlin" Type="Variable" Display="advanced" Required="false" Mask="false">UTC</Config>
+</Container>

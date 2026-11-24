@@ -1,0 +1,20 @@
+[
+  {
+    "status": "installed",
+    "name": "delta",
+    "repo_key": "multi-b1627a84",
+    "version": "1.0.1",
+    "path": "/tmp/tcode-probe-grok-git/home/.grok/installed-plugins/multi-b1627a84",
+    "source": "file:///tmp/tcode-probe-grok/multi",
+    "marketplace": null
+  },
+  {
+    "status": "installed",
+    "name": "epsilon",
+    "repo_key": "multi-b1627a84",
+    "version": "0.1.0",
+    "path": "/tmp/tcode-probe-grok-git/home/.grok/installed-plugins/multi-b1627a84",
+    "source": "file:///tmp/tcode-probe-grok/multi",
+    "marketplace": null
+  }
+]

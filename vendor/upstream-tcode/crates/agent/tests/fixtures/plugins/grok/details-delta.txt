@@ -1,0 +1,8 @@
+multi-0b1623cc
+  path: /tmp/tcode-probe-grok/home/.grok/installed-plugins/multi-0b1623cc
+  kind: local: /tmp/tcode-probe-grok/multi
+  installed: 2026-10-03T07:22:24.557732+00:00
+  updated: 2026-10-03T07:22:24.557732+00:00
+  plugins (2):
+    epsilon v0.1.0 (subdir: epsilon)
+    delta v1.0.0 (subdir: delta)
