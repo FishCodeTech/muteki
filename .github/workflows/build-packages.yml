@@ -111,9 +111,11 @@ jobs:
       - run: npm --prefix apps/frontend ci --no-audit --no-fund
       - run: npm --prefix apps/frontend run build
       - name: Build native Rust release
+        env:
+          SIGNED_DESKTOP: ${{ steps.signing.outputs.available }}
         shell: bash
         run: |
-          if [[ "$RUNNER_OS" == macOS ]]; then
+          if [[ "$RUNNER_OS" == macOS && "$SIGNED_DESKTOP" == true ]]; then
             cargo build --locked --workspace --release
           else
             cargo build --locked -p muteki-server --release
