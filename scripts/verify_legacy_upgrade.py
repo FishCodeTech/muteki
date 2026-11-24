@@ -66,11 +66,16 @@ def run_json(arguments: list[str], *, cwd: Path, env: dict[str, str]) -> dict[st
         arguments,
         cwd=cwd,
         env=env,
-        check=True,
+        check=False,
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
+    if result.returncode:
+        raise RuntimeError(
+            f"命令失败（exit {result.returncode}）：{' '.join(arguments)}\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
     try:
         payload = json.loads(result.stdout)
     except json.JSONDecodeError as error:

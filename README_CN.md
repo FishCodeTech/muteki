@@ -113,7 +113,7 @@ muteki upgrade v0.5.0
 
 ### 1. 准备环境并启动
 
-准备 **Node.js 22/npm**、**支持 edition 2024 的 stable Rust 工具链**和 **sccache**。仓库的 Cargo 包装脚本要求 sccache。原生构建需要 C/C++ 工具链、CMake、pkg-config 和 dav1d；Linux 还需要 OpenSSL 开发头文件。各平台依赖可参照 [发布工作流](.github/workflows/build-packages.yml)。本地解题还需安装并登录至少一种受支持的 Agent CLI。
+准备 **Node.js 22/npm**、**支持 edition 2024 的 stable Rust 工具链**和 **sccache**。仓库的 Cargo 包装脚本要求 sccache。原生构建需要 C/C++ 工具链、CMake 和 pkg-config；Linux 还需要 OpenSSL 开发头文件。各平台依赖可参照 [发布工作流](.github/workflows/build-packages.yml)。本地解题还需安装并登录至少一种受支持的 Agent CLI。
 
 ```bash
 git clone https://github.com/FishCodeTech/muteki.git
@@ -327,7 +327,7 @@ node scripts/package-macos.mjs --skip-build
 
 在对应 macOS/Linux 目标平台按前文构建服务和前端后，运行 `node scripts/package-web.mjs --skip-build` 可生成独立 Web 发布包，输出在 `dist/web-releases/`。旧 `./init.sh`、`./run.sh`、`ctf-tools/` 和 Python Ubuntu 安装器属于归档分支。
 
-Linux 原生 Web 发布包依赖系统共享库。在 Ubuntu 24.04 上先安装 `sudo apt-get install libdav1d7 libstdc++6`；其他发行版需提供兼容的 glibc、dav1d 和 C++ 运行库。可用 `ldd bin/muteki-server` 检查缺失项。Web Docker 镜像已安装这些运行库。
+Linux 原生 Web 发布包需要兼容的 glibc 与 C++ 运行库。在 Ubuntu 24.04 上安装 `sudo apt-get install libstdc++6`。可用 `ldd bin/muteki-server` 检查缺失项。Web Docker 镜像已安装该运行库。
 
 ## 常见问题
 

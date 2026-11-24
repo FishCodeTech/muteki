@@ -94,7 +94,7 @@ muteki upgrade v0.5.0
 
 ### 1. Prepare the environment and start the Web app
 
-Install **Node.js 22/npm**, a **stable Rust toolchain with edition 2024 support**, and **sccache**. The repository Cargo wrapper requires sccache. Native build dependencies include a C/C++ toolchain, CMake, pkg-config and dav1d; Linux also needs OpenSSL development headers. See the platform dependency steps in [the release workflow](.github/workflows/build-packages.yml). For local solving, install and sign in to at least one supported Agent CLI.
+Install **Node.js 22/npm**, a **stable Rust toolchain with edition 2024 support**, and **sccache**. The repository Cargo wrapper requires sccache. Native build dependencies include a C/C++ toolchain, CMake and pkg-config; Linux also needs OpenSSL development headers. See the platform dependency steps in [the release workflow](.github/workflows/build-packages.yml). For local solving, install and sign in to at least one supported Agent CLI.
 
 ```bash
 git clone https://github.com/FishCodeTech/muteki.git
@@ -309,7 +309,7 @@ The output is `dist/Muteki.app`. The package includes Node, the frontend and the
 
 For a standalone Web release on the target macOS/Linux platform, build the server/frontend as above and run `node scripts/package-web.mjs --skip-build`. The archive is written under `dist/web-releases/`. The old `./init.sh`, `./run.sh`, `ctf-tools/` and Python Ubuntu installer belong to the archived branch.
 
-Native Linux Web releases require system shared libraries. On Ubuntu 24.04, install `sudo apt-get install libdav1d7 libstdc++6`; other distributions need compatible glibc, dav1d and C++ runtimes. Check missing libraries with `ldd bin/muteki-server`. The Web Docker image includes these runtimes.
+Native Linux Web releases require compatible glibc and the C++ runtime. On Ubuntu 24.04, install `sudo apt-get install libstdc++6`. Check missing libraries with `ldd bin/muteki-server`. The Web Docker image includes the runtime.
 
 ## Troubleshooting
 
