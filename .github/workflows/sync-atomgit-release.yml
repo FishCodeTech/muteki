@@ -106,18 +106,44 @@ jobs:
             echo 'AtomGit release tag differs from GitHub; refusing to overwrite it' >&2
             exit 1
           fi
+          REMOTE_MAIN="$(git -c credential.helper= ls-remote "$REMOTE" refs/heads/main | awk '{print $1}')"
+          ARCHIVE_REF="refs/heads/archive/pre-$RELEASE_TAG-main"
+          ARCHIVE_REQUIRED=false
+          FORCE_ARGS=()
+          if [ -n "$REMOTE_MAIN" ] && [ "$REMOTE_MAIN" != "$MAIN_COMMIT" ]; then
+            git -c credential.helper= fetch --no-tags "$REMOTE" \
+              refs/heads/main:refs/remotes/atomgit/main
+            if ! git merge-base --is-ancestor "$REMOTE_MAIN" "$MAIN_COMMIT"; then
+              REMOTE_ARCHIVE="$(git -c credential.helper= ls-remote "$REMOTE" "$ARCHIVE_REF" | awk '{print $1}')"
+              if [ -n "$REMOTE_ARCHIVE" ] && [ "$REMOTE_ARCHIVE" != "$REMOTE_MAIN" ]; then
+                echo 'AtomGit archive branch already points to different history; refusing to overwrite it' >&2
+                exit 1
+              fi
+              if [ -z "$REMOTE_ARCHIVE" ]; then
+                ARCHIVE_REQUIRED=true
+              fi
+              FORCE_ARGS+=("--force-with-lease=refs/heads/main:$REMOTE_MAIN")
+            fi
+          fi
           PUSH_ARGS=()
           if [ "$DRY_RUN" = true ]; then PUSH_ARGS+=(--dry-run); fi
-          git -c credential.helper= push "${PUSH_ARGS[@]}" "$REMOTE" \
+          if [ "$ARCHIVE_REQUIRED" = true ]; then
+            git -c credential.helper= push "${PUSH_ARGS[@]}" "$REMOTE" \
+              "$REMOTE_MAIN:$ARCHIVE_REF"
+          fi
+          git -c credential.helper= push "${PUSH_ARGS[@]}" "${FORCE_ARGS[@]}" "$REMOTE" \
             'refs/remotes/origin/main:refs/heads/main' "$TAG_REF:$TAG_REF"
           if [ "$DRY_RUN" = true ]; then
-            echo 'Dry run: main and tag push checked without changing AtomGit'
+            echo 'Dry run: archive, main and tag pushes checked without changing AtomGit'
             exit 0
           fi
-          REMOTE_REFS="$(git -c credential.helper= ls-remote "$REMOTE" refs/heads/main "$TAG_REF" "$TAG_REF^{}")"
+          REMOTE_REFS="$(git -c credential.helper= ls-remote "$REMOTE" refs/heads/main "$ARCHIVE_REF" "$TAG_REF" "$TAG_REF^{}")"
           test "$(awk '$2 == "refs/heads/main" {print $1}' <<< "$REMOTE_REFS")" = "$MAIN_COMMIT"
           test "$(awk -v ref="$TAG_REF" '$2 == ref {print $1}' <<< "$REMOTE_REFS")" = "$TAG_OBJECT"
           test "$(awk -v ref="$TAG_REF^{}" '$2 == ref {print $1}' <<< "$REMOTE_REFS")" = "$SOURCE_COMMIT"
+          if [ "$ARCHIVE_REQUIRED" = true ]; then
+            test "$(awk -v ref="$ARCHIVE_REF" '$2 == ref {print $1}' <<< "$REMOTE_REFS")" = "$REMOTE_MAIN"
+          fi
           echo "Verified AtomGit main and annotated $RELEASE_TAG tag against GitHub"
       - name: Synchronize AtomGit release and verify attachment hashes
         env:
