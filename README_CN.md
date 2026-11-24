@@ -354,6 +354,26 @@ Linux 原生 Web 发布包依赖系统共享库。在 Ubuntu 24.04 上先安装 
 - 扩展融合 Agent 对话和插件生态。
 - 补齐更多故障恢复窗口与跨版本数据迁移验证。
 
+## 贡献者
+
+<a href="https://github.com/FishCodeTech/muteki/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=FishCodeTech/muteki" alt="公开仓库贡献者">
+</a>
+
+### 开发阶段补充贡献者
+
+<table>
+  <tr>
+    <td align="center" valign="top" width="140">
+      <a href="https://github.com/FzWjScJ">
+        <img src="https://avatars.githubusercontent.com/u/43847366?v=4" width="72" alt="FzWjScJ"><br>
+        <sub><b>FzWjScJ</b></sub>
+      </a><br>
+      <sub>Bug 反馈 · Pull Request</sub>
+    </td>
+  </tr>
+</table>
+
 ## 鸣谢
 
 感谢 [c3](https://github.com/Real-C3ngH) 提供的云镜靶场账号，浪费了很多沙砾，疯狂爆米。
