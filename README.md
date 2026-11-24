@@ -336,6 +336,26 @@ Native Linux Web releases require system shared libraries. On Ubuntu 24.04, inst
 - Extend the integrated Agent chat and plugin ecosystem.
 - Verify more failure/recovery windows and cross-version data migrations.
 
+## Contributors
+
+<a href="https://github.com/FishCodeTech/muteki/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=FishCodeTech/muteki" alt="Public repository contributors">
+</a>
+
+### Additional development contributor
+
+<table>
+  <tr>
+    <td align="center" valign="top" width="140">
+      <a href="https://github.com/FzWjScJ">
+        <img src="https://avatars.githubusercontent.com/u/43847366?v=4" width="72" alt="FzWjScJ"><br>
+        <sub><b>FzWjScJ</b></sub>
+      </a><br>
+      <sub>Bug reports · Pull requests</sub>
+    </td>
+  </tr>
+</table>
+
 ## Acknowledgements
 
 Thanks to [c3](https://github.com/Real-C3ngH) for the Yunjing range account. I used a lot of grit and made plenty of popcorn along the way.
