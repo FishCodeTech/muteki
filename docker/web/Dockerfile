@@ -1,6 +1,6 @@
 FROM docker:cli AS docker-cli
 FROM ubuntu:24.04
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl libdav1d7 libstdc++6 git ripgrep python3 && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl libstdc++6 git ripgrep python3 && rm -rf /var/lib/apt/lists/*
 COPY --from=docker-cli /usr/local/bin/docker /usr/local/bin/docker
 ARG RELEASE_ASSET=web-release.tar.gz
 COPY ${RELEASE_ASSET} /tmp/release.tar.gz
