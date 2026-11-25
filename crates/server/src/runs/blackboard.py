@@ -99,7 +99,6 @@ def _db_path() -> str:
 
 
 def _conn() -> sqlite3.Connection:
-    # Post-solve respond receives read-only board access.
     path = os.path.abspath(_db_path())
     c = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=10)
     c.execute("PRAGMA query_only=ON")

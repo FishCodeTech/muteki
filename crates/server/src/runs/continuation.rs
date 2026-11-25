@@ -38,4 +38,3 @@ pub(super) fn save_local_pi(state:&AppState,run:&str,worker_id:&str,cwd:&Path,re
     }
     Ok(())
 }
-pub(super) fn winner(state:&AppState,run:&str)->Result<Option<Value>,String>{state.store.get("run_winner_continuations",run).map_err(|error|error.to_string())}

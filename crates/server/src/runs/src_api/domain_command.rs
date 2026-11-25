@@ -534,20 +534,6 @@ pub(super) fn supported(kind: &str) -> bool {
         || coordination_command(kind)
 }
 
-pub(super) fn agent_settings_command(kind: &str) -> bool {
-    matches!(
-        kind,
-        "src.policy.update"
-            | "src.task.pause"
-            | "src.task.resume"
-            | "src.coordination.policy.save"
-            | "src.identity.login_recipe.save"
-            | "src.monitor.create"
-            | "src.monitor.revise"
-            | "src.monitor.state"
-    )
-}
-
 pub(super) fn agent_allowed(kind: &str) -> bool {
     !matches!(
         kind,

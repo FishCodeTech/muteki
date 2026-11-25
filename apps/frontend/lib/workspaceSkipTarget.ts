@@ -10,9 +10,7 @@ export function isSrcConversationPath(pathname: string): boolean {
 
 export function isConversationLayoutPath(pathname: string): boolean {
   if (pathname === "/chat" || pathname.startsWith("/chat/")) return true;
-  if (isSrcConversationPath(pathname)) return true;
-  if (pathname === "/studio-prototype/workspace" || pathname.startsWith("/studio-prototype/workspace/")) return false;
-  return pathname === "/studio-prototype" || pathname.startsWith("/studio-prototype/");
+  return isSrcConversationPath(pathname);
 }
 
 export function workspaceSkipTargetId(pathname: string): string {

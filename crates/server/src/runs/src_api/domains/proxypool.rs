@@ -15,18 +15,11 @@ const DEFAULT_COOLDOWN_SECS: i64 = 600;
 #[derive(Clone, Debug)]
 pub(in crate::runs::src_api::domains) struct ResolvedUpstream {
     pub node_id: String,
-    pub label: String,
     pub scheme: String,
     pub host: String,
     pub port: u16,
     pub username: String,
     pub password: String,
-}
-
-impl ResolvedUpstream {
-    pub fn endpoint_label(&self) -> String {
-        format!("{}://{}:{}", self.scheme, self.host, self.port)
-    }
 }
 
 fn rr_cursor(task_id: &str) -> usize {
@@ -398,7 +391,6 @@ pub(super) fn select_upstream(s: &AppState, id: &str) -> Api<Option<ResolvedUpst
 
     Ok(Some(ResolvedUpstream {
         node_id,
-        label: chosen["label"].as_str().unwrap_or("").to_owned(),
         scheme: chosen["scheme"].as_str().unwrap_or("http").to_owned(),
         host: require(&chosen, "host")?.to_owned(),
         port: chosen["port"]

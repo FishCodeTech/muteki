@@ -122,12 +122,6 @@ pub(super) fn authorize(s: &AppState, owner: &str, _principal: &str) -> Api<()> 
     Ok(())
 }
 
-pub(super) fn same_principal(left: &str, right: &str) -> bool {
-    !left.is_empty() && !right.is_empty()
-        && (left == right || (matches!(left, "local-operator" | "local-user")
-            && matches!(right, "local-operator" | "local-user")))
-}
-
 fn dataset(s: &AppState, task_id: &str, principal: &str, dataset_id: &str) -> Api<Value> {
     let dataset = find_dataset_record(s, dataset_id)?["payload"].clone();
     check_dataset_acl(s, &dataset, task_id, principal, "read")?;

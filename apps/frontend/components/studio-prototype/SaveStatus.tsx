@@ -17,7 +17,6 @@ import {
   syncWithServer,
   retryLoad,
   saveNow,
-  startStudioPersistence,
   switchStudioPersistenceTask,
   syncWithSimulatedServer,
   useSaveStatus,
@@ -71,12 +70,6 @@ function useSaveFeedback(status: SaveStatus) {
       toast({ title: "已重新保存", description: status.savedAt ? `保存于 ${formatTime(status.savedAt)}` : undefined, tone: "success", duration: 2400 });
     }
   }, [status.message, status.phase, status.savedAt]);
-}
-
-export function StudioPersistenceGate({ children }: { children: ReactNode }) {
-  const status = useSaveStatus();
-  useEffect(() => { startStudioPersistence(); }, []);
-  return <PersistenceShell status={status}>{children}</PersistenceShell>;
 }
 
 export function TaskPersistenceGate({ taskId, threadId, projectId, title, goal, children }: {

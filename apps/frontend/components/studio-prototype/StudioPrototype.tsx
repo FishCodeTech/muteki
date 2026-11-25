@@ -1,43 +1,30 @@
 "use client";
 
-import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type ComponentType, type ReactNode } from "react";
-import { useParams, usePathname, useRouter, useSearchParams } from "next/navigation";
-import { Button } from "@muteki/ui";
-import { ConversationShell, type ConversationExperience } from "@/components/conversation/ConversationShell";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type ComponentType } from "react";
+import { Button, Spinner } from "@muteki/ui";
+import type { ConversationExperience } from "@/components/conversation/ConversationShell";
 import type { ComposerCustomDrop, ComposerLocalMentionItem, ComposerLocalMentions } from "@/components/chat/composer/MutekiPromptBar";
 import type { PanelExtensionConfig } from "@/components/chat/panel/extensions";
-import { Spinner } from "@muteki/ui";
-import { chatPanel, useChatPanel } from "@/lib/chatPanelStore";
+import { useChatPanel } from "@/lib/chatPanelStore";
 import { StudioComposerControls, StudioContextTray, StudioHeaderActions, StudioTurnAccessory } from "./ConversationParts";
 import { EVIDENCE_KIND_LABELS, submissionStatusLabel, type StudioRef, type StudioRefKind } from "./model";
 import {
-  STUDIO_BASE,
   STUDIO_PHONE_BREAKPOINT,
   STUDIO_SHEET_BREAKPOINT,
-  STUDIO_WORKSPACE,
   WORKSPACE_ORDER,
   WORKSPACES,
   applyWorkspaceQuery,
-  applyWorkspaceUrl,
-  chatHref,
   openWorkspaceByDefault,
   orderWorkspaceTabs,
-  showWorkspace,
   studioComposer,
   studioRouter,
   toggleWorkspace,
-  visibleWorkspace,
   workspaceQuery,
   type WorkspaceKey,
 } from "./nav";
 import { REF_ICON, REF_KIND_LABEL, STUDIO_REF_MIME, citeRef, parseDroppedRef } from "./parts";
 import { mergeOf, RUN_STATE_LABEL } from "./records";
-import { StudioPersistenceGate } from "./SaveStatus";
 import {
-  DEFAULT_THREAD_ID,
-  effectiveContext,
-  previewThread,
-  previewView,
   readStudioState,
   refLabel,
   studio,
@@ -52,12 +39,6 @@ const LibraryWorkspace = lazy(() => import("./SourceViews").then((m) => ({ defau
 const FindingsWorkspace = lazy(() => import("./ClueBoard").then((m) => ({ default: m.FindingsWorkspace })));
 const TasksWorkspace = lazy(() => import("./TaskBoard").then((m) => ({ default: m.TasksWorkspace })));
 const ReportsWorkspace = lazy(() => import("./Workbench").then((m) => ({ default: m.ReportsWorkspace })));
-
-const draftThreads = new Map<string, string>();
-
-function newThreadHref(draftId: string): string {
-  return `${STUDIO_BASE}?draft=${encodeURIComponent(draftId)}`;
-}
 
 const WORKSPACE_VIEW: Record<WorkspaceKey, ComponentType<{ active: boolean; sheet?: boolean }>> = {
   traffic: TrafficWorkspace,
@@ -189,21 +170,6 @@ function parseMentionId(id: string): StudioRef | null {
   return { kind, id: id.slice(split + 1) };
 }
 
-function carryWorkspaces(fromThread: string, toThread: string) {
-  const from = chatPanel.thread(fromThread);
-  const to = chatPanel.thread(toThread);
-  const activeSurface = from.surfaces.find((surface) => surface.id === from.activeId);
-  if (from.isOpen && activeSurface?.kind === "extension") {
-    from.surfaces
-      .filter((surface) => surface.kind === "extension" && !to.surfaces.some((item) => item.id === surface.id))
-      .forEach((surface) => chatPanel.open(toThread, surface));
-    chatPanel.open(toThread, activeSurface);
-    chatPanel.setMaximized(toThread, from.maximized);
-  } else if (!from.isOpen && to.isOpen) {
-    chatPanel.close(toThread);
-  }
-}
-
 const DOMAIN_ERROR_LABELS: Record<string, string> = {
   tasks: "任务与运行",
   assets: "资产库",
@@ -278,7 +244,7 @@ export function useStudioWorkbenchExperience(threadId: string): Pick<
 }
 
 function isWorkbenchPathname(pathname: string): boolean {
-  return pathname.startsWith("/src/tasks/") || pathname === STUDIO_BASE || pathname.startsWith(`${STUDIO_BASE}/`);
+  return pathname.startsWith("/src/tasks/");
 }
 
 export function useStudioWorkspaceUrlSync(
@@ -325,101 +291,4 @@ export function useStudioWorkspaceUrlSync(
     studioRouter.current = router;
     return () => { studioRouter.current = null; };
   }, [router]);
-}
-
-function StudioChatRoute() {
-  const params = useParams<{ id?: string | string[] }>();
-  const rawId = Array.isArray(params?.id) ? params.id[0] : params?.id;
-  const routeId = rawId ? decodeURIComponent(rawId) : "";
-  const router = useRouter();
-  const pathname = usePathname();
-  const search = useSearchParams();
-  const draft = search.get("draft") || "";
-  const state = useStudioState();
-
-  const threadId = state.threads[routeId]
-    ? routeId
-    : state.threads[state.activeThreadId] ? state.activeThreadId : DEFAULT_THREAD_ID;
-  const record = state.threads[threadId];
-
-  useEffect(() => {
-    if (draft) {
-      let created = draftThreads.get(draft);
-      if (!created) {
-        const current = readStudioState();
-        created = studio.createThread(current.threads[current.activeThreadId]?.projectId ?? current.projects[0]?.id ?? "");
-        draftThreads.set(draft, created);
-      }
-      router.replace(chatHref(created));
-      return;
-    }
-    if (pathname.startsWith(STUDIO_WORKSPACE)) {
-      const key = applyWorkspaceUrl(pathname, new URLSearchParams(search.toString()));
-      if (key) showWorkspace(threadId, key);
-      router.replace(chatHref(threadId));
-      return;
-    }
-    if (routeId !== threadId) router.replace(`${chatHref(threadId)}${window.location.search}`);
-  }, [draft, pathname, routeId, router, search, threadId]);
-
-  const previousThread = useRef("");
-  useEffect(() => {
-    const previous = previousThread.current;
-    previousThread.current = threadId;
-    studio.setActiveThread(threadId);
-    if (previous && previous !== threadId) carryWorkspaces(previous, threadId);
-  }, [threadId]);
-
-  const settled = !draft && !pathname.startsWith(STUDIO_WORKSPACE) && routeId === threadId;
-  useStudioWorkspaceUrlSync(threadId, settled, router, search.toString());
-
-  const navigation = useMemo(() => ({
-    router,
-    pathname,
-    searchParams: new URLSearchParams(search.toString()),
-  }), [router, pathname, search]);
-
-  const threads = useMemo(
-    () => state.threadOrder.flatMap((id) => (state.threads[id] ? [previewThread(state.threads[id])] : [])),
-    [state.threadOrder, state.threads],
-  );
-  const view = useMemo(() => previewView(record), [record]);
-  const onSend = useCallback((text: string) => {
-    const current = readStudioState();
-    const refs = effectiveContext(current, threadId, visibleWorkspace(threadId));
-    studio.send(threadId, text, refs, { taskId: current.handoff[threadId] });
-  }, [threadId]);
-  const preview = useMemo(() => ({ threads, view, notice: "", onSend }), [threads, view, onSend]);
-
-  const workbench = useStudioWorkbenchExperience(threadId);
-  const experience = useMemo<ConversationExperience>(() => ({
-    defaultMode: "conversation",
-    draftScope: "studio-prototype",
-    hideProjects: true,
-    allowFork: false,
-    threadHref: chatHref,
-    newThreadHref,
-    sidebarLabels: { title: "研究对话", newThread: "新研究对话", search: "搜索研究对话", thread: "研究对话" },
-    ...workbench,
-    preview,
-  }), [preview, workbench]);
-
-  return (
-    <div className="flex h-full min-h-0 w-full overflow-hidden" data-testid="studio-prototype">
-      <div className="relative flex min-w-0 flex-1">
-        <ConversationShell threadId={threadId} navigation={navigation} experience={experience} />
-      </div>
-    </div>
-  );
-}
-
-export function StudioPrototypeRoute({ children }: { children: ReactNode }) {
-  return (
-    <>
-      <StudioPersistenceGate>
-        <StudioChatRoute />
-      </StudioPersistenceGate>
-      {children}
-    </>
-  );
 }

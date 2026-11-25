@@ -8,6 +8,6 @@ export function useConversationLocalPreview(): boolean {
   return useContext(ConversationLocalPreviewContext);
 }
 
-export function isLocalPreviewPath(pathname: string | null | undefined): boolean {
-  return pathname === "/studio-prototype" || Boolean(pathname?.startsWith("/studio-prototype/"));
+export function isLocalPreviewPath(_pathname: string | null | undefined): boolean {
+  return false;
 }

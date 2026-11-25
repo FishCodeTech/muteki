@@ -183,7 +183,6 @@ struct Chrome {
     started: Instant,
     /// Emulation.setUserAgentOverride parameters every tab gets.
     identity: Value,
-    api_port: u16,
 }
 
 impl Chrome {
@@ -204,7 +203,7 @@ impl Drop for Chrome {
 }
 
 #[cfg(unix)]
-async fn launch(state_dir: &Path, api_port: u16) -> Result<Chrome, Value> {
+async fn launch(state_dir: &Path) -> Result<Chrome, Value> {
     use std::os::unix::{io::FromRawFd, process::CommandExt};
     let executable = executable()?;
     let unavailable = |message: String| failure("chat.browser.headless_launch_failed", message, "runtime", true);
@@ -370,7 +369,6 @@ async fn launch(state_dir: &Path, api_port: u16) -> Result<Chrome, Value> {
         log,
         started: Instant::now(),
         identity: Value::Null,
-        api_port,
     };
     match chrome.cdp.call(None, "Browser.getVersion", json!({}), LAUNCH_TIMEOUT).await {
         Ok(version) => {
@@ -453,7 +451,7 @@ fn accept_language() -> Option<String> {
     Some(if full == base { base } else { format!("{full},{base}") })
 }
 #[cfg(not(unix))]
-async fn launch(_state_dir: &Path, _api_port: u16) -> Result<Chrome, Value> {
+async fn launch(_state_dir: &Path) -> Result<Chrome, Value> {
     Err(executable().err().unwrap_or_else(|| failure("chat.browser.headless_unavailable", "后台浏览器只支持 macOS/Linux 服务主机", "state", false)))
 }
 
@@ -536,7 +534,7 @@ impl Headless {
         self.shared.threads.lock().unwrap().get(thread_id).is_some_and(|entry| entry.alive.load(Ordering::SeqCst))
     }
 
-    async fn chrome(&self, state_dir: &Path, api_port: u16) -> Result<Arc<Chrome>, Value> {
+    async fn chrome(&self, state_dir: &Path) -> Result<Arc<Chrome>, Value> {
         let mut slot = self.shared.chrome.lock().await;
         if let Some(chrome) = slot.as_ref().filter(|chrome| chrome.cdp.alive.load(Ordering::SeqCst)) {
             return Ok(chrome.clone());
@@ -544,13 +542,13 @@ impl Headless {
         if slot.take().is_some() {
             tracing::warn!("Background browser exited; starting a new one");
         }
-        let chrome = Arc::new(launch(state_dir, api_port).await?);
+        let chrome = Arc::new(launch(state_dir).await?);
         *slot = Some(chrome.clone());
         self.spawn_reaper();
         Ok(chrome)
     }
 
-    async fn workspace(&self, state_dir: &Path, api_port: u16, thread_id: &str, create: bool)
+    async fn workspace(&self, state_dir: &Path, thread_id: &str, create: bool)
         -> Result<(Arc<tokio::sync::Mutex<Workspace>>, bool), Value> {
         let live = |shared: &Shared| shared.threads.lock().unwrap().get(thread_id)
             .filter(|entry| entry.alive.load(Ordering::SeqCst)).map(|entry| entry.workspace.clone());
@@ -560,7 +558,7 @@ impl Headless {
         if let Some(workspace) = live(&self.shared) { return Ok((workspace, false)); }
         self.shared.threads.lock().unwrap().remove(thread_id);
         self.evict_for_room().await;
-        let chrome = self.chrome(state_dir, api_port).await?;
+        let chrome = self.chrome(state_dir).await?;
         let context = chrome.cdp.call(None, "Target.createBrowserContext", json!({"disposeOnDetach": false}), CALL_TIMEOUT).await?;
         let context_id = context["browserContextId"].as_str().unwrap_or("").to_owned();
         let tab = attach_tab(&chrome, &context_id, VIEWPORT).await?;
@@ -656,7 +654,7 @@ impl Headless {
             "idle_close_s": IDLE_CLOSE.as_secs(),
             "viewport": {"width": VIEWPORT.0, "height": VIEWPORT.1},
         });
-        if let Ok((workspace, _)) = self.workspace(Path::new(""), 0, thread_id, false).await
+        if let Ok((workspace, _)) = self.workspace(Path::new(""), thread_id, false).await
             && let Ok(mut workspace) = tokio::time::timeout(Duration::from_secs(2), workspace.lock()).await
         {
             let _ = prune_tabs(&mut workspace).await;
@@ -673,7 +671,7 @@ impl Headless {
 
     /// The active tab's picture. It never waits for, or delays, an agent action.
     pub async fn thumbnail(&self, thread_id: &str) -> Result<Vec<u8>, Value> {
-        let (workspace, _) = self.workspace(Path::new(""), 0, thread_id, false).await?;
+        let (workspace, _) = self.workspace(Path::new(""), thread_id, false).await?;
         let workspace = workspace.try_lock()
             .map_err(|_| failure("chat.browser.headless_busy", "后台浏览器正在执行操作", "state", true))?;
         let session = workspace.tabs.get(workspace.active).ok_or_else(not_open)?.session_id.clone();
@@ -686,7 +684,7 @@ impl Headless {
     pub async fn perform(&self, state_dir: &Path, api_port: u16, thread_id: &str, action: &str, input: &Value, budget: Duration) -> Result<Value, Value> {
         let end = Instant::now() + budget;
         let opening = action == "open";
-        let (workspace, created) = self.workspace(state_dir, api_port, thread_id, opening).await?;
+        let (workspace, created) = self.workspace(state_dir, thread_id, opening).await?;
         let mut workspace = workspace.lock().await;
         workspace.last_used = Instant::now();
         let mut extra = serde_json::Map::new();

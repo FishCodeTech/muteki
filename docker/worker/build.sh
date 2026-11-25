@@ -37,11 +37,6 @@ fi
 ls -la "$RUNTIME_AGENT"
 file "$RUNTIME_AGENT" 2>/dev/null || true
 
-echo ">> syncing muteki-blackboard skill into docker build context..."
-cp "$REPO/skills/muteki-blackboard/SKILL.md" "$HERE/blackboard.SKILL.md"
-cp "$REPO/skills/muteki-blackboard/blackboard.py" "$HERE/blackboard.py"
-chmod +x "$HERE/blackboard.py"
-
 echo ">> [2/3] docker build --platform linux/$ARCH --load -t $TAG $HERE ..."
 build_args=()
 http_proxy_value="${http_proxy:-${HTTP_PROXY:-}}"
