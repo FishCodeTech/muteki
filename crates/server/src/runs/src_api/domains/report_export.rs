@@ -331,7 +331,6 @@ fn report_retest_status(s: &AppState, task_id: &str, report: &Value) -> (bool, b
 struct DocxImage {
     rel_id: String,
     filename: String,
-    ext: &'static str,
     bytes: Vec<u8>,
     cx: i64,
     cy: i64,
@@ -444,7 +443,6 @@ fn collect_docx_images(
         images.push(DocxImage {
             rel_id: format!("rIdImg{num}"),
             filename: format!("media/image{num}.{ext}"),
-            ext,
             bytes: out_bytes,
             cx,
             cy,

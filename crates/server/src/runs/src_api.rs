@@ -67,9 +67,6 @@ pub(crate) fn supports_domain_command(kind: &str) -> bool {
 pub(crate) fn agent_allowed_command(kind: &str) -> bool {
     domain_command::agent_allowed(kind)
 }
-pub(crate) fn agent_settings_command(kind: &str) -> bool {
-    domain_command::agent_settings_command(kind)
-}
 
 fn source_key(task_id: &str, source_id: &str) -> String {
     json!([task_id, source_id]).to_string()
@@ -266,9 +263,6 @@ pub(crate) fn guardrail_refusal_clarify(
     model_id: &str,
 ) -> Api<(bool, Option<String>)> {
     domains::guardrails_refusal(s, task_id, chain_key, stop_reason, model_id)
-}
-pub(crate) fn guardrail_coverage_gate_met(s: &AppState, task_id: &str) -> Api<(bool, Value)> {
-    domains::guardrails_coverage(s, task_id)
 }
 pub(crate) fn guardrail_run_coverage_gate_met(
     s: &AppState,
@@ -1563,7 +1557,6 @@ pub(crate) struct AuthorizedSrcCaller {
     pub(crate) task: Value,
     pub(crate) task_id: String,
     pub(crate) main_thread_id: String,
-    pub(crate) caller_thread_id: String,
     pub(crate) principal_id: String,
     pub(crate) delegation: Option<Value>,
 }
@@ -1621,7 +1614,6 @@ pub(crate) fn resolve_authorized_src_caller_from_store(
             task: task_row,
             task_id,
             main_thread_id,
-            caller_thread_id: thread_id.to_owned(),
             principal_id,
             delegation: None,
         }));
@@ -1674,7 +1666,6 @@ pub(crate) fn resolve_authorized_src_caller_from_store(
         task: task_row,
         task_id: task_id.to_owned(),
         main_thread_id,
-        caller_thread_id: thread_id.to_owned(),
         principal_id,
         delegation: Some(delegation),
     }))

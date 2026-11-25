@@ -230,10 +230,6 @@ async fn dial_tcp_or_proxy(
     }
 }
 
-pub(super) async fn exchange(url:&reqwest::Url,method:&str,request:&[u8],timeout:Duration,limit:usize)->Capture{
-    exchange_via_proxy(url, method, request, timeout, limit, None).await
-}
-
 pub(in crate::runs::src_api::domains) async fn exchange_via_proxy(url:&reqwest::Url,method:&str,request:&[u8],timeout:Duration,limit:usize,proxy:Option<&super::super::proxypool::ResolvedUpstream>)->Capture{
     let deadline=tokio::time::Instant::now()+timeout;
     let mut capture=Capture{raw:Vec::new(),complete:false,error:None,sent:0,peer:Value::Null};

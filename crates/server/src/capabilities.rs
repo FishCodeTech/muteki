@@ -22,7 +22,6 @@ type Api = Result<Json<Value>, Failure>;
 
 pub const BINDINGS: &str = "capability_bindings";
 pub const GRANTS: &str = "capability_grants";
-const SESSIONS: &str = "capability_sessions";
 const POLICY_FILE: &str = "capability_management.json";
 pub const CONTROL_SERVER: &str = "muteki-control";
 pub const COLLAB_SERVER: &str = "muteki-collab";

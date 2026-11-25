@@ -20,11 +20,3 @@ inherits = "release"
 lto = "off"
 codegen-units = 256
 incremental = true
-
-[profile.web]
-inherits = "release"
-opt-level = "z"
-lto = "fat"
-codegen-units = 1
-strip = true
-panic = "abort"

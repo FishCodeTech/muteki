@@ -338,14 +338,6 @@ impl RunRegistry {
         ids
     }
 
-    pub(super) fn has_execution_owner(&self, run_id: &str) -> bool {
-        self.handles
-            .lock()
-            .unwrap()
-            .get(run_id)
-            .is_some_and(|handle| handle.execution_owner.lock().unwrap().is_some())
-    }
-
     pub(super) fn existing_handle(&self, run_id: &str) -> Option<Arc<RunHandle>> {
         self.handles.lock().unwrap().get(run_id).cloned()
     }
@@ -1081,10 +1073,6 @@ impl<'de> serde::Deserialize<'de> for ClockEvent {
         }
         deserializer.deserialize_map(Visitor)
     }
-}
-
-pub(crate) fn persisted_events(state: &AppState, run_id: &str) -> Result<Vec<Value>, String> {
-    persisted_event_iter(state, run_id).map(Iterator::collect)
 }
 
 pub(crate) fn persisted_event_iter(

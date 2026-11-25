@@ -37,9 +37,6 @@ pub(super) fn close_dispatched_hook_receipts(s:&AppState,id:&str,tid:&str)->Api<
     }
     Ok(())
 }
-pub(crate) fn decide(_s:&AppState,_doc:&Value,_row:&Value,_choice:&ApprovalDecision)->Api<()>{
-    Ok(())
-}
 
 pub(crate) async fn install(s:&Arc<AppState>,tid:&str,request:&mut StartRequest)->Result<(),RuntimeError>{
     if !assert_access(s,tid,&request.adapter_id,&request.access_mode)?{return Ok(())}

@@ -84,9 +84,6 @@ pub(super) fn guardrails_refusal(
 ) -> Api<(bool, Option<String>)> {
     guardrails::record_refusal_and_maybe_clarify(s, task_id, chain_key, stop_reason, model_id)
 }
-pub(super) fn guardrails_coverage(s: &AppState, task_id: &str) -> Api<(bool, Value)> {
-    guardrails::coverage_gate_met(s, task_id)
-}
 pub(super) fn guardrails_run_coverage(
     s: &AppState,
     task_id: &str,
@@ -95,7 +92,6 @@ pub(super) fn guardrails_run_coverage(
     guardrails::run_coverage_gate_met(s, task_id, run_id)
 }
 pub(super) fn policy_compare(name:&str,actual:&Value,operator:&str,expected:&Value)->Api<bool>{egress::scope_compare(name,actual,operator,expected)}
-pub(super) fn policy_canonical_json(value:&Value)->String{browser_runtime::canonical_json(value)}
 pub(super) fn policy_raw_path(raw:&str)->String{raw_endpoint_path(raw)}
 pub(super) fn recover_retests(s:&AppState,id:&str)->Api<Value>{retest::recover(s,id)}
 
