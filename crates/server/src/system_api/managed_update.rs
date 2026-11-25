@@ -380,15 +380,81 @@ pub(super) async fn rollback() -> Result<Value, String> {
     Ok(status())
 }
 
-fn update_lock(root: &Path) -> Result<std::fs::File, String> {
+struct UpdateLock {
+    path: PathBuf,
+    file: std::fs::File,
+    remove_on_drop: bool,
+}
+
+impl UpdateLock {
+    #[cfg(unix)]
+    fn matches_path(&self) -> std::io::Result<bool> {
+        use std::os::unix::fs::MetadataExt;
+
+        let held = self.file.metadata()?;
+        let linked = std::fs::symlink_metadata(&self.path)?;
+        Ok((held.dev(), held.ino()) == (linked.dev(), linked.ino()))
+    }
+
+    fn remove(&mut self) -> std::io::Result<()> {
+        #[cfg(unix)]
+        if !self.matches_path()? {
+            return Err(std::io::Error::other("升级锁已被替换"));
+        }
+        std::fs::remove_file(&self.path)?;
+        self.remove_on_drop = false;
+        Ok(())
+    }
+}
+
+impl Drop for UpdateLock {
+    fn drop(&mut self) {
+        if self.remove_on_drop && let Err(error) = self.remove() {
+            tracing::error!(path = %self.path.display(), %error, "Failed to remove the legacy update lock");
+        }
+    }
+}
+
+fn uses_legacy_update_lock(version: &str) -> bool {
+    version.trim_start_matches('v').starts_with("0.4.")
+}
+
+fn update_lock(root: &Path) -> Result<UpdateLock, String> {
+    use std::io::ErrorKind;
+
     std::fs::create_dir_all(root).map_err(|error| error.to_string())?;
-    let lock = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .open(root.join(".update.lock"))
-        .map_err(|error| error.to_string())?;
-    fs2::FileExt::try_lock_exclusive(&lock).map_err(|_| "已有升级任务正在执行".to_owned())?;
+    let path = root.join(".update.lock");
+    let busy = "已有升级任务正在执行";
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    let (file, created) = match options.open(&path) {
+        Ok(file) => (file, true),
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+            if uses_legacy_update_lock(&current_version(root)) {
+                return Err(busy.to_owned());
+            }
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .map_err(|error| error.to_string())?;
+            (file, false)
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    fs2::FileExt::try_lock_exclusive(&file).map_err(|error| match error.kind() {
+        ErrorKind::WouldBlock => busy.to_owned(),
+        _ => error.to_string(),
+    })?;
+    let legacy = uses_legacy_update_lock(&current_version(root));
+    let lock = UpdateLock { path, file, remove_on_drop: legacy && created };
+    if (legacy && !created) || lock.file.metadata().map_err(|error| error.to_string())?.len() != 0 {
+        return Err(busy.to_owned());
+    }
+    #[cfg(unix)]
+    if !lock.matches_path().map_err(|error| error.to_string())? {
+        return Err(busy.to_owned());
+    }
     Ok(lock)
 }
 async fn download(root: &Path, release: &Release, path: &Path) -> Result<(), String> {
@@ -781,7 +847,7 @@ async fn upgrade(root: &Path, target: Option<&str>, force: bool) -> Result<Value
 fn rollback_inner(root: &Path) -> Result<(), String> {
     let root = std::fs::canonicalize(root).map_err(|error| error.to_string())?;
     let root = root.as_path();
-    let _lock = update_lock(root)?;
+    let mut lock = update_lock(root)?;
     let current_link = root.join("current");
     let previous_link = root.join("previous");
     let current =
@@ -803,6 +869,7 @@ fn rollback_inner(root: &Path) -> Result<(), String> {
                 .map(|name| name.to_string_lossy().to_string())
         })
         .ok_or("上一版本目录缺少版本")?;
+    lock.remove_on_drop |= uses_legacy_update_lock(&previous_version);
     set_link(root, "current", &previous)?;
     set_link(root, "previous", &current)?;
     let mut metadata = initial_metadata(root)?;
@@ -818,6 +885,9 @@ fn rollback_inner(root: &Path) -> Result<(), String> {
         "available":false,"progress":100,"restart_required":true,"error":null,
         "message":format!("已回滚到 {previous_version}，重启服务后生效")}),
     )?;
+    if lock.remove_on_drop {
+        lock.remove().map_err(|error| format!("无法移除回滚后的升级锁：{error}"))?;
+    }
     Ok(())
 }
 

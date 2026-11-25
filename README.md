@@ -80,12 +80,12 @@ After a month of engineering work, tuning, and fixes, Muteki is open source with
 | [FishCodeTech/muteki](https://github.com/FishCodeTech/muteki) | Public source, releases and user issues; use this address for sharing, stars and public feedback |
 | [AtomGit](https://atomgit.com/FishCodeTech/muteki) | Project mirror; check its actual content for synchronization status |
 
-The current public release is [v0.5.0](https://github.com/FishCodeTech/muteki/releases/tag/v0.5.0). It moves the main application from the Python/FastAPI and Electron stack used by v0.4.7 to the Rust service, Next.js frontend and native macOS shell in this repository.
+The current public release is [v0.5.1](https://github.com/FishCodeTech/muteki/releases/tag/v0.5.1). It moves the main application from the Python/FastAPI and Electron stack used by v0.4.7 to the Rust service, Next.js frontend and native macOS shell in this repository.
 
 Existing managed v0.4.7 Web installations can upgrade through the stable command. The updater verifies the compatibility bundle and the platform-specific native package before switching the installation:
 
 ```bash
-muteki upgrade v0.5.0
+muteki upgrade v0.5.1
 ```
 
 ## Rust development quick start
