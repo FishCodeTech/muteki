@@ -4,18 +4,30 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing GitHub release tag to mirror (for example v0.4.7)"
+        description: "Existing GitHub release tag to mirror (for example v0.5.1)"
         required: true
         type: string
+      mode:
+        description: "Asset sync mode: atomgit-action (pull on AtomGit domestic runner) or direct (upload from GitHub runner)"
+        required: false
+        default: atomgit-action
+        type: choice
+        options:
+          - atomgit-action
+          - direct
       dry_run:
         description: "Compare assets without changing AtomGit"
-        type: boolean
+        required: false
         default: false
+        type: boolean
   workflow_call:
     inputs:
       tag:
         required: true
         type: string
+      mode:
+        type: string
+        default: atomgit-action
       dry_run:
         type: boolean
         default: false
@@ -39,6 +51,7 @@ jobs:
     timeout-minutes: 90
     env:
       RELEASE_TAG: ${{ inputs.tag }}
+      SYNC_MODE: ${{ inputs.mode || 'atomgit-action' }}
       ATOMGIT_REPOSITORY: ${{ vars.ATOMGIT_REPOSITORY || 'FishCodeTech/muteki' }}
       GH_REPO: ${{ github.repository }}
     steps:
@@ -58,7 +71,7 @@ jobs:
             echo 'ATOMGIT_USERNAME and ATOMGIT_TOKEN repository secrets are required' >&2
             exit 1
           fi
-      - name: Download the published GitHub release
+      - name: Resolve published GitHub release metadata
         id: release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -67,7 +80,9 @@ jobs:
           [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]
           mkdir -p "$RUNNER_TEMP/atomgit-assets"
           gh api "repos/$GH_REPO/releases/tags/$RELEASE_TAG" > "$RUNNER_TEMP/github-release.json"
-          gh release download "$RELEASE_TAG" --dir "$RUNNER_TEMP/atomgit-assets"
+          if [ "$SYNC_MODE" = "direct" ]; then
+            gh release download "$RELEASE_TAG" --dir "$RUNNER_TEMP/atomgit-assets"
+          fi
           COMMIT="$(gh api "repos/$GH_REPO/commits/$RELEASE_TAG" --jq .sha)"
           echo "commit=$COMMIT" >> "$GITHUB_OUTPUT"
       - name: Mirror main and the annotated release tag to AtomGit
@@ -145,7 +160,23 @@ jobs:
             test "$(awk -v ref="$ARCHIVE_REF" '$2 == ref {print $1}' <<< "$REMOTE_REFS")" = "$REMOTE_MAIN"
           fi
           echo "Verified AtomGit main and annotated $RELEASE_TAG tag against GitHub"
-      - name: Synchronize AtomGit release and verify attachment hashes
+      - name: Dispatch AtomGit domestic pull workflow
+        if: env.SYNC_MODE == 'atomgit-action'
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+          ATOMGIT_TOKEN: ${{ secrets.ATOMGIT_TOKEN }}
+        run: |
+          set -euo pipefail
+          ARGS=()
+          if [ "$DRY_RUN" = true ]; then ARGS+=(--dry-run); fi
+          python3 -u scripts/sync_atomgit_release.py \
+            --dispatch-workflow sync-github-release.yml \
+            --dispatch-ref main \
+            --tag "$RELEASE_TAG" \
+            --repository "$ATOMGIT_REPOSITORY" \
+            "${ARGS[@]}"
+      - name: Synchronize AtomGit release directly from GitHub runner
+        if: env.SYNC_MODE == 'direct'
         env:
           SOURCE_COMMIT: ${{ steps.release.outputs.commit }}
           DRY_RUN: ${{ inputs.dry_run }}
@@ -154,8 +185,10 @@ jobs:
           set -euo pipefail
           ARGS=()
           if [ "$DRY_RUN" = true ]; then ARGS+=(--dry-run); fi
-          python scripts/sync_atomgit_release.py \
+          python3 -u scripts/sync_atomgit_release.py \
             --release-json "$RUNNER_TEMP/github-release.json" \
             --assets-dir "$RUNNER_TEMP/atomgit-assets" \
             --target-commitish "$SOURCE_COMMIT" \
-            --repository "$ATOMGIT_REPOSITORY" "${ARGS[@]}"
+            --repository "$ATOMGIT_REPOSITORY" \
+            --workers 4 \
+            "${ARGS[@]}"
