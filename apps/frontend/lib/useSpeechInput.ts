@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { desktopChatBridge, type DesktopChatBridge, type DesktopSpeechEvent } from "./desktopChatBridge";
+import { randomUuid } from "./browserCrypto";
 
 export type SpeechInputState = "idle" | "requesting" | "listening" | "processing" | "error" | "unsupported";
 
@@ -98,7 +99,7 @@ export function useSpeechInput(onTranscript: (text: string) => void, scopeKey = 
       const current = () => session === sessionRef.current && ownerScope === scopeRef.current;
       try {
         if (!bridge.startSpeech || !bridge.finishSpeech || !bridge.cancelSpeech || !bridge.onSpeech || !bridge.getState) throw new Error("desktop.speech.unavailable: 桌面原生语音识别接口未配置，请更新桌面客户端。");
-        const id = crypto.randomUUID();
+        const id = randomUuid();
         const owner = { connectionVersion: -1, serviceId: "", identityId: "" };
         const dispose = () => { if (nativeRef.current?.id === id) { nativeRef.current.unsubscribe(); nativeRef.current = null; } };
         const unsubscribe = bridge.onSpeech((event: DesktopSpeechEvent) => {

@@ -2,7 +2,7 @@
 
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, ReactElement, RefObject, DragEvent as ReactDragEvent, PointerEvent as ReactPointerEvent } from "react";
-import { RunSummary, RunStatus, Folder, type OperatorTriageLabel } from "@/lib/useRun";
+import { RunSummary, RunStatus, Folder, type FolderSection, type OperatorTriageLabel } from "@/lib/useRun";
 import { useLang, useT, type Lang } from "@/lib/i18n";
 import { Button, Icon, Menu, MenuItem, MenuSeparator, shouldUseNativeContextMenu, type IconName } from "@muteki/ui";
 import { createDragGhost, type DragGhost } from "@/components/chat/sidebar/dragGhost";
@@ -18,10 +18,31 @@ type RailAction =
   | { kind: "delete"; runId: string }
   | { kind: "move"; runId: string; folderId: string | null }
   | { kind: "reorder"; runIds: string[]; pinned: boolean }
-  | { kind: "newFolder" }
+  | { kind: "newFolder"; section: FolderSection }
+  | { kind: "arrangeFolders"; folders: { id: string; section: FolderSection }[] }
   | { kind: "renameFolder"; folderId: string; name: string }
   | { kind: "deleteFolder"; folderId: string }
   | { kind: "operatorLabel"; runId: string; label: OperatorTriageLabel | null };
+
+type FolderDrop = { section: FolderSection; targetId: string | null; side: "before" | "after" };
+
+function arrangeFolderList(list: Folder[], folderId: string, drop: FolderDrop): Folder[] | null {
+  const source = list.find((folder) => folder.id === folderId);
+  if (!source || drop.targetId === folderId) return null;
+  const rest = list.filter((folder) => folder.id !== folderId);
+  let at: number;
+  if (drop.targetId) {
+    const index = rest.findIndex((folder) => folder.id === drop.targetId);
+    if (index < 0) return null;
+    at = index + (drop.side === "after" ? 1 : 0);
+  } else {
+    const last = rest.map((folder) => folder.section).lastIndexOf(drop.section);
+    at = last >= 0 ? last + 1 : drop.section === "active" ? 0 : rest.length;
+  }
+  rest.splice(at, 0, { ...source, section: drop.section });
+  const changed = rest.some((folder, index) => folder.id !== list[index].id || folder.section !== list[index].section);
+  return changed ? rest : null;
+}
 
 function operatorLabelText(label: OperatorTriageLabel | null | undefined, lang: Lang): string {
   switch (label) {
@@ -61,7 +82,7 @@ export function ThreadRail({
   draftActive: boolean;
   onNew: () => void;
   onSelect: (runId: string) => void;
-  onAction: (a: RailAction) => void | Promise<Folder | null | void>;
+  onAction: (a: RailAction) => void | Promise<Folder | boolean | null | void>;
   onResize: (width: number) => void;
   onOpenSettings: () => void;
   onOpenReports: () => void;
@@ -83,6 +104,7 @@ export function ThreadRail({
         "rail.emptyHint": ["在下方输入目标并开始测试。", "Describe a target to start testing."],
         "rail.status.solved": ["已证实", "Proven"],
         "rail.reports": ["测试报告", "Reports"],
+        "rail.folderEmpty": ["把测试拖进来", "Drag a test here"],
       };
       const label = labels[key];
       if (label) return label[lang === "zh" ? 0 : 1];
@@ -99,6 +121,11 @@ export function ThreadRail({
   const [rowDrop, setRowDrop] = useState<{ runId: string; side: "before" | "after" } | null>(null);
   const [collapsedFolders, setCollapsedFolders] = useState<Set<string>>(new Set());
   const [renamingFolder, setRenamingFolder] = useState<string | null>(null);
+  const [dragFolder, setDragFolder] = useState<string | null>(null);
+  const [folderDrop, setFolderDrop] = useState<FolderDrop | null>(null);
+  const [arrangedFolders, setArrangedFolders] = useState<{ seq: number; pending: boolean; source: Folder[]; folders: Folder[] } | null>(null);
+  const shownFolders = arrangedFolders && (arrangedFolders.pending || arrangedFolders.source === folders) ? arrangedFolders.folders : folders;
+  const folderArrangeSeqRef = useRef(0);
   const [resizing, setResizing] = useState(false);
   const navRef = useRef<HTMLElement | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
@@ -251,7 +278,7 @@ export function ThreadRail({
     const pinned: RunSummary[] = [];
     const archived: RunSummary[] = [];
     const ungrouped: RunSummary[] = [];
-    const folderRuns = new Map<string, RunSummary[]>(folders.map((folder) => [folder.id, []]));
+    const folderRuns = new Map<string, RunSummary[]>(shownFolders.map((folder) => [folder.id, []]));
     for (const run of matched) {
       if (run.archived) {
         archived.push(run);
@@ -289,7 +316,7 @@ export function ThreadRail({
     ungrouped.sort(byCreationOrder);
     for (const items of folderRuns.values()) items.sort(byCreationOrder);
     return { pinned, archived, ungrouped, folderRuns };
-  }, [matched, folders]);
+  }, [matched, shownFolders]);
   const searching = q.length > 0;
   const noMatches = searching && matched.length === 0;
 
@@ -547,6 +574,113 @@ export function ThreadRail({
       return next;
     });
 
+  const latestFolderStateRef = useRef({ source: folders, shown: shownFolders, onAction });
+  latestFolderStateRef.current = { source: folders, shown: shownFolders, onAction };
+  const commitFolderDrop = (folderId: string, drop: FolderDrop): boolean => {
+    const latest = latestFolderStateRef.current;
+    const next = arrangeFolderList(latest.shown, folderId, drop);
+    if (!next) return false;
+    const seq = ++folderArrangeSeqRef.current;
+    setArrangedFolders({ seq, pending: true, source: latest.source, folders: next });
+    void Promise.resolve(latest.onAction({
+      kind: "arrangeFolders",
+      folders: next.map((folder) => ({ id: folder.id, section: folder.section })),
+    })).then((ok) => {
+      if (folderArrangeSeqRef.current !== seq) return;
+      if (ok === false) setArrangedFolders(null);
+      else setArrangedFolders((current) => current && current.seq === seq
+        ? { ...current, pending: false, source: latestFolderStateRef.current.source }
+        : current);
+    });
+    return true;
+  };
+  const folderDropAt = (folderId: string, x: number, y: number): FolderDrop | null => {
+    const hit = document.elementFromPoint(x, y);
+    if (!hit || !navRef.current?.contains(hit)) return null;
+    const folderEl = hit.closest<HTMLElement>("[data-rail-folder]");
+    const targetId = folderEl?.dataset.railFolder;
+    if (folderEl && targetId) {
+      if (targetId === folderId) return null;
+      const target = latestFolderStateRef.current.shown.find((folder) => folder.id === targetId);
+      if (!target) return null;
+      const head = folderEl.querySelector<HTMLElement>(":scope > .rail-folder-head") ?? folderEl;
+      const rect = head.getBoundingClientRect();
+      return { section: target.section, targetId, side: y < rect.top + rect.height / 2 ? "before" : "after" };
+    }
+    const section = hit.closest<HTMLElement>("[data-rail-section]")?.dataset.railSection;
+    return section === "active" || section === "recent" ? { section, targetId: null, side: "after" } : null;
+  };
+  const startFolderPointerDrag = (folder: Folder, event: ReactPointerEvent<HTMLDivElement>) => {
+    if (event.button !== 0 || event.pointerType === "touch" || renamingFolder === folder.id) return;
+    if (event.target instanceof HTMLElement && event.target.closest(".row-menu, input")) return;
+    pointerDragCleanup.current?.();
+    const folderId = folder.id;
+    const startX = event.clientX;
+    const startY = event.clientY;
+    const sourceEl = event.currentTarget;
+    let active = false;
+    let ghost: DragGhost | null = null;
+    let didDragTimer: number | null = null;
+
+    const cleanup = (cancelled: boolean) => {
+      pointerDragCleanup.current = null;
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      window.removeEventListener("pointercancel", onCancel);
+      window.removeEventListener("keydown", onEsc);
+      if (!active) return;
+      delete document.documentElement.dataset.cxSidebarDragging;
+      setDragFolder(null);
+      setFolderDrop(null);
+      if (cancelled) ghost?.cancel();
+      if (didDragTimer !== null) window.clearTimeout(didDragTimer);
+      didDragTimer = window.setTimeout(() => {
+        didDragRef.current = false;
+      }, 0);
+    };
+    const onMove = (ev: PointerEvent) => {
+      if (!active) {
+        if (Math.hypot(ev.clientX - startX, ev.clientY - startY) < 5) return;
+        active = true;
+        didDragRef.current = true;
+        setMenuFor(null);
+        setDragFolder(folderId);
+        const reduced = document.documentElement.dataset.motion === "reduce"
+          || Boolean(window.matchMedia?.("(prefers-reduced-motion: reduce)").matches);
+        ghost = createDragGhost(sourceEl, startX, startY, reduced);
+        document.documentElement.dataset.cxSidebarDragging = "";
+      }
+      ev.preventDefault();
+      ghost?.move(ev.clientX, ev.clientY);
+      const drop = folderDropAt(folderId, ev.clientX, ev.clientY);
+      setFolderDrop((current) => current?.section === drop?.section && current?.targetId === drop?.targetId && current?.side === drop?.side
+        ? current : drop);
+    };
+    const onUp = (ev: PointerEvent) => {
+      if (active) {
+        ev.preventDefault();
+        ghost?.move(ev.clientX, ev.clientY);
+        const drop = folderDropAt(folderId, ev.clientX, ev.clientY);
+        if (drop && commitFolderDrop(folderId, drop)) ghost?.drop();
+        else ghost?.cancel();
+      }
+      cleanup(false);
+    };
+    const onCancel = () => cleanup(true);
+    const onEsc = (ev: KeyboardEvent) => {
+      if (ev.key === "Escape") cleanup(true);
+    };
+
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    window.addEventListener("pointercancel", onCancel);
+    window.addEventListener("keydown", onEsc);
+    pointerDragCleanup.current = () => {
+      if (didDragTimer !== null) window.clearTimeout(didDragTimer);
+      cleanup(true);
+    };
+  };
+
   const rowProps = (r: RunSummary) => ({
     run: r,
     active: r.run_id === activeRunId,
@@ -610,6 +744,103 @@ export function ThreadRail({
     },
   });
 
+  const folderVisible = (folder: Folder) => !searching || (folderRuns.get(folder.id)?.length ?? 0) > 0;
+  const activeFolders = shownFolders.filter((folder) => folder.section === "active" && folderVisible(folder));
+  const recentFolders = shownFolders.filter((folder) => folder.section !== "active" && folderVisible(folder));
+  const showActive = draftActive || activeFolders.length > 0 || dragFolder !== null;
+  const zoneDrop = (section: FolderSection) => folderDrop?.section === section && folderDrop.targetId === null;
+  const openFolderMenu = (folderId: string, x: number, y: number) => {
+    setContextPosition({ runId: `folder:${folderId}`, x, y });
+    setMenuFor(`folder:${folderId}`);
+  };
+
+  const renderFolder = (f: Folder) => {
+    const items = folderRuns.get(f.id) ?? [];
+    const open = searching || !collapsedFolders.has(f.id);
+    const menuKey = `folder:${f.id}`;
+    const folderLabel = (
+      <>
+        <span className="rail-folder-ico" aria-hidden="true"><Icon name={open ? "folderOpen" : "folder"} size={13} /></span>
+        <span className="rail-folder-text">
+          {renamingFolder === f.id ? (
+            <RenameInput
+              initial={f.name}
+              onCommit={(name) => { setRenamingFolder(null); const v = name.trim(); if (v && v !== f.name) onAction({ kind: "renameFolder", folderId: f.id, name: v }); }}
+              onCancel={() => setRenamingFolder(null)}
+            />
+          ) : (
+            <span className="rail-folder-name">{f.name}</span>
+          )}
+          <span className="rail-folder-sub">{t("rail.folderCount", { n: items.length })}</span>
+        </span>
+        <span className="rail-folder-caret" aria-hidden="true"><Icon name="chevronRight" size={12} /></span>
+      </>
+    );
+    const cls = [
+      "rail-folder",
+      open ? "open" : "",
+      dropZone === f.id ? "drop" : "",
+      folderDrop?.targetId === f.id ? `drop-${folderDrop.side}` : "",
+      dragFolder === f.id ? "dragging" : "",
+      menuFor === menuKey ? "menu-open" : "",
+    ].filter(Boolean).join(" ");
+    return (
+      <div key={f.id} data-rail-folder={f.id} className={cls} {...dzProps(f.id)}>
+        <div
+          className="rail-folder-head"
+          data-rail-draggable={renamingFolder === f.id ? undefined : "true"}
+          onPointerDown={(event) => startFolderPointerDrag(f, event)}
+          onContextMenu={(event) => {
+            if (renamingFolder === f.id || event.defaultPrevented || shouldUseNativeContextMenu(event.target)) return;
+            event.preventDefault();
+            event.stopPropagation();
+            openFolderMenu(f.id, event.clientX, event.clientY);
+          }}
+        >
+          {renamingFolder === f.id ? (
+            <div className="rail-folder-toggle">{folderLabel}</div>
+          ) : (
+            <Button
+              variant="unstyled"
+              className="rail-folder-toggle"
+              aria-expanded={open}
+              aria-keyshortcuts="Shift+F10"
+              onClick={() => { if (!didDragRef.current) toggleFolder(f.id); }}
+              onKeyDown={(event) => {
+                if (event.target !== event.currentTarget) return;
+                if (event.key !== "ContextMenu" && !(event.shiftKey && event.key === "F10")) return;
+                event.preventDefault();
+                const rect = event.currentTarget.getBoundingClientRect();
+                openFolderMenu(f.id, rect.left + 12, rect.bottom);
+              }}
+            >{folderLabel}</Button>
+          )}
+          <div className={`row-menu ${menuFor === menuKey ? "menu-open" : ""}`}>
+            <FolderMenu
+              trigger={<Button className="dots" data-tooltip={t("rail.menu.moreActions")} aria-label={t("rail.menu.moreActions")} onClick={(event) => event.stopPropagation()}><Icon name="more" size={15} /></Button>}
+              open={menuFor === menuKey}
+              contextPosition={contextPosition?.runId === menuKey ? contextPosition : null}
+              section={f.section}
+              onOpen={() => { setContextPosition(null); setMenuFor(menuKey); }}
+              t={t}
+              onClose={() => setMenuFor(null)}
+              onRename={() => { setMenuFor(null); setRenamingFolder(f.id); }}
+              onMove={(section) => { setMenuFor(null); commitFolderDrop(f.id, { section, targetId: null, side: "after" }); }}
+              onDelete={() => { setMenuFor(null); onAction({ kind: "deleteFolder", folderId: f.id }); }}
+            />
+          </div>
+        </div>
+        {open && (
+          <div className="thread">
+            {items.length === 0
+              ? <div className="rail-folder-empty">{t("rail.folderEmpty")}</div>
+              : items.map((r) => <RailRow key={r.run_id} {...rowProps(r)} t={t} lang={lang} />)}
+          </div>
+        )}
+      </div>
+    );
+  };
+
   return (
     <nav
       ref={navRef}
@@ -657,16 +888,22 @@ export function ThreadRail({
           ref={scrollRef}
           onScroll={(e) => { scrollTop.current = (e.target as HTMLDivElement).scrollTop; }}
         >
-        {draftActive && (
-          <>
+        {showActive && (
+          <div data-rail-section="active" className={`rail-zone ${zoneDrop("active") ? "drop" : ""}`}>
             <div className="rail-sec">{t("rail.active")}</div>
-            <div className="thread">
-              <Button className="thread-item active is-draft" onClick={() => onSelect(activeRunId)}>
-                <StatusIcon status="draft" t={t} mode={workspaceMode} />
-                <span className="nm">{t("rail.newSolveItem")}</span>
-              </Button>
-            </div>
-          </>
+            {draftActive && (
+              <div className="thread">
+                <Button className="thread-item active is-draft" onClick={() => onSelect(activeRunId)}>
+                  <StatusIcon status="draft" t={t} mode={workspaceMode} />
+                  <span className="nm">{t("rail.newSolveItem")}</span>
+                </Button>
+              </div>
+            )}
+            {activeFolders.map(renderFolder)}
+            {dragFolder !== null && activeFolders.length === 0 && (
+              <div className="rail-folder-slot">{t("rail.folderDropActive")}</div>
+            )}
+          </div>
         )}
 
         {pinned.length > 0 && (
@@ -678,84 +915,25 @@ export function ThreadRail({
           </>
         )}
 
-        {workspaceMode === "ctf" && folders.map((f) => {
-          const items = folderRuns.get(f.id)!;
-          if (searching && items.length === 0) return null;
-          const open = searching || !collapsedFolders.has(f.id);
-          return (
-            <div
-              key={f.id}
-              data-rail-folder={f.id}
-              className={`rail-folder ${dropZone === f.id ? "drop" : ""} ${menuFor === `folder:${f.id}` ? "menu-open" : ""}`}
-              {...dzProps(f.id)}
-            >
-              <div className="rail-folder-head" onContextMenu={(event) => {
-                if (renamingFolder === f.id || event.defaultPrevented || shouldUseNativeContextMenu(event.target)) return;
-                event.preventDefault();
-                event.stopPropagation();
-                setContextPosition({ runId: `folder:${f.id}`, x: event.clientX, y: event.clientY });
-                setMenuFor(`folder:${f.id}`);
-              }}>
-                <Button className="rail-folder-toggle" onClick={() => toggleFolder(f.id)} aria-keyshortcuts="Shift+F10" onKeyDown={(event) => {
-                  if (renamingFolder === f.id || event.target !== event.currentTarget) return;
-                  if (event.key !== "ContextMenu" && !(event.shiftKey && event.key === "F10")) return;
-                  event.preventDefault();
-                  const rect = event.currentTarget.getBoundingClientRect();
-                  setContextPosition({ runId: `folder:${f.id}`, x: rect.left, y: rect.bottom });
-                  setMenuFor(`folder:${f.id}`);
-                }}>
-                  <span className="rail-folder-caret">{open ? "▾" : "▸"}</span>
-                  {renamingFolder === f.id ? (
-                    <RenameInput
-                      initial={f.name}
-                      onCommit={(name) => { setRenamingFolder(null); const v = name.trim(); if (v && v !== f.name) onAction({ kind: "renameFolder", folderId: f.id, name: v }); }}
-                      onCancel={() => setRenamingFolder(null)}
-                    />
-                  ) : (
-                    <span className="rail-folder-name"><Icon name="folder" size={13} /> {f.name}</span>
-                  )}
-                  <span className="rail-folder-count">{items.length}</span>
-                </Button>
-                <div className={`row-menu ${menuFor === `folder:${f.id}` ? "menu-open" : ""}`}>
-                  <FolderMenu
-                      trigger={<Button className="dots" data-tooltip={t("rail.menu.moreActions")} aria-label={t("rail.menu.moreActions")} onClick={(event) => event.stopPropagation()}><Icon name="more" size={15} /></Button>}
-                      open={menuFor === `folder:${f.id}`}
-                      contextPosition={contextPosition?.runId === `folder:${f.id}` ? contextPosition : null}
-                      onOpen={() => { setContextPosition(null); setMenuFor(`folder:${f.id}`); }}
-                      t={t}
-                      onClose={() => setMenuFor(null)}
-                      onRename={() => { setMenuFor(null); setRenamingFolder(f.id); }}
-                      onDelete={() => { setMenuFor(null); onAction({ kind: "deleteFolder", folderId: f.id }); }}
-                    />
-                </div>
+        <div data-rail-section="recent" className={`rail-zone ${zoneDrop("recent") ? "drop" : ""}`}>
+          <div data-rail-recent="true" className={`rail-sec rail-recent-head ${dropZone === "" ? "drop" : ""}`} {...dzProps("")}>
+            <span>{t("rail.recent")}</span>
+            <Button className="rail-newfolder" data-tooltip={t("rail.newFolderTitle")} aria-label={t("rail.newFolderTitle")}
+              onClick={async () => {
+                const folder = await onAction({ kind: "newFolder", section: "recent" });
+                if (folder && typeof folder === "object" && "id" in folder) setRenamingFolder(folder.id);
+              }}><Icon name="folderPlus" size={15} /></Button>
+          </div>
+          {recentFolders.map(renderFolder)}
+          <div data-rail-recent="true" className={`thread ${dropZone === "" ? "drop" : ""}`} {...dzProps("")}>
+            {ungrouped.length === 0 && recentFolders.length === 0 && !draftActive && !searching && (
+              <div className="rail-empty">
+                {t("rail.empty")}
+                <span className="rail-empty-hint">{t("rail.emptyHint")}</span>
               </div>
-              {open && (
-                <div className="thread">
-                  {items.length === 0
-                    ? <div className="rail-folder-empty">{t("rail.folderEmpty")}</div>
-                    : items.map((r) => <RailRow key={r.run_id} {...rowProps(r)} t={t} lang={lang} />)}
-                </div>
-              )}
-            </div>
-          );
-        })}
-
-        <div data-rail-recent="true" className={`rail-sec rail-recent-head ${dropZone === "" ? "drop" : ""}`} {...dzProps("")}>
-          <span>{t("rail.recent")}</span>
-          {workspaceMode === "ctf" && <Button className="rail-newfolder" data-tooltip={t("rail.newFolderTitle")} aria-label={t("rail.newFolderTitle")}
-            onClick={async () => {
-              const folder = await onAction({ kind: "newFolder" });
-              if (folder && typeof folder === "object" && "id" in folder) setRenamingFolder(folder.id);
-            }}><Icon name="folderPlus" size={15} /></Button>}
-        </div>
-        <div data-rail-recent="true" className={`thread ${dropZone === "" ? "drop" : ""}`} {...dzProps("")}>
-          {ungrouped.length === 0 && !draftActive && !searching && (
-            <div className="rail-empty">
-              {t("rail.empty")}
-              <span className="rail-empty-hint">{t("rail.emptyHint")}</span>
-            </div>
-          )}
-          {ungrouped.map((r) => <RailRow key={r.run_id} {...rowProps(r)} t={t} lang={lang} />)}
+            )}
+            {ungrouped.map((r) => <RailRow key={r.run_id} {...rowProps(r)} t={t} lang={lang} />)}
+          </div>
         </div>
 
         {noMatches && (
@@ -1110,20 +1288,25 @@ function RowMenu({
 }
 
 function FolderMenu({
-  open, trigger, contextPosition, t, onOpen, onClose, onRename, onDelete,
+  open, trigger, contextPosition, section, t, onOpen, onClose, onRename, onMove, onDelete,
 }: {
   open: boolean;
   trigger: ReactElement;
   contextPosition: { x: number; y: number } | null;
+  section: FolderSection;
   t: (k: string, v?: Record<string, string | number>) => string;
   onOpen: () => void;
   onClose: () => void;
   onRename: () => void;
+  onMove: (section: FolderSection) => void;
   onDelete: () => void;
 }) {
   return (
     <Menu open={open} trigger={trigger} anchorPoint={contextPosition} placement={contextPosition ? "bottom-start" : "bottom-end"} onOpenChange={(next) => { if (next) onOpen(); else onClose(); }} ariaLabel={t("rail.menu.moreActions")}>
       <MenuItem icon="pencil" onSelect={onRename}>{t("rail.menu.rename")}</MenuItem>
+      {section === "active"
+        ? <MenuItem icon="arrowDown" onSelect={() => onMove("recent")}>{t("rail.folderMoveRecent")}</MenuItem>
+        : <MenuItem icon="arrowUp" onSelect={() => onMove("active")}>{t("rail.folderMoveActive")}</MenuItem>}
       <MenuSeparator />
       <MenuItem icon="trash" danger onSelect={onDelete}>{t("rail.folderDelete")}</MenuItem>
     </Menu>

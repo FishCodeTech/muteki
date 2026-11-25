@@ -58,16 +58,6 @@
   padding: 0 2px; line-height: 1; }
 .rail-newfolder:hover { color: var(--accent); }
 .rail-recent-head.drop, .thread.drop { background: color-mix(in srgb, var(--accent) 10%, transparent); border-radius: 8px; }
-.rail-folder { margin: 0 8px 2px; border-radius: 8px; }
-.rail-folder.drop { background: color-mix(in srgb, var(--accent) 14%, transparent);
-  outline: 1px dashed color-mix(in srgb, var(--accent) 60%, var(--border2)); }
-.rail-folder-head { display: flex; align-items: center; gap: 4px; padding: 4px 4px 4px 6px; }
-.rail-folder-toggle { flex: 1; min-width: 0; display: flex; align-items: center; gap: 6px; background: transparent;
-  border: 0; color: var(--text); cursor: pointer; font-size: 12px; text-align: left; padding: 2px 0; }
-.rail-folder-caret { color: var(--dim); width: 10px; flex: none; }
-.rail-folder-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
-.rail-folder-count { margin-left: auto; color: var(--dim); font-size: 11px; padding-right: 4px; font-variant-numeric: tabular-nums; }
-.rail-folder-empty { font-size: 11px; color: var(--dim); padding: 4px 18px 6px; font-style: italic; }
 .thread-item.dragging { opacity: .4; }
 .thread-item[data-rail-draggable="true"],
 .thread-item[draggable="true"] { cursor: grab; user-select: none; -webkit-user-select: none; }

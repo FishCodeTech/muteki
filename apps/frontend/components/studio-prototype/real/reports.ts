@@ -3,6 +3,7 @@ import type {
   ReportTemplateId, SubmissionStatus, RewardStatus, ReadinessLevel, RetestVerdict,
 } from "../model";
 import type { HistoryEntry } from "../records";
+import { randomUuid } from "@/lib/browserCrypto";
 import { postCommand, querySrc } from "../../src/reviewPrimitives";
 import { recordListAll, type DomainCtx, type RealDomain } from "./domain";
 
@@ -68,7 +69,7 @@ async function recordHistory(ctx: DomainCtx, undo: { op: string; params?: Record
   const entry = (ctx.proposal?.() ?? ctx.state()).history[0];
   const payload = entry && entry.summary === fallback.summary
     ? { id: entry.id, action: entry.action, summary: entry.summary, refs: entry.refs, at: entry.at }
-    : { id: `wb-${crypto.randomUUID().slice(0, 8)}`, action: fallback.action, summary: fallback.summary, refs: fallback.refs ?? [], at: new Date().toISOString() };
+    : { id: `wb-${randomUuid().slice(0, 8)}`, action: fallback.action, summary: fallback.summary, refs: fallback.refs ?? [], at: new Date().toISOString() };
   await postCommand(ctx.taskId, "src.workbench.history.record", { entry: { ...payload, undo, domain: "reports" } });
 }
 

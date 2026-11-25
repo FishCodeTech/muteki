@@ -1,6 +1,7 @@
 "use client";
 
 import { classifyCommandReceipt } from "@/lib/commandReceiptState";
+import { randomUuid } from "@/lib/browserCrypto";
 import { flushConversationPersistence } from "@/lib/conversationPersistence";
 
 
@@ -5518,7 +5519,7 @@ export function ConversationShell({ threadId = "", navigation, experience, mainC
             onForkTurn={preview || sideChat ? undefined : (tId) => handleFork(threadId, tId)}
             onCiteMessageSpan={handleCiteMessageSpan}
             onAskSideChat={!preview && !sideOf && threadId ? (payload) => {
-              void askInSideChat({ ...payload, sourceThreadId: threadId, key: crypto.randomUUID() });
+              void askInSideChat({ ...payload, sourceThreadId: threadId, key: randomUuid() });
             } : undefined}
             jumpTarget={jumpTarget}
             onJumpTargetConsumed={() => setJumpTarget(null)}

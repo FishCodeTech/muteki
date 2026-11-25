@@ -7,6 +7,7 @@ import { CodeBlock } from "@muteki/ui/agent";
 import { querySrc } from "@/components/src/reviewPrimitives";
 import { fetchConversationProjects, fetchConversationView, sendConversationCommand, useConversation, type ConversationAgentNode, type ConversationProject } from "@/lib/useConversation";
 import { apiFetch } from "@/lib/useRun";
+import { randomUuid } from "@/lib/browserCrypto";
 import { downloadSrcDebugLogs, fetchSrcTask, lifecycleSrcTask, listSrcRecordPage, takeoverHistoricalSrcTask } from "@/lib/srcApi";
 import { formatSrcDebugLogsSummary } from "@/lib/srcDebugLogs";
 import { srcTaskThreadId, type SrcTask } from "@/lib/srcTypes";
@@ -719,7 +720,7 @@ function SrcWorkbenchBody({
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          command_id: crypto.randomUUID(),
+          command_id: randomUuid(),
           title: selectedTarget ? `Worker · ${selectedTarget.label}` : `资料审阅 · ${task.title}`,
           references: reviewRefs.map(({ kind, id }) => ({ kind, id })),
           ...(runId ? { run_id: runId } : {}),
@@ -742,7 +743,7 @@ function SrcWorkbenchBody({
     if (!activeSideId || !sideInput.trim()) return;
     setSideBusy(true);
     try {
-      const cid = crypto.randomUUID();
+      const cid = randomUuid();
       await sendConversationCommand(activeSideId, "conversation.turn.send",
         { text: sideInput.trim(), client_message_id: cid },
         { commandId: cid, idempotencyKey: cid });

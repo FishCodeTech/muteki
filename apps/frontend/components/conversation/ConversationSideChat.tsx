@@ -3,6 +3,7 @@
 import { useEffect, useRef } from "react";
 import { extensionSurface, type ExtensionSurface } from "@/components/chat/panel/extensions";
 import { chatPanel } from "@/lib/chatPanelStore";
+import { randomUuid } from "@/lib/browserCrypto";
 import { sendConversationCommand, type ConversationView } from "@/lib/useConversation";
 import type { ConversationMessageProps } from "./ConversationMessage";
 
@@ -32,7 +33,7 @@ export function visibleSideChatId(parentId: string): string {
 }
 
 export async function createSideChat(parentId: string): Promise<string> {
-  const id = crypto.randomUUID();
+  const id = randomUuid();
   const receipt = await sendConversationCommand(parentId, "conversation.thread.fork", { from_turn_id: "", side_chat: true }, { commandId: id, idempotencyKey: id });
   const sideId = receipt.aggregate?.id;
   if (!sideId) throw new Error("侧边聊天回执缺少会话编号");
@@ -40,7 +41,7 @@ export async function createSideChat(parentId: string): Promise<string> {
 }
 
 export async function sendSideChatQuestion(sideId: string, text: string): Promise<void> {
-  const id = crypto.randomUUID();
+  const id = randomUuid();
   await sendConversationCommand(sideId, "conversation.turn.send", { text, client_message_id: id, capability_refs: [] }, { commandId: id, idempotencyKey: id });
 }
 

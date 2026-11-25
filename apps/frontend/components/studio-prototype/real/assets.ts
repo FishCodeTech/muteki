@@ -1,3 +1,4 @@
+import { randomUuid } from "@/lib/browserCrypto";
 import {
   SRC_ASSET_TYPES,
   type AssetFieldConflict,
@@ -977,7 +978,7 @@ export function createAssetDomain(): RealDomain {
             default_asset_type: input.settings.defaultAssetType,
           },
           field_mapping: canSendRawBytes ? fieldMapping : {},
-          idempotency_key: `studio-import-${crypto.randomUUID()}`,
+          idempotency_key: `studio-import-${randomUuid()}`,
         });
         const localId = ctx.proposal?.().workspace.library.importBatchId;
         const serverId = text(saved.batch_id);

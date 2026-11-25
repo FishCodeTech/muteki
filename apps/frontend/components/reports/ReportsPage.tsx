@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type DragEvent, type KeyboardEvent } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { cn } from "@/lib/cn";
+import { sha256Hex } from "@/lib/browserCrypto";
 import { useT } from "@/lib/i18n";
 import { apiFetch, type RunSummary } from "@/lib/useRun";
 import {
@@ -623,8 +624,7 @@ export function ReportsPage({ workspaceMode, runs, onOpenRun, active = true }: {
       setBodyPristine(false);
       return;
     }
-    void crypto.subtle.digest("SHA-256", new TextEncoder().encode(selected.markdown)).then((buf) => {
-      const hex = Array.from(new Uint8Array(buf), (b) => b.toString(16).padStart(2, "0")).join("");
+    void sha256Hex(selected.markdown).then((hex) => {
       if (!dead) setBodyPristine(hex === selected.ai_sha256);
     });
     return () => {

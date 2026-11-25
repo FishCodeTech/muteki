@@ -1,6 +1,7 @@
 import { conversationStorageKey, conversationStorageScope, subscribeConversationStorageScope } from "./conversationStorageScope";
 import { desktopChatBridge, type DesktopNativeState, type DesktopNotificationEvent, type DesktopNotificationScope, type DesktopNotificationStage, type DesktopNotificationStatus } from "./desktopChatBridge";
 import { API } from "./useRun";
+import { randomUuid } from "./browserCrypto";
 
 export type NotificationMode =
   | "off"
@@ -637,7 +638,7 @@ export async function sendTestNotification(): Promise<{ host: "desktop-client" |
     if (typeof window === "undefined" || !("Notification" in window)) throw new Error("当前环境不支持系统通知。");
     if (Notification.permission !== "granted") throw new Error("请先允许浏览器发送通知。");
     const note = new Notification("Muteki 测试通知", {
-      body: "这是一条测试通知。点击返回通知设置。", tag: `muteki-test:${crypto.randomUUID()}`,
+      body: "这是一条测试通知。点击返回通知设置。", tag: `muteki-test:${randomUuid()}`,
     });
     note.onclick = () => { window.focus(); note.close(); };
     return { host: "browser" };

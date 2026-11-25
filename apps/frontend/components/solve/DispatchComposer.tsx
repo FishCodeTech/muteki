@@ -2,6 +2,7 @@
 "use client";
 
 import { useCallback, useEffect, useId, useRef, useState, type ReactNode } from "react";
+import { randomUuid } from "@/lib/browserCrypto";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { PromptBar, type PromptBarAttachment } from "@/components/chat/composer/MutekiPromptBar";
@@ -180,7 +181,7 @@ export function DispatchComposer({
     if (dispatchPending) return;
     const list = Array.from(files);
     if (!list.length) return;
-    const rows = list.map((file) => ({ id: `pending:${crypto.randomUUID()}`, name: file.name, size: file.size }));
+    const rows = list.map((file) => ({ id: `pending:${randomUuid()}`, name: file.name, size: file.size }));
     setPending((old) => [...old, ...rows]);
     let saved: number | void = 0;
     try { saved = await onAddFiles(list); } catch { saved = 0; }

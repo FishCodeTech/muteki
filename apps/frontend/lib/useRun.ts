@@ -1,6 +1,7 @@
 "use client";
 
 import { startTransition, useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { randomUuid } from "./browserCrypto";
 import { DeckState, EventType, GuardApprovalDecisionAction, MutekiEvent, ProductionGuardState, emptyDeck, reduce } from "./events";
 import { deleteRunProjection, loadRunProjection, saveRunProjection } from "./runProjectionCache";
 import { seedGid } from "./run-events/helpers";
@@ -67,10 +68,14 @@ export interface RunSummary {
   updated_at?: number;
 }
 
+export type FolderSection = "active" | "recent";
+
 export interface Folder {
   id: string;
   name: string;
   order: number;
+  mode: "ctf" | "pentest";
+  section: FolderSection;
 }
 
 const RECENT_DECK_LIMIT = 8;
@@ -409,7 +414,7 @@ export function useRun(runId: string) {
       body: JSON.stringify({
         kind,
         question,
-        request_id: crypto.randomUUID(),
+        request_id: randomUuid(),
         ...(opts?.templateId ? { template_id: opts.templateId } : {}),
         ...(opts?.customPrompt ? { custom_prompt: opts.customPrompt } : {}),
       }),
@@ -428,7 +433,7 @@ export function useRun(runId: string) {
   const resolve = useCallback(async (text?: string) => {
     const res = await apiFetch(`/api/runs/${runId}/resolve`, {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ command_id: crypto.randomUUID(),
+      body: JSON.stringify({ command_id: randomUuid(),
         expected_execution_generation: deckRef.current.executionGeneration,
         expected_generation: deckRef.current.controlGeneration,
         ...(text?.trim() ? { guidance: { action: "hint", text: text.trim() } } : {}),
@@ -1020,12 +1025,12 @@ async function listFolders(): Promise<Folder[]> {
   }
 }
 
-export async function createFolder(name: string): Promise<Folder | null> {
+export async function createFolder(name: string, mode: Folder["mode"], section: FolderSection): Promise<Folder | null> {
   try {
     const r = await apiFetch(`/api/folders`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name }),
+      body: JSON.stringify({ name, mode, section }),
     });
     const j = await r.json();
     return (j.folder ?? null) as Folder | null;
@@ -1035,11 +1040,18 @@ export async function createFolder(name: string): Promise<Folder | null> {
 }
 
 export async function renameFolder(id: string, name: string): Promise<boolean> {
+  return updateFolder(id, { name });
+}
+
+export async function updateFolder(
+  id: string,
+  patch: { name?: string; section?: FolderSection; order?: number },
+): Promise<boolean> {
   try {
     const r = await apiFetch(`/api/folders/${id}`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name }),
+      body: JSON.stringify(patch),
     });
     const j = await r.json().catch(() => ({}));
     return !!j.ok;

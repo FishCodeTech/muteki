@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import { createRequire } from 'node:module';
 import path from 'node:path';
@@ -81,6 +82,11 @@ function loadTsModule(filePath) {
     Error,
     URL,
     URLSearchParams,
+    TextEncoder,
+    Uint8Array,
+    Uint32Array,
+    DataView,
+    ArrayBuffer,
   };
   vm.runInNewContext(transpiled, context, { filename: canonical });
   return mod.exports;
@@ -1831,5 +1837,105 @@ runProp(
     assert.equal(classifyHitlRequest(state.hitlRequests[0]), 'recovering');
   },
 );
+
+const { randomUuid, sha256Hex, sha256HexSync } = loadTsModule(path.join(frontendRoot, 'lib/browserCrypto.ts'));
+
+runProp(
+  'browserCrypto_randomUuid_works_without_secure_context',
+  fc.constantFrom(undefined, {}, { getRandomValues: (arr) => { for (let i = 0; i < arr.length; i += 1) arr[i] = (i * 37 + 11) & 0xff; return arr; } }),
+  (mockCrypto) => {
+    const id = randomUuid(mockCrypto);
+    assert.match(id, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+  },
+);
+
+await fc.assert(
+  fc.asyncProperty(
+    fc.oneof(
+      fc.constantFrom('', 'abc', 'a'.repeat(55), 'a'.repeat(56), 'a'.repeat(63), 'a'.repeat(64), 'a'.repeat(65), '中文报告内容🚀\n## Heading'),
+      fc.string({ maxLength: 512 }),
+    ),
+    async (text) => {
+      const expected = createHash('sha256').update(text, 'utf8').digest('hex');
+      assert.equal(sha256HexSync(new TextEncoder().encode(text)), expected);
+      assert.equal(await sha256Hex(text, {}), expected);
+      assert.equal(await sha256Hex(text, undefined), expected);
+    },
+  ),
+  { numRuns },
+);
+console.log(`PASS  [frontend-prop] browserCrypto_sha256_matches_node_without_subtle (${numRuns} runs)`);
+
+const { createFolderArrangeQueue } = loadTsModule(path.join(frontendRoot, 'lib/folderArrangeQueue.ts'));
+
+await fc.assert(
+  fc.asyncProperty(
+    fc.array(
+      fc.record({
+        sections: fc.array(fc.constantFrom('active', 'recent'), { minLength: 1, maxLength: 4 }),
+        reverseOrder: fc.boolean(),
+      }),
+      { minLength: 2, maxLength: 6 },
+    ),
+    async (steps) => {
+      const ids = ['f1', 'f2', 'f3', 'f4'];
+      const initial = ids.map((id, idx) => ({ id, section: 'recent', order: idx + 1 }));
+      const server = new Map(initial.map((item) => [item.id, { ...item }]));
+      let staleProp = initial;
+      let activeCalls = 0;
+      let settledCount = 0;
+      const resolvers = [];
+      const queue = createFolderArrangeQueue(
+        () => staleProp,
+        (id, patch) => {
+          activeCalls += 1;
+          assert.equal(activeCalls, 1, 'folder PATCH requests must be strictly serialized');
+          return new Promise((resolve) => {
+            resolvers.push(() => {
+              const cur = server.get(id);
+              assert.ok(cur);
+              server.set(id, {
+                id,
+                section: patch.section ?? cur.section,
+                order: patch.order ?? cur.order,
+              });
+              activeCalls -= 1;
+              resolve(true);
+            });
+          });
+        },
+        () => {
+          settledCount += 1;
+        },
+      );
+
+      const desiredTargets = steps.map((step) => {
+        const ordered = step.reverseOrder ? [...ids].reverse() : [...ids];
+        return ordered.map((id, idx) => ({ id, section: step.sections[idx % step.sections.length] }));
+      });
+      const backToInitial = initial.map((item) => ({ id: item.id, section: item.section }));
+      const allTargets = [...desiredTargets, backToInitial];
+
+      const pending = allTargets.map((targets) => queue(targets));
+      await new Promise(setImmediate);
+      while (resolvers.length > 0) {
+        resolvers.shift()();
+        await new Promise(setImmediate);
+      }
+      const results = await Promise.all(pending);
+      assert.ok(results.every(Boolean));
+      assert.equal(settledCount, 1);
+
+      const expected = allTargets[allTargets.length - 1];
+      for (const [index, target] of expected.entries()) {
+        const actual = server.get(target.id);
+        assert.equal(actual.section, target.section);
+        assert.equal(actual.order, index + 1);
+      }
+    },
+  ),
+  { numRuns },
+);
+console.log(`PASS  [frontend-prop] folderArrangeQueue_serializes_rapid_moves_and_reconciles_baseline (${numRuns} runs)`);
 
 console.log('ALL FRONTEND PROPERTY SUITES PASSED');

@@ -29,7 +29,7 @@ services:
     image: ${MUTEKI_WEB_IMAGE:?set the exact versioned MUTEKI_WEB_IMAGE}
     restart: unless-stopped
     ports:
-      - "127.0.0.1:${MUTEKI_WEB_PORT:-3101}:3101"
+      - "${MUTEKI_WEB_BIND:-127.0.0.1}:${MUTEKI_WEB_PORT:-3101}:3101"
     volumes:
       - ${MUTEKI_HOST_DATA_ROOT:?set MUTEKI_HOST_DATA_ROOT to an absolute host path}:${MUTEKI_HOST_DATA_ROOT}
       - ${MUTEKI_HOST_DATA_ROOT}/state/runner:${MUTEKI_HOST_DATA_ROOT}/state/runner:ro
@@ -43,8 +43,6 @@ services:
       MUTEKI_UI_HOST: 0.0.0.0
       MUTEKI_API_PORT: "8100"
       MUTEKI_UI_PORT: "3101"
-      MUTEKI_WEB_TLS_CERT: /run/secrets/web_tls_cert
-      MUTEKI_WEB_TLS_KEY: /run/secrets/web_tls_key
       MUTEKI_WEB_PASSWORD: ${MUTEKI_WEB_PASSWORD:?set MUTEKI_WEB_PASSWORD}
       MUTEKI_RUNNER_SOCKET: ${MUTEKI_HOST_DATA_ROOT}/state/runner/control.sock
       MUTEKI_WORKER_NETWORK: ${MUTEKI_WORKER_NETWORK:-${COMPOSE_PROJECT_NAME:-muteki}_web_net}
@@ -52,9 +50,8 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     networks: [worker]
-    secrets: [web_tls_cert, web_tls_key]
     healthcheck:
-      test: ["CMD", "curl", "-fkSs", "https://127.0.0.1:3101/api/health"]
+      test: ["CMD-SHELL", "scheme=http; [ -n \"$$MUTEKI_WEB_TLS_CERT\" ] && scheme=https; curl -fkSs \"$$scheme://127.0.0.1:$${MUTEKI_UI_PORT:-3101}/api/health\""]
       interval: 10s
       timeout: 5s
       retries: 12
@@ -62,9 +59,3 @@ services:
 networks:
   worker:
     name: ${MUTEKI_WORKER_NETWORK:-${COMPOSE_PROJECT_NAME:-muteki}_web_net}
-
-secrets:
-  web_tls_cert:
-    file: ${MUTEKI_WEB_TLS_CERT:?set MUTEKI_WEB_TLS_CERT}
-  web_tls_key:
-    file: ${MUTEKI_WEB_TLS_KEY:?set MUTEKI_WEB_TLS_KEY}

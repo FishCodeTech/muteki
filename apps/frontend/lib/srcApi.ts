@@ -1,4 +1,5 @@
 import { createReadCache } from "./readCache";
+import { randomUuid } from "./browserCrypto";
 import { srcFetch as apiFetch } from "./srcFetch";
 import { parseSrcDebugLogsMetadata, srcDebugLogsFilename, type SrcDebugLogsMetadata } from "./srcDebugLogs";
 import type {
@@ -126,7 +127,7 @@ export function startSrcRun(taskId: string, runId: string, input: { target_url: 
 
 export async function resolveSrcRun(taskId: string, runId: string, description?: string, generations?: { executionGeneration: number; controlGeneration: number }) {
   const response = await apiFetch(`/api/runs/${encodeURIComponent(runId)}/resolve?src_task_id=${encodeURIComponent(taskId)}`, {
-    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ command_id: crypto.randomUUID(), expected_execution_generation: generations?.executionGeneration, expected_generation: generations?.controlGeneration, ...(description?.trim() ? { guidance: { action: "hint", text: description.trim() } } : {}) }),
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ command_id: randomUuid(), expected_execution_generation: generations?.executionGeneration, expected_generation: generations?.controlGeneration, ...(description?.trim() ? { guidance: { action: "hint", text: description.trim() } } : {}) }),
   });
   const data = await response.json();
   if (!response.ok || data?.ok === false) throw new Error(data?.error?.message || data?.detail || `resolve failed (${response.status})`);

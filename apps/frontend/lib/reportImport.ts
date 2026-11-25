@@ -1,3 +1,4 @@
+import { sha256Hex } from "./browserCrypto";
 import {
   imageFileToDataUrl,
   joinReportAssets,
@@ -51,10 +52,7 @@ export function parseTitle(text: string): string | null {
   return null;
 }
 
-export async function sha256Hex(text: string): Promise<string> {
-  const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
-  return Array.from(new Uint8Array(buf), (b) => b.toString(16).padStart(2, "0")).join("");
-}
+export { sha256Hex };
 
 export function normalizeName(s: string): string {
   return s.toLowerCase().replace(/[^a-z0-9\u4e00-\u9fff]+/g, "");

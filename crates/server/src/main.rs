@@ -76,7 +76,7 @@ async fn main() -> anyhow::Result<()> {
     if let Some(code)=muteki_server::system_api::management_cli_entry().await{std::process::exit(code);}
     let options = if std::env::args().nth(1).as_deref()==Some("web"){Options::parse_from(std::env::args().take(1).chain(std::env::args().skip(2)))}else{Options::parse()};
     if !options.host.is_loopback() {
-        anyhow::bail!("The HTTP API must bind loopback. Expose Web through the TLS Web gateway instead.");
+        anyhow::bail!("The HTTP API must bind loopback. Expose Web through the Web gateway instead.");
     }
     let exposed = !options.host.is_loopback() || !options.ui_host.is_loopback();
     std::fs::create_dir_all(&options.state_dir).context("Create local state directory")?;

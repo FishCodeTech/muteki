@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { randomUuid } from "@/lib/browserCrypto";
 import {
   Button,
   Callout,
@@ -1548,7 +1549,7 @@ export function TrafficWorkspace({ active, sheet = false }: { active: boolean; s
                         url: streamUrl.trim(),
                         authorization_ref: authRef,
                         identity_ref: streamCtx.trim() || "default",
-                        idempotency_key: crypto.randomUUID(),
+                        idempotency_key: randomUuid(),
                       });
                       const sid = String(out.stream_id || "");
                       await loadStreamsData(sid);

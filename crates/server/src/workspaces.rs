@@ -1541,8 +1541,34 @@ pub(crate) async fn put_sidebar(
         Err(current) => Err((StatusCode::CONFLICT, Json(flatten_prefs(current)))),
     }
 }
+const FOLDER_MODES: [&str; 2] = ["ctf", "pentest"];
+const FOLDER_SECTIONS: [&str; 2] = ["active", "recent"];
+fn choice<'a>(body: &'a Value, key: &str, default: &'a str, allowed: &[&str]) -> Result<&'a str, Error> {
+    let value = text(body, key, default)?;
+    if allowed.contains(&value) {
+        Ok(value)
+    } else {
+        Err(invalid(&format!("{key} must be one of: {}", allowed.join(", "))))
+    }
+}
+fn folder_mode(folder: &Value) -> &str {
+    folder["mode"].as_str().unwrap_or("ctf")
+}
+fn with_folder_defaults(mut folder: Value) -> Value {
+    if let Some(fields) = folder.as_object_mut() {
+        fields.entry("mode").or_insert_with(|| json!("ctf"));
+        fields.entry("section").or_insert_with(|| json!("recent"));
+    }
+    folder
+}
 pub(crate) async fn list_folders(State(s): State<Arc<AppState>>) -> Api {
-    let mut rows = s.store.list("folders").map_err(db)?;
+    let mut rows: Vec<Value> = s
+        .store
+        .list("folders")
+        .map_err(db)?
+        .into_iter()
+        .map(with_folder_defaults)
+        .collect();
     rows.sort_by_key(|v| v["order"].as_i64().unwrap_or(0));
     Ok(Json(json!({"folders":rows})))
 }
@@ -1550,6 +1576,8 @@ pub(crate) async fn create_folder(State(s): State<Arc<AppState>>, Json(body): Js
     object(&body)?;
     let name = text(&body, "name", "")?.trim();
     let name = if name.is_empty() { "Folder" } else { name };
+    let mode = choice(&body, "mode", "ctf", &FOLDER_MODES)?;
+    let section = choice(&body, "section", "recent", &FOLDER_SECTIONS)?;
     let _guard = WRITES.lock().await;
     let folders = s.store.list("folders").map_err(db)?;
     let order = folders
@@ -1560,7 +1588,7 @@ pub(crate) async fn create_folder(State(s): State<Arc<AppState>>, Json(body): Js
         .checked_add(1)
         .ok_or_else(|| invalid("Folder order overflow"))?;
     let id = new_id("f");
-    let folder = json!({"id":id,"name":name,"order":order});
+    let folder = json!({"id":id,"name":name,"order":order,"mode":mode,"section":section});
     s.store.put("folders", &id, &folder).map_err(db)?;
     Ok(Json(json!({"folder":folder})))
 }
@@ -1577,6 +1605,9 @@ pub(crate) async fn update_folder(
         if !name.is_empty() {
             folder["name"] = json!(name);
         }
+    }
+    if body.get("section").is_some() {
+        folder["section"] = json!(choice(&body, "section", "", &FOLDER_SECTIONS)?);
     }
     if let Some(order) = body.get("order") {
         folder["order"] = json!(
@@ -1647,7 +1678,10 @@ async fn update_run(
                 .trim()
         };
         if !folder.is_empty() {
-            load(&s, "folders", folder)?;
+            let row = load(&s, "folders", folder)?;
+            if folder_mode(&row) != run["mode"].as_str().unwrap_or("ctf") {
+                return Err(invalid("folder_id belongs to another workspace mode"));
+            }
         }
         run["folder_id"] = if folder.is_empty() {
             Value::Null
@@ -2291,6 +2325,45 @@ mod tests {
             request(s.clone(), "POST", "/api/folders", json!({"name":" Work "})).await;
         let fid = folder["folder"]["id"].as_str().unwrap();
         assert_eq!(folder["folder"]["name"], "Work");
+        assert_eq!(folder["folder"]["mode"], "ctf");
+        assert_eq!(folder["folder"]["section"], "recent");
+        let folder_path = format!("/api/folders/{fid}");
+        assert_eq!(
+            request(s.clone(), "PATCH", &folder_path, json!({"section":"later"}))
+                .await
+                .0,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert_eq!(
+            request(s.clone(), "PATCH", &folder_path, json!({"section":"active"}))
+                .await
+                .0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            s.store.get("folders", fid).unwrap().unwrap()["section"],
+            "active"
+        );
+        let (_, pentest) = request(
+            s.clone(),
+            "POST",
+            "/api/folders",
+            json!({"name":"Hosts","mode":"pentest","section":"active"}),
+        )
+        .await;
+        let pentest_fid = pentest["folder"]["id"].as_str().unwrap();
+        assert_eq!(pentest["folder"]["section"], "active");
+        assert_eq!(
+            request(
+                s.clone(),
+                "PATCH",
+                "/api/runs/one",
+                json!({"folder_id":pentest_fid})
+            )
+            .await
+            .0,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
         assert_eq!(
             request(
                 s.clone(),

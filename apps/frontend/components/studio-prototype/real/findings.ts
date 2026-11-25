@@ -5,6 +5,7 @@ import type {
 import type {
   HistoryEntry, MergeRecord, RecordKind, SavedFilter, UndeterminedDuplicate,
 } from "../records";
+import { randomUuid } from "@/lib/browserCrypto";
 import { postCommand, querySrc } from "../../src/reviewPrimitives";
 import { recordListAll, type DomainCtx, type DomainRecordRow, type RealDomain } from "./domain";
 
@@ -210,7 +211,7 @@ async function recordHistory(ctx: DomainCtx, undo: { op: string; params?: Record
   const entry = (ctx.proposal?.() ?? ctx.state()).history[0];
   const payload = entry && entry.summary === fallback.summary
     ? { id: entry.id, action: entry.action, summary: entry.summary, scope: entry.scope, refs: entry.refs, at: entry.at }
-    : { id: `wb-${crypto.randomUUID().slice(0, 8)}`, action: fallback.action, summary: fallback.summary, scope: fallback.scope, refs: fallback.refs ?? [], at: new Date().toISOString() };
+    : { id: `wb-${randomUuid().slice(0, 8)}`, action: fallback.action, summary: fallback.summary, scope: fallback.scope, refs: fallback.refs ?? [], at: new Date().toISOString() };
   await postCommand(ctx.taskId, "src.workbench.history.record", { entry: { ...payload, undo, domain: "findings" } });
 }
 
@@ -520,7 +521,7 @@ export function createFindingDomain(): RealDomain {
         await postCommand(ctx.taskId, "src.finding.claim.create", {
           finding_id: clueId, text: claim.text, status: CLAIM_KIND[claim.kind] ?? "unverified",
           exchange_refs: evidenceIds,
-          idempotency_key: `wb-claim-${clueId}-${crypto.randomUUID()}`,
+          idempotency_key: `wb-claim-${clueId}-${randomUuid()}`,
         });
         await recordHistory(ctx, { op: "noop" }, { action: "status", summary: "新增发现论断", refs: [{ kind: "clue", id: clueId }] });
       },
@@ -546,7 +547,7 @@ export function createFindingDomain(): RealDomain {
           await postCommand(ctx.taskId, "src.finding.review.record", {
             finding_id: id, validation_type: "artifact_review", readiness,
             reviewer: ctx.actor,
-            idempotency_key: `wb-review-${id}-${crypto.randomUUID()}`,
+            idempotency_key: `wb-review-${id}-${randomUuid()}`,
           });
         }
       },

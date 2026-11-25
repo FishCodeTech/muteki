@@ -4,11 +4,10 @@ import net from 'node:net';
 import { readFile } from 'node:fs/promises';
 import { createHmac, randomBytes } from 'node:crypto';
 export async function createWebGateway({ host, port, env }) {
-  const local = ['127.0.0.1', '::1', 'localhost'].includes(host);
-  const cert = env.MUTEKI_WEB_TLS_CERT;
-  const key = env.MUTEKI_WEB_TLS_KEY;
-  if (Boolean(cert) !== Boolean(key) || (!local && !cert)) {
-    throw new Error('Non-loopback Web access requires MUTEKI_WEB_TLS_CERT and MUTEKI_WEB_TLS_KEY.');
+  const cert = env.MUTEKI_WEB_TLS_CERT?.trim() || '';
+  const key = env.MUTEKI_WEB_TLS_KEY?.trim() || '';
+  if (Boolean(cert) !== Boolean(key)) {
+    throw new Error('MUTEKI_WEB_TLS_CERT and MUTEKI_WEB_TLS_KEY must be set together.');
   }
   const probe = net.createServer();
   await new Promise((resolve, reject) => { probe.once('error', reject); probe.listen(0, '127.0.0.1', resolve); });

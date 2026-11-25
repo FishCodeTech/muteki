@@ -196,7 +196,7 @@ def verify_native_web(
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--version", default="0.5.1")
+    parser.add_argument("--version", default="0.5.2")
     parser.add_argument("--assets", type=Path, required=True)
     args = parser.parse_args()
 

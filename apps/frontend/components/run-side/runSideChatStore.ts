@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { queueSideChatQuote, requestSideChatFocus } from "@/components/conversation/ConversationSideChat";
 import { apiFetch } from "@/lib/serviceAuth";
+import { randomUuid } from "@/lib/browserCrypto";
 import { desktopChatBridge } from "@/lib/desktopChatBridge";
 import { sendConversationCommand, type ConversationThread } from "@/lib/useConversation";
 
@@ -125,7 +126,7 @@ export type RunSideChatsPayload = {
 };
 
 export async function createRunSideChat(runId: string, targetId?: string): Promise<string> {
-  const id = crypto.randomUUID();
+  const id = randomUuid();
   const response = await apiFetch(`/api/runs/${encodeURIComponent(runId)}/side-chats`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -254,7 +255,7 @@ export function useRunSideChatWindow(runId: string, enabled: boolean, onReclaime
       if (message.type === "ping") announce();
       else if (message.type === "reclaim") onReclaimed();
       else if (message.type === "quote" && message.threadId && message.text) {
-        queueSideChatQuote(message.threadId, { plainText: message.text, key: crypto.randomUUID(), send: message.send });
+        queueSideChatQuote(message.threadId, { plainText: message.text, key: randomUuid(), send: message.send });
         requestSideChatFocus(message.threadId);
       }
     };

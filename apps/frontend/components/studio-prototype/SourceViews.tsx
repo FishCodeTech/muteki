@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, 
 import { Background, Controls, ReactFlow, type Edge, type Node as FlowNode } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import { cn } from "@/lib/cn";
+import { randomUuid } from "@/lib/browserCrypto";
 import { scrollBehavior } from "@/lib/usePrefersReducedMotion";
 import { Icon, type IconName } from "@muteki/ui";
 import {
@@ -1723,7 +1724,7 @@ function ConnectorsSheet({ open, onOpenChange }: { open: boolean; onOpenChange: 
         connector_id: activeId,
         content_b64,
         filename: file.name,
-        idempotency_key: `wb-conn-import-${activeId}-${crypto.randomUUID()}`,
+        idempotency_key: `wb-conn-import-${activeId}-${randomUuid()}`,
       });
       await reloadDomains();
       toast({ title: `已导入 ${file.name}`, tone: "success" });

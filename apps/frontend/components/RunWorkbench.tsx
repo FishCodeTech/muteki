@@ -1,10 +1,12 @@
 "use client";
 import { setThemePreference, subscribeThemePreference } from "@/lib/themePreference";
+import { randomUuid } from "@/lib/browserCrypto";
+import { createFolderArrangeQueue } from "@/lib/folderArrangeQueue";
 import { countTimelineEvents } from "@/components/activity-timeline/fromDeck";
 import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import type { ActivityProps, ExoticComponent, ReactNode, KeyboardEvent as ReactKeyboardEvent, PointerEvent as ReactPointerEvent } from "react";
-import { useRun, useRunList, useFolders, newRun, patchRun, deleteRun, uploadFiles, spawnWorker, killWorker, openWorkspace, createFolder, renameFolder, deleteFolder, decideRunGuardApproval, RunStartError, SavedFile, apiFetch, type OperatorTriageLabel } from "@/lib/useRun";
+import { useRun, useRunList, useFolders, newRun, patchRun, deleteRun, uploadFiles, spawnWorker, killWorker, openWorkspace, createFolder, renameFolder, updateFolder, deleteFolder, decideRunGuardApproval, RunStartError, SavedFile, apiFetch, type FolderSection, type OperatorTriageLabel } from "@/lib/useRun";
 import { useT, useLang } from "@/lib/i18n";
 import { DeckState, type GuardApprovalDecisionAction, isFactRetired, isRunActive, workerIds, swarmPhase } from "@/lib/events";
 import { CTF_DEMO_DEFAULT_RUN, CTF_DEMO_NOTICE, ctfDemoDeck, ctfDemoRunSummaries, isCtfDemoRunId } from "@/lib/ctfDemoRun";
@@ -880,8 +882,15 @@ function Deck({ workspaceMode, surface = "conversation" }: { workspaceMode: "ctf
     ...allRuns.filter((item) => (item.mode || "ctf") === workspaceMode),
   ], [allRuns, demoListed, demoRuns, workspaceMode]);
   const allFolders = useFolders(8000, listBump);
-  const folders = useMemo(() => workspaceMode === "pentest" ? [] : allFolders, [workspaceMode, allFolders]);
+  const folders = useMemo(() => allFolders.filter((folder) => folder.mode === workspaceMode), [workspaceMode, allFolders]);
+  const foldersRef = useRef(folders);
+  foldersRef.current = folders;
   const bump = () => setListBump((n) => n + 1);
+  const [arrangeFolders] = useState(() => createFolderArrangeQueue(
+    () => foldersRef.current,
+    updateFolder,
+    () => setListBump((n) => n + 1),
+  ));
 
   const toastFail = () => pushToast({ msg: t("toast.actionFailed"), variant: "error" });
 
@@ -1219,7 +1228,8 @@ function Deck({ workspaceMode, surface = "conversation" }: { workspaceMode: "ctf
     | { kind: "delete"; runId: string }
     | { kind: "move"; runId: string; folderId: string | null }
     | { kind: "reorder"; runIds: string[]; pinned: boolean }
-    | { kind: "newFolder" }
+    | { kind: "newFolder"; section: FolderSection }
+    | { kind: "arrangeFolders"; folders: { id: string; section: FolderSection }[] }
     | { kind: "renameFolder"; folderId: string; name: string }
     | { kind: "deleteFolder"; folderId: string }
     | { kind: "operatorLabel"; runId: string; label: OperatorTriageLabel | null }
@@ -1252,11 +1262,15 @@ function Deck({ workspaceMode, surface = "conversation" }: { workspaceMode: "ctf
       bump();
       if (!ok) toastFail();
     } else if (a.kind === "newFolder") {
-      const folder = await createFolder(t("rail.newFolderDefault"));
+      const folder = await createFolder(t("rail.newFolderDefault"), workspaceMode, a.section);
       bump();
       if (folder) pushToast({ msg: t("toast.folderCreated"), variant: "success" });
       else toastFail();
       return folder;
+    } else if (a.kind === "arrangeFolders") {
+      const ok = await arrangeFolders(a.folders);
+      if (!ok) toastFail();
+      return ok;
     } else if (a.kind === "renameFolder") {
       const ok = await renameFolder(a.folderId, a.name);
       bump();
@@ -1443,7 +1457,7 @@ function Deck({ workspaceMode, surface = "conversation" }: { workspaceMode: "ctf
     catch (error) { pushToast({ msg: error instanceof Error ? error.message : String(error), variant: "error" }); }
   };
   const onExpireDirective = async (id: string) => {
-    await onCommand("global", "expire_context", "", { contextId: id, commandId: crypto.randomUUID(), expectedGeneration: deck.controlGeneration });
+    await onCommand("global", "expire_context", "", { contextId: id, commandId: randomUuid(), expectedGeneration: deck.controlGeneration });
   };
   const onToggleFreezeWorker = (id: string, paused: boolean) => { void onCommand(`solver:${id}`, paused ? "thaw" : "freeze", ""); };
   const onDecideGuardApproval = useCallback(async (

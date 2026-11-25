@@ -3,6 +3,7 @@ import { type IconName } from "@muteki/ui";
 
 
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { randomUuid } from "@/lib/browserCrypto";
 
 import {
   Button,
@@ -1158,7 +1159,7 @@ function SuperAgentCoordinationCard({
   const togglePolicy = async (key: "enabled" | "auto_recon" | "auto_reproduce", next: boolean) => {
     setSavingKey(key);
     try {
-      await postCommand(taskId, "src.coordination.policy.save", { [key]: next, idempotency_key: crypto.randomUUID() });
+      await postCommand(taskId, "src.coordination.policy.save", { [key]: next, idempotency_key: randomUuid() });
       onStatusChange({ ...status, policy: { ...status?.policy, [key]: next } });
       const names = { enabled: "自动唤醒", auto_recon: "自动侦察", auto_reproduce: "自动复现" };
       toast({ title: `${next ? "已开启" : "已暂停"}${names[key]}`, tone: "success" });
@@ -1266,7 +1267,7 @@ function CoverageDrillIn({ taskId }: { taskId: string }) {
     if (!taskId) return;
     setBusy(true);
     try {
-      await postCommand(taskId, "src.coverage.seed", { derive: true, idempotency_key: crypto.randomUUID() });
+      await postCommand(taskId, "src.coverage.seed", { derive: true, idempotency_key: randomUuid() });
       await load();
       toast({ title: "已生成覆盖率基线", tone: "success" });
     } catch (err) {
@@ -1714,7 +1715,7 @@ function ProjectMemoryCard({ taskId }: { taskId: string }) {
         preferences: prefDraft,
         notes: notesDraft,
         mode: "replace",
-        idempotency_key: crypto.randomUUID(),
+        idempotency_key: randomUuid(),
       });
       if (saved && typeof saved === "object" && "preferences" in saved) {
         setMemory(saved);
@@ -2020,7 +2021,7 @@ export function TasksWorkspace({ active, sheet = false }: { active: boolean; she
         reason: n.rationale ?? n.summary ?? "",
         go: () => {
           if (srcTaskId && n.notice_id) {
-            void postCommand(srcTaskId, "src.coordination.notice.ack", { notice_id: n.notice_id, idempotency_key: crypto.randomUUID() })
+            void postCommand(srcTaskId, "src.coordination.notice.ack", { notice_id: n.notice_id, idempotency_key: randomUuid() })
               .then(() => setCoordination((prev) => ({
                 ...prev,
                 unread_notices: (prev?.unread_notices ?? []).filter((x) => x.notice_id !== n.notice_id),

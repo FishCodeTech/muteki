@@ -8,6 +8,7 @@ import { Badge, Button, IconButton, Menu, MenuItem, MenuLabel, MenuSeparator, Po
 import { EngineLogo } from "@/components/EngineLogo";
 import { Icon } from "@muteki/ui";
 import { cn } from "@/lib/cn";
+import { randomUuid } from "@/lib/browserCrypto";
 import { isRunActive, swarmPhase, type DeckState } from "@/lib/events";
 import { asRunWorkspaceMode, conversationHref } from "@/lib/runWorkspaceRoutes";
 import { useRun } from "@/lib/useRun";
@@ -98,7 +99,7 @@ export function useRunSideChatController(runId: string) {
     creating.current = true;
     const deliver = (threadId: string, text: string) => {
       if (popout.popped) popout.sendQuote(threadId, text, true);
-      else queueSideChatQuote(threadId, { plainText: text, key: crypto.randomUUID(), send: true });
+      else queueSideChatQuote(threadId, { plainText: text, key: randomUuid(), send: true });
     };
     try { return await startRunSideChat(runId, question, deliver, targetId); }
     finally { creating.current = false; }
@@ -113,7 +114,7 @@ export function useRunSideChatController(runId: string) {
     if (options.quote) {
       const text = options.quote.split("\n").map((line) => `> ${line}`).join("\n");
       if (popout.popped) popout.sendQuote(threadId, `${text}\n\n`);
-      else queueSideChatQuote(threadId, { plainText: `${text}\n\n`, key: crypto.randomUUID() });
+      else queueSideChatQuote(threadId, { plainText: `${text}\n\n`, key: randomUuid() });
     }
     requestSideChatFocus(threadId);
     showRunSideChat(runId, threadId);

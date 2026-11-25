@@ -26,8 +26,6 @@ html, body { letter-spacing: -.006em; }
 .thread-item.active::before { display: none; }
 .thread-item .nm { font-size: 12px; font-weight: 500; }
 .thread-item .sub .ct, .thread-item .sub .st, .thread-item .sub .when { border-color: transparent; background: transparent; }
-.rail-folder-toggle { border-radius: 7px; padding: 5px 4px; }
-.rail-folder-toggle:hover { background: var(--panel2); }
 .rail-foot { padding: 8px; border-top: 1px dashed var(--line2); background: transparent; }
 
 .main, .convo, .artifact { background: var(--bg); }

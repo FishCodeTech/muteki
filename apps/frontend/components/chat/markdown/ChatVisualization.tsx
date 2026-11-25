@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { apiFetch } from "@/lib/useRun";
+import { randomUuid } from "@/lib/browserCrypto";
 import { desktopChatBridge } from "@/lib/desktopChatBridge";
 import { visualizationSelectionText } from "@/lib/visualizationFollowup";
 import { conversationStorageKey, conversationStorageScope } from "@/lib/conversationStorageScope";
@@ -107,7 +108,7 @@ export function ChatVisualization({ threadId, messageId, path, title, inlineHtml
         if (typeof v.html !== "string" || typeof v.documentId !== "string" || (v.assets !== undefined && (!v.assets || typeof v.assets !== "object" || Object.values(v.assets).some((value) => typeof value !== "string")))) throw new Error("visualization.protocol.invalid_document: 缺少完整图形正文或资源");
         if (!abort.signal.aborted) {
           setContentRevision(v.documentId);
-          setDocumentNonce(crypto.randomUUID()); setHtml(v.html); setAssets(v.assets || {});
+          setDocumentNonce(randomUuid()); setHtml(v.html); setAssets(v.assets || {});
           setDocumentTitle(title || v.title || "交互图");
         }
       })

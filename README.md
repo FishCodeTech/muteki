@@ -80,12 +80,12 @@ After a month of engineering work, tuning, and fixes, Muteki is open source with
 | [FishCodeTech/muteki](https://github.com/FishCodeTech/muteki) | Public source, releases and user issues; use this address for sharing, stars and public feedback |
 | [AtomGit](https://atomgit.com/FishCodeTech/muteki) | Project mirror; check its actual content for synchronization status |
 
-The current public release is [v0.5.1](https://github.com/FishCodeTech/muteki/releases/tag/v0.5.1). It moves the main application from the Python/FastAPI and Electron stack used by v0.4.7 to the Rust service, Next.js frontend and native macOS shell in this repository.
+The current public release is [v0.5.2](https://github.com/FishCodeTech/muteki/releases/tag/v0.5.2). It moves the main application from the Python/FastAPI and Electron stack used by v0.4.7 to the Rust service, Next.js frontend and native macOS shell in this repository.
 
 Existing managed v0.4.7 Web installations can upgrade through the stable command. The updater verifies the compatibility bundle and the platform-specific native package before switching the installation:
 
 ```bash
-muteki upgrade v0.5.1
+muteki upgrade v0.5.2
 ```
 
 ## Rust development quick start
@@ -275,15 +275,13 @@ node scripts/dev.mjs --hot --web                   # Frontend hot preview, UI :3
 
 `MUTEKI_STATE_DIR` selects the private state root; source development defaults to `.state`. A packaged macOS app uses its application data directory. Credentials and run records belong in private data, not the repository or application bundle. Python state is not automatically converted by changing branches.
 
-For LAN exposure, set an access password, `MUTEKI_WEB_TLS_CERT` and `MUTEKI_WEB_TLS_KEY` to your HTTPS certificate/key paths, then use `node scripts/dev.mjs --web --release --skip-build --host 0.0.0.0`. Configure `MUTEKI_WEB_PASSWORD` in the environment or access settings before exposing the service. Restart a reused backend if its access configuration needs to change. Open the Web UI over HTTPS and trust the issuing CA on clients. The API stays on loopback; direct non-loopback HTTP API binds are rejected.
+For LAN exposure, set an access password (`MUTEKI_WEB_PASSWORD` or in access settings), then use `node scripts/dev.mjs --web --release --skip-build --host 0.0.0.0`. Restart a reused backend if its access configuration needs to change. HTTPS is optional: configure TLS yourself via a reverse proxy (such as Nginx or Caddy), or optionally set both `MUTEKI_WEB_TLS_CERT` and `MUTEKI_WEB_TLS_KEY` for built-in HTTPS. The API stays on loopback; direct non-loopback HTTP API binds are rejected.
 
 ### Docker Compose
 
 Prepare a **Linux** Web image and a Worker image matching the intended version/architecture. `muteki-web:latest` and `muteki-worker:latest` below are local image names, not a promise that a registry tag is current. The Web image is packaged from a Linux Web release with [`docker/web/Dockerfile`](docker/web/Dockerfile); release packaging is defined in [the workflow](.github/workflows/build-packages.yml).
 
 ```bash
-MUTEKI_WEB_TLS_CERT=/absolute/path/to/cert.pem \
-MUTEKI_WEB_TLS_KEY=/absolute/path/to/key.pem \
 MUTEKI_HOST_DATA_ROOT=/opt/muteki/data \
 MUTEKI_WEB_IMAGE=muteki-web:latest \
 MUTEKI_WORKER_IMAGE=muteki-worker:latest \
@@ -291,7 +289,7 @@ MUTEKI_WEB_PASSWORD='replace-with-a-strong-password' \
   docker compose -f docker-compose.web.yml up -d --wait
 ```
 
-Open `https://127.0.0.1:3101` using a certificate valid for the chosen hostname. Web and Runner share the absolute host data root, while Web has no Docker socket. Drain active Workers before upgrading or rolling back; retain data and the previous image digests. Linux arm64 and Docker Desktop arm64 acceptance do not certify every other platform.
+Open `http://127.0.0.1:3101` (set `MUTEKI_WEB_BIND=0.0.0.0` to expose beyond host loopback, or put your own reverse proxy in front for HTTPS). Web and Runner share the absolute host data root, while Web has no Docker socket. Drain active Workers before upgrading or rolling back; retain data and the previous image digests. Linux arm64 and Docker Desktop arm64 acceptance do not certify every other platform.
 
 ### Development
 

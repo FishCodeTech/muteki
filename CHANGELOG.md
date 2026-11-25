@@ -2,6 +2,34 @@
 
 All notable public release changes are tracked here.
 
+## 0.5.2 - 2026-11-26
+
+### Added
+
+- Added workspace-scoped (`ctf` / `pentest`) and section-aware (`active` / `recent`) rail folders so CTF and Pentest folders can sit in either **Active** or **Recent**, be dragged across sections, reordered within a section, or moved via the folder menu. Legacy folders read back as `ctf` / `recent`, and cross-mode run-to-folder assignments are rejected with a 422 validation error.
+- Enabled dedicated rail folders in the Pentest workspace and aligned folder header layout with single run rows.
+- Refreshed the light and dark README wordmarks (`assets/logo-light.png`, `assets/logo-dark.png`) to match the day and night renditions of the new macOS Icon Composer app icon.
+- Streamlined `README_CN.md` around the open-source Coding Agents control plane positioning and split benchmarks, per-workspace usage, and runtime/configuration guides into `docs/benchmarks.md`, `docs/ctf.md`, `docs/pentest.md`, `docs/src.md`, `docs/chat-and-extensions.md`, and `docs/runtime-and-configuration.md`.
+
+### Changed
+
+- Made Web gateway HTTPS opt-in instead of mandatory on non-loopback binds (`scripts/web-gateway.mjs`, `docker-compose.web.yml`, `docker-compose.release.yml`, `scripts/smoke-web-container.sh`). Non-loopback Web access now works over HTTP by default while keeping mandatory access password enforcement intact; operators can terminate HTTPS via an external reverse proxy or enable built-in TLS by pairing `MUTEKI_WEB_TLS_CERT` and `MUTEKI_WEB_TLS_KEY`. Compose exposes optional `MUTEKI_WEB_BIND` (default `127.0.0.1`), and its healthcheck adapts automatically to HTTP or opt-in HTTPS.
+
+### Fixed
+
+- Added HTTP-safe fallbacks in `apps/frontend/lib/browserCrypto.ts` (`randomUuid()` via `crypto.getRandomValues` / RFC 4122 v4 and a pure-JS FIPS 180-4 `sha256Hex()`) and updated all unguarded frontend `crypto.randomUUID()` and `crypto.subtle.digest("SHA-256", ...)` callers so plain-HTTP LAN deployments outside browser secure contexts do not fail on attachment uploads, follow-up/resume commands, report hash checks, or workspace actions.
+- Serialized rapid consecutive folder arrangements (`apps/frontend/lib/folderArrangeQueue.ts`) against a reconciled baseline across pending moves and the pre-refresh window, and guarded optimistic `ThreadRail` state with a sequence counter so moving a folder back and forth before refresh cannot drop section or order updates.
+
+### Upgrade
+
+- Existing managed Web installations (`v0.4.7` / `v0.5.0` / `v0.5.1`) can run `muteki upgrade v0.5.2` directly.
+- Docker Compose deployments: drain active Workers, then switch `MUTEKI_WEB_IMAGE` and `MUTEKI_WORKER_IMAGE` to `v0.5.2` (`ghcr.io/fishcodetech/muteki-web:v0.5.2` and `ghcr.io/fishcodetech/muteki-worker:v0.5.2`).
+
+### Validation
+
+- Custom lint, TypeScript, ESLint, frontend `fast-check` property tests (including `browserCrypto` non-secure-context fallbacks and `folderArrangeQueue` serialization/reconciliation), Rust Clippy, generated OpenAPI contracts, and Docker Compose config / smoke-script syntax checks passed.
+- Public release workflows validate native macOS arm64 / Linux amd64 / Linux arm64 Web archives, signed macOS desktop packaging, multi-architecture Web and Worker container images, and direct `v0.4.7` → `v0.5.2` upgrade/rollback verification.
+
 ## 0.5.1 - 2026-11-25
 
 ### Fixed

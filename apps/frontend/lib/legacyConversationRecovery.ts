@@ -1,6 +1,7 @@
 import { COMPOSER_DRAFT_STORAGE_KEY, COMPOSER_DRAFT_STORAGE_KEY_V1, normalizeComposerDraft, type ComposerDraft } from "./composerDraftStore";
 import { COMPOSER_STASH_STORAGE_KEY } from "./composerRecallStore";
 import { conversationStorageScope } from "./conversationStorageScope";
+import { randomUuid } from "./browserCrypto";
 export type LegacyComposerEntry = { kind: "draft" | "stash"; key: string; label: string; snapshot: ComposerDraft };
 export function listLegacyComposerEntries(): LegacyComposerEntry[] {
   if (typeof window === "undefined" || !conversationStorageScope()) throw new Error("draft.legacy.scope_unverified: 请先确认当前服务身份");
@@ -25,14 +26,14 @@ export function listLegacyComposerEntries(): LegacyComposerEntry[] {
 export function prepareLegacyComposerCopy(entry: LegacyComposerEntry): ComposerDraft {
   const nodeIds = new Map<string, string>();
   const capabilityRefs = entry.snapshot.capabilityRefs.map((ref) => {
-    const id = crypto.randomUUID(); nodeIds.set(ref.node_id || ref.id, id);
+    const id = randomUuid(); nodeIds.set(ref.node_id || ref.id, id);
     return { ...ref, id, node_id: id, status: "stale" as const, status_reason: "旧记录没有服务归属证据，请在当前工作台重新选择引用", legacy_capability_id: undefined };
   });
   return {
     prompt: entry.snapshot.prompt,
     promptSegments: entry.snapshot.promptSegments?.map((segment) => segment.type === "text" ? { ...segment } : { type: "ref", nodeId: nodeIds.get(segment.nodeId) || segment.nodeId }),
     capabilityRefs,
-    attachments: entry.snapshot.attachments.map((attachment) => ({ id: crypto.randomUUID(), name: attachment.name, size: attachment.size, mimeType: attachment.mimeType, needsReselect: true })),
+    attachments: entry.snapshot.attachments.map((attachment) => ({ id: randomUuid(), name: attachment.name, size: attachment.size, mimeType: attachment.mimeType, needsReselect: true })),
     accessMode: "supervised", updatedAt: Date.now(),
   };
 }
