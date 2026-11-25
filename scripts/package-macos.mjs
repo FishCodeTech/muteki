@@ -51,7 +51,7 @@ Rust and the Next build run in parallel; an unchanged frontend reuses its last b
 --require-release-sign require the official release Developer ID certificate and designated requirement.`);
   process.exit(0);
 }
-if (process.platform !== 'darwin') throw new Error('macOS packaging requires macOS (sips and iconutil).');
+if (process.platform !== 'darwin') throw new Error('macOS packaging requires macOS (Xcode actool).');
 function run(command, arguments_, env = process.env) {
   const result = spawnSync(command, arguments_, { cwd: root, stdio: 'inherit', env });
   if (result.error) throw result.error;
@@ -181,23 +181,19 @@ try {
   await copyFile(path.join(root, 'LICENSE'), path.join(licenses, 'Muteki-LICENSE'));
   await copyFile(path.join(frontend, 'THIRD_PARTY_NOTICES.md'), path.join(licenses, 'Frontend-THIRD_PARTY_NOTICES.md'));
   for (const name of ['LICENSE-APACHE']) await copyFile(path.join(root, 'vendor/upstream-nsh', name), path.join(licenses, `NSH-${name}`));
-  const icon = path.join(root, 'assets/icon-512.png');
-  const cachedIcns = path.join(root, '.cache/icons', `${createHash('sha256').update(await readFile(icon)).digest('hex')}.icns`);
-  if (!(await access(cachedIcns).then(() => true, () => false))) {
-    const iconset = path.join(dist, '.muteki.iconset');
-    await mkdir(iconset, { recursive: true });
-    for (const size of [16, 32, 128, 256, 512]) {
-      for (const density of [1, 2]) {
-        run('sips', ['-z', String(size * density), String(size * density), icon, '--out', path.join(iconset, `icon_${size}x${size}${density === 2 ? '@2x' : ''}.png`)]);
-      }
-    }
-    await mkdir(path.dirname(cachedIcns), { recursive: true });
-    const partial = cachedIcns.replace(/\.icns$/, `.${process.pid}.partial.icns`);
-    run('iconutil', ['-c', 'icns', iconset, '-o', partial]);
-    await rename(partial, cachedIcns);
-    await rm(iconset, { recursive: true, force: true });
+  const icon = path.join(root, 'assets/Muteki.icon');
+  const iconFiles = ['icon.json', 'Assets/wu.svg', 'Assets/wu-dark.svg'];
+  const iconHash = createHash('sha256');
+  for (const file of iconFiles) iconHash.update(await readFile(path.join(icon, file)));
+  const cachedIcon = path.join(root, '.cache/icons', iconHash.digest('hex'));
+  if (!(await access(path.join(cachedIcon, 'Assets.car')).then(() => true, () => false))) {
+    const partial = `${cachedIcon}.${process.pid}.partial`;
+    await mkdir(partial, { recursive: true });
+    run('xcrun', ['actool', icon, '--compile', partial, '--app-icon', 'Muteki', '--include-all-app-icons', '--platform', 'macosx', '--target-device', 'mac', '--minimum-deployment-target', '14.0', '--output-partial-info-plist', path.join(partial, 'icon-info.plist'), '--errors', '--warnings']);
+    await rm(cachedIcon, { recursive: true, force: true });
+    await rename(partial, cachedIcon);
   }
-  await copyFile(cachedIcns, path.join(resources, 'Muteki.icns'));
+  for (const file of ['Assets.car', 'Muteki.icns']) await copyFile(path.join(cachedIcon, file), path.join(resources, file));
   await writeFile(path.join(staging, 'Contents/Info.plist'), `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
@@ -210,7 +206,8 @@ try {
 <key>CFBundleLocalizations</key><array><string>zh-Hans</string><string>en</string></array>
 <key>CFBundleShortVersionString</key><string>${version}</string>
 <key>CFBundleVersion</key><string>${version}</string>
-<key>CFBundleIconFile</key><string>Muteki.icns</string>
+<key>CFBundleIconFile</key><string>Muteki</string>
+<key>CFBundleIconName</key><string>Muteki</string>
 <key>LSMinimumSystemVersion</key><string>14.0</string>
 <key>NSHighResolutionCapable</key><true/>
 <key>NSAppTransportSecurity</key><dict><key>NSAllowsLocalNetworking</key><true/></dict>
