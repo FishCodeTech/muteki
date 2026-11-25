@@ -19,13 +19,13 @@ if (hostIndex >= 0) {
 }
 const args = new Set(argv);
 if (args.has('--help')) {
-  console.log('Usage: node scripts/dev.mjs [--web] [--hot] [--host ADDRESS] [--release] [--skip-build]\n--hot: live frontend updates on port 3103, reusing existing Rust binaries (built once if missing); no frontend build or app packaging.\nDefault: builds Rust binaries and the original Next frontend, then opens NSH.\n--web: serves the same frontend at http://127.0.0.1:3101.\n--host: with --web, serves the UI on ADDRESS (for example 0.0.0.0 for the LAN). A non-loopback address requires an access password from Settings or MUTEKI_WEB_PASSWORD; the backend stays on loopback.\n--release: accepted for compatibility; every run uses the Cargo profile "local" (optimized, incremental, no LTO), shared with install-macos.mjs --build.\n--skip-build: uses existing Rust binaries and Next production build.\nRust and the Next build run in parallel; an unchanged frontend reuses its last build (MUTEKI_FRONTEND_REBUILD=1 forces it).\nState defaults to workspace .state; MUTEKI_STATE_DIR overrides it.');
+  console.log('Usage: node scripts/dev.mjs [--web] [--hot] [--host ADDRESS] [--release] [--skip-build]\n--hot: live frontend updates on port 3103, reusing existing Rust binaries (built once if missing); no frontend build or app packaging.\nDefault: builds Rust binaries and the original Next frontend, then opens NSH.\n--web: serves the same frontend at http://127.0.0.1:3101.\n--host: with --web, serves the UI on ADDRESS (for example 0.0.0.0 for the LAN). A non-loopback address requires an access password from Settings or MUTEKI_WEB_PASSWORD; the backend stays on loopback.\n--release: uses the Cargo "release" profile (.cache/target/release); default uses "local" (optimized, incremental, no LTO).\n--skip-build: uses existing Rust binaries and Next production build.\nRust and the Next build run in parallel; an unchanged frontend reuses its last build (MUTEKI_FRONTEND_REBUILD=1 forces it).\nState defaults to workspace .state; MUTEKI_STATE_DIR overrides it.');
   process.exit(0);
 }
 if ([...args].some(arg => !['--web', '--hot', '--release', '--skip-build'].includes(arg))) throw new Error('Unknown argument. Use --help.');
 const loopbackUi = ['127.0.0.1', '::1'].includes(uiHost);
 if (!loopbackUi && !args.has('--web')) throw new Error('--host applies to --web only; the desktop app always stays on loopback.');
-const profile = 'local';
+const profile = args.has('--release') ? 'release' : 'local';
 const cargoProfile = ['--profile', profile];
 const frontend = path.join(root, 'apps/frontend');
 const env = { ...process.env, MUTEKI_NODE: process.execPath, MUTEKI_API_UPSTREAM: 'http://127.0.0.1:8100', NEXT_TELEMETRY_DISABLED: '1', MUTEKI_STATE_DIR: process.env.MUTEKI_STATE_DIR ?? path.join(root, '.state') };

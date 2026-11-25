@@ -59,19 +59,10 @@
   "include": [
     "**/*.ts",
     "**/*.tsx",
-    ".next-build/types/**/*.ts",
-    ".next-desktop/types/**/*.ts",
-    ".next-dev-verify/types/**/*.ts",
     ".next-dev/types/**/*.ts",
     ".next-package/types/**/*.ts",
-    ".next-sidechat/types/**/*.ts",
-    ".next-verify-499/types/**/*.ts",
-    ".next-verify/types/**/*.ts",
-    ".next/dev-report/types/**/*.ts",
     ".next/types/**/*.ts",
-    "next-env.d.ts",
-    "out/types/**/*.ts",
-    ".next-dev-compare/types/**/*.ts"
+    "next-env.d.ts"
   ],
   "exclude": [
     "node_modules",

@@ -59,15 +59,6 @@ export function GlobalWorkspacePalette({ overview, open, setOpen }: { overview: 
         icon: item.kindId === "conversation" ? "terminal" : item.kindId === "competition" ? "grid" : "target",
       });
     }
-    if (process.env.NODE_ENV !== "production") {
-      base.push({
-        id: "dev-ui-preview",
-        label: "Muteki UI Preview",
-        detail: "内部组件验收预览页 /dev/ui",
-        href: "/dev/ui",
-        icon: "layers",
-      });
-    }
     return base;
   }, [overview.kinds, overview.recent, solveOnly]);
 

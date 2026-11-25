@@ -2,6 +2,7 @@
 .muteki/
 .state/
 .state
+sessions/
 .env
 .env.*
 !.env.example
@@ -20,6 +21,7 @@ __pycache__/
 .impeccable/
 .playwright-cli/
 output/
+docker/worker/runtime_agent
 docker/worker*/runtime_agent-*
 cmd/runtime-agent/runtime-agent
 docker/worker*/.last-engine-versions.txt

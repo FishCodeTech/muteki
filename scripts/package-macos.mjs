@@ -11,7 +11,7 @@ const values = {};
 for (const arg of process.argv.slice(2)) {
   const [key, value] = arg.split(/=(.*)/s, 2);
   if (['--version', '--output', '--identity', '--profile'].includes(key) && value) values[key] = value;
-  else if (['--skip-build', '--debug', '--zip', '--adhoc', '--help'].includes(arg)) args.add(arg);
+  else if (['--skip-build', '--debug', '--zip', '--adhoc', '--require-release-sign', '--help'].includes(arg)) args.add(arg);
   else throw new Error(`Unknown argument ${arg}. Use --help.`);
 }
 function listCodeSignIdentities() {
@@ -25,13 +25,6 @@ function resolveSignIdentity() {
   if (requested === '-' || requested === 'adhoc') return '-';
   if (requested) return requested;
   const identities = listCodeSignIdentities();
-  const preferred = [
-    'Developer ID Application: Yuqi Jia (H53Q22J4T3)',
-    'Apple Development: Yuqi Jia (8WHTQ2AHNT)',
-  ];
-  for (const name of preferred) {
-    if (identities.includes(name)) return name;
-  }
   const developerId = identities.find((name) => name.startsWith('Developer ID Application:'));
   if (developerId) return developerId;
   const appleDev = identities.find((name) => name.startsWith('Apple Development:'));
@@ -39,22 +32,23 @@ function resolveSignIdentity() {
   return '-';
 }
 if (args.has('--help')) {
-  console.log(`Usage: node scripts/package-macos.mjs [--skip-build] [--profile=release|local|debug] [--debug] [--version=X.Y.Z] [--output=PATH/Muteki.app] [--zip] [--identity=NAME] [--adhoc]
+  console.log(`Usage: node scripts/package-macos.mjs [--skip-build] [--profile=release|local|debug] [--debug] [--version=X.Y.Z] [--output=PATH/Muteki.app] [--zip] [--identity=NAME] [--adhoc] [--require-release-sign]
 Writes dist/Muteki.app with the NSH host, Rust backend, original Next frontend and Node runtime.
-Default signing uses a stable local codesign identity (Developer ID / Apple Development) so macOS
-permission grants survive rebuilds. Pass --adhoc or MUTEKI_CODESIGN_IDENTITY=- for ad-hoc.
+Default signing uses a local Developer ID / Apple Development identity when available, falling back to ad-hoc.
+Pass --adhoc or MUTEKI_CODESIGN_IDENTITY=- for ad-hoc. Pass --require-release-sign for official CI releases.
 Does not notarize, publish, or upload.
---skip-build   uses existing workspace binaries and frontend build.
---profile      Cargo profile to build and package (default release, used for published zips).
-               local = incremental, no LTO: much faster rebuilds for local installs.
---debug        same as --profile=debug.
+--skip-build           uses existing workspace binaries and frontend build.
+--profile              Cargo profile to build and package (default release, used for published zips).
+                       local = incremental, no LTO: faster rebuilds for local installs.
+--debug                same as --profile=debug.
 Rust and the Next build run in parallel; an unchanged frontend reuses its last build
 (MUTEKI_FRONTEND_REBUILD=1 forces it).
---version      sets CFBundleShortVersionString (default: crates/desktop version), e.g. for an update candidate.
---output       writes the bundle elsewhere; the name must stay Muteki.app.
---zip          writes Muteki-<version>-<arch>.zip next to the bundle.
---identity     codesign identity name (overrides MUTEKI_CODESIGN_IDENTITY and auto-detect).
---adhoc        force ad-hoc signature (resets TCC on every rebuild).`);
+--version              sets CFBundleShortVersionString (default: crates/desktop version), e.g. for an update candidate.
+--output               writes the bundle elsewhere; the name must stay Muteki.app.
+--zip                  writes Muteki-<version>-<arch>.zip next to the bundle.
+--identity             codesign identity name (overrides MUTEKI_CODESIGN_IDENTITY and auto-detect).
+--adhoc                force ad-hoc signature (resets TCC on every rebuild).
+--require-release-sign require the official release Developer ID certificate and designated requirement.`);
   process.exit(0);
 }
 if (process.platform !== 'darwin') throw new Error('macOS packaging requires macOS (sips and iconutil).');
@@ -92,9 +86,9 @@ const profile = values['--profile'] || (args.has('--debug') ? 'debug' : 'release
 if (!['release', 'local', 'debug'].includes(profile)) throw new Error(`Unknown --profile ${profile}; use release, local or debug.`);
 const cargoProfile = profile === 'debug' ? [] : ['--profile', profile];
 const signIdentity = resolveSignIdentity();
-const officialPackage = profile === 'release' || args.has('--zip');
+const officialPackage = args.has('--require-release-sign') || process.env.MUTEKI_REQUIRE_RELEASE_SIGN === '1';
 if (officialPackage && (!signIdentity.startsWith('Developer ID Application:') || !signIdentity.endsWith('(H53Q22J4T3)'))) {
-  throw new Error('Release packages require Developer ID Application for Team H53Q22J4T3. Use --profile=local without --zip for local ad-hoc builds.');
+  throw new Error('Official release packages require Developer ID Application for Team H53Q22J4T3.');
 }
 
 const binaryDir = path.join(root, '.cache/target', profile);

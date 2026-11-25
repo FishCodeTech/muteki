@@ -1,5 +1,0 @@
-#!/usr/bin/env sh
-set -eu
-ROOT=$(git rev-parse --show-toplevel)
-cd "$ROOT"
-exec node scripts/verify/run.mjs --staged-only
