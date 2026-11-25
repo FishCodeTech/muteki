@@ -113,7 +113,7 @@ muteki upgrade v0.5.1
 
 ### 1. 准备环境并启动
 
-准备 **Node.js 22/npm**、**支持 edition 2024 的 stable Rust 工具链**和 **sccache**。仓库的 Cargo 包装脚本要求 sccache。原生构建需要 C/C++ 工具链、CMake 和 pkg-config；Linux 还需要 OpenSSL 开发头文件。各平台依赖可参照 [发布工作流](.github/workflows/build-packages.yml)。本地解题还需安装并登录至少一种受支持的 Agent CLI。
+准备 **Node.js 22/npm** 和 **支持 edition 2024 的 stable Rust 工具链**（`sccache` 为可选项，`scripts/cargo.mjs` 检测到本机安装时会自动启用）。原生构建需要 C/C++ 工具链和 `pkg-config`。各平台依赖可参照 [发布工作流](.github/workflows/build-packages.yml)。本地解题还需安装并登录至少一种受支持的 Agent CLI。
 
 ```bash
 git clone https://github.com/FishCodeTech/muteki.git

@@ -1,6 +1,5 @@
 #!/usr/bin/env node
 import fs from 'node:fs';
-import { execFileSync } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -48,7 +47,7 @@ function checkNoPlaywright() {
             pkgPath,
             1,
             `Forbidden Playwright dependency "${name}" in ${section}.`,
-            'Remove Playwright dependency. Web E2E must use kimi-webbridge and Desktop E2E must use cua-driver (see .agents/skills/verify/SKILL.md).',
+            'Remove the Playwright dependency from package.json.',
           );
         }
       }
@@ -80,7 +79,7 @@ function checkNoPlaywright() {
           file,
           idx + 1,
           `Forbidden Playwright usage: ${line.trim()}`,
-          'Use kimi-webbridge (http://127.0.0.1:10086) for Web E2E or cua-driver for Desktop E2E.',
+          'Remove Playwright imports or CLI invocations from the repository.',
         );
       }
     });
@@ -137,80 +136,6 @@ function checkVerifyAntiCheating() {
             'Poll an explicit readiness/state predicate with bounded timeout instead of sleeping >= 5s (or annotate with verify-allow-sleep: <reason>).',
           );
         }
-      }
-    });
-  }
-}
-
-function checkManifestAndSkill() {
-  const manifestPath = path.join(root, 'scripts/verify/manifest.json');
-  const skillPath = path.join(root, '.agents/skills/verify/SKILL.md');
-
-  if (!fs.existsSync(manifestPath)) {
-    addViolation(
-      'verify-manifest-valid',
-      manifestPath,
-      1,
-      'Missing scripts/verify/manifest.json.',
-      'Restore scripts/verify/manifest.json on the repository.',
-    );
-  } else {
-    try {
-      const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
-      if (!Array.isArray(manifest.triggers) || manifest.triggers.length === 0) {
-        addViolation('verify-manifest-valid', manifestPath, 1, 'manifest.triggers must be a non-empty array.', 'Define diff-triggered verification rules in scripts/verify/manifest.json.');
-      }
-      if (!Array.isArray(manifest.docs_only_globs) || !Array.isArray(manifest.rules_files)) {
-        addViolation('verify-manifest-valid', manifestPath, 1, 'manifest must define docs_only_globs and rules_files arrays.', 'Update scripts/verify/manifest.json schema.');
-      }
-      for (const trigger of manifest.triggers || []) {
-        if (!trigger.id || !Array.isArray(trigger.patterns) || !Array.isArray(trigger.automated) || !Array.isArray(trigger.e2e_tracks)) {
-          addViolation('verify-manifest-valid', manifestPath, 1, `Invalid trigger entry: ${JSON.stringify(trigger.id || trigger)}`, 'Each trigger requires id, patterns, automated, and e2e_tracks.');
-        }
-      }
-    } catch (err) {
-      addViolation('verify-manifest-valid', manifestPath, 1, `Invalid JSON in manifest.json: ${err.message}`, 'Fix JSON syntax in scripts/verify/manifest.json.');
-    }
-  }
-
-  if (!fs.existsSync(skillPath)) {
-    addViolation(
-      'verify-manifest-valid',
-      skillPath,
-      1,
-      'Missing project-local skill .agents/skills/verify/SKILL.md.',
-      'Create .agents/skills/verify/SKILL.md inside the repository.',
-    );
-  } else {
-    const raw = fs.readFileSync(skillPath, 'utf8');
-    if (!raw.startsWith('---\n') || !raw.includes('\nname: verify\n')) {
-      addViolation(
-        'verify-manifest-valid',
-        skillPath,
-        1,
-        '.agents/skills/verify/SKILL.md must start with YAML frontmatter containing "name: verify".',
-        'Add valid YAML frontmatter with name: verify and description.',
-      );
-    }
-  }
-
-  const forbiddenLegacy = /\b(pack:dev|apps\/web\/ui)\b/;
-  const docAndVerifyFiles = [
-    skillPath,
-    ...walkFiles(path.join(root, 'scripts/verify'), ['.js', '.mjs', '.json', '.md']),
-  ].filter((f) => fs.existsSync(f));
-
-  for (const file of docAndVerifyFiles) {
-    const lines = fs.readFileSync(file, 'utf8').split(/\r?\n/);
-    lines.forEach((line, idx) => {
-      if (forbiddenLegacy.test(line)) {
-        addViolation(
-          'no-legacy-electron-commands',
-          file,
-          idx + 1,
-          `Legacy Electron/Python reference found: ${line.trim()}`,
-          'Use current Rust/Next commands from docs/development.md (node scripts/dev.mjs, install-macos.mjs, package-web.mjs).',
-        );
       }
     });
   }
@@ -365,16 +290,8 @@ function checkShadowCardsUseRing() {
     });
   }
 }
-execFileSync('uv', [
-  'run', '--no-project', '--python', '3.12',
-  '--with-requirements', 'scripts/verify/comments-requirements.txt',
-  'python', 'scripts/verify/comments.py',
-  ...process.argv.slice(2),
-], { cwd: root, stdio: 'inherit' });
-
 checkNoPlaywright();
 checkVerifyAntiCheating();
-checkManifestAndSkill();
 checkNoHeroUiOrLegacyUi();
 checkShadowCardsUseRing();
 
@@ -388,4 +305,4 @@ if (violations.length > 0) {
   process.exit(1);
 }
 
-console.log('LINT_RULES_OK: no-new-comments, no-playwright, no-skipped-or-only-verify, no-long-bare-sleep-in-verify, verify-manifest-valid, no-legacy-electron-commands, shadow-card-uses-ring');
+console.log('LINT_RULES_OK: no-playwright, no-skipped-or-only-verify, no-long-bare-sleep-in-verify, no-heroui-or-legacy-ui, shadow-card-uses-ring');

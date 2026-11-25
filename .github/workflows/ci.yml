@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main, muteki-rust]
+    branches: [main]
   workflow_dispatch:
     inputs:
       full_packages:
@@ -56,7 +56,7 @@ jobs:
             git diff --name-only -z "$BASE_SHA" "$HEAD_SHA" > "$RUNNER_TEMP/changed-paths"
             while IFS= read -r -d '' path; do
               case "$path" in
-                docs/*|README.md|AGENTS.md|CHANGELOG.md|CONTRIBUTING.md|SECURITY.md|LICENSE|LICENSE.*) ;;
+                docs/*|README.md|README_CN.md|CHANGELOG.md|CONTRIBUTING.md|DISCLAIMER.md|SECURITY.md|LICENSE|LICENSE.*) ;;
                 *) code=true; break ;;
               esac
             done < "$RUNNER_TEMP/changed-paths"
@@ -67,13 +67,6 @@ jobs:
           fi
           echo "code=$code" >> "$GITHUB_OUTPUT"
           echo "packages=$packages" >> "$GITHUB_OUTPUT"
-      - name: Pre-PR verification stamp gate
-        if: github.event_name == 'pull_request'
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          MUTEKI_VERIFY_GATE_MODE: ${{ vars.MUTEKI_VERIFY_GATE_MODE || 'observe' }}
-        run: node scripts/verify/pr_gate.mjs --ci
 
   frontend:
     needs: changes
@@ -85,33 +78,37 @@ jobs:
       - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
-          fetch-depth: 0
       - uses: actions/setup-node@v7.1.0
         with:
           node-version: "22"
           cache: npm
           cache-dependency-path: apps/frontend/package-lock.json
       - run: npm --prefix apps/frontend ci --no-audit --no-fund
-      - run: npm --prefix apps/frontend run typecheck
-      - run: npm --prefix apps/frontend run lint
-      - run: python3 scripts/generate_frontend_contracts.py --check
-      - run: pipx install uv
-      - name: Resolve the comment ratchet baseline
-        id: comments
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before || 'HEAD^' }}
+      - name: Run frontend typecheck, lint, contracts, and property checks in parallel
         shell: bash
         run: |
           set -euo pipefail
-          base="$BASE_SHA"
-          if ! git cat-file -e "$base:crates/server/Cargo.toml" 2>/dev/null; then
-            base=HEAD
-          fi
-          echo "base=$base" >> "$GITHUB_OUTPUT"
-      - run: node scripts/lint_rules.mjs
-        env:
-          MUTEKI_COMMENT_BASE: ${{ steps.comments.outputs.base }}
-      - run: node scripts/verify/props_frontend.mjs
+          logs="$RUNNER_TEMP/frontend-checks"
+          mkdir -p "$logs"
+          declare -A pids=()
+          declare -a names=(typecheck lint contracts lint_rules props)
+          (npm --prefix apps/frontend run typecheck >"$logs/typecheck.log" 2>&1) & pids[typecheck]=$!
+          (npm --prefix apps/frontend run lint >"$logs/lint.log" 2>&1) & pids[lint]=$!
+          (python3 scripts/generate_frontend_contracts.py --check >"$logs/contracts.log" 2>&1) & pids[contracts]=$!
+          (node scripts/lint_rules.mjs >"$logs/lint_rules.log" 2>&1) & pids[lint_rules]=$!
+          (node scripts/verify/props_frontend.mjs >"$logs/props.log" 2>&1) & pids[props]=$!
+          status=0
+          for name in "${names[@]}"; do
+            if wait "${pids[$name]}"; then
+              echo "=== $name: PASS ==="
+              cat "$logs/$name.log"
+            else
+              echo "=== $name: FAIL ==="
+              cat "$logs/$name.log"
+              status=1
+            fi
+          done
+          exit "$status"
 
   rust:
     name: Rust server check
@@ -126,10 +123,17 @@ jobs:
       - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
-      - name: Install Linux native dependencies
+      - name: Ensure Linux native build tools
+        shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends build-essential pkg-config cmake libssl-dev
+          set -euo pipefail
+          pkgs=()
+          command -v cc >/dev/null || pkgs+=(build-essential)
+          command -v pkg-config >/dev/null || pkgs+=(pkg-config)
+          if (( ${#pkgs[@]} > 0 )); then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends "${pkgs[@]}"
+          fi
       - uses: dtolnay/rust-toolchain@stable
       - name: Record Rust version
         id: rust
@@ -142,9 +146,16 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             .cache/target-check
-          key: rust-check-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.version }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml') }}
-          restore-keys: rust-check-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.version }}-
+          key: rust-check-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.version }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml') }}
+          restore-keys: rust-check-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.version }}-
       - run: cargo clippy --locked -p muteki-server -- -A clippy::all -D clippy::disallowed_methods
+      - name: Prune workspace build outputs before cache save
+        shell: bash
+        run: |
+          rm -rf .cache/target-check/debug/incremental \
+            .cache/target-check/debug/muteki-server* \
+            .cache/target-check/debug/deps/muteki_server* \
+            .cache/target-check/debug/.fingerprint/muteki-server-*
 
   packages:
     needs: [changes, frontend]

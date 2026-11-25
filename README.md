@@ -94,7 +94,7 @@ muteki upgrade v0.5.1
 
 ### 1. Prepare the environment and start the Web app
 
-Install **Node.js 22/npm**, a **stable Rust toolchain with edition 2024 support**, and **sccache**. The repository Cargo wrapper requires sccache. Native build dependencies include a C/C++ toolchain, CMake and pkg-config; Linux also needs OpenSSL development headers. See the platform dependency steps in [the release workflow](.github/workflows/build-packages.yml). For local solving, install and sign in to at least one supported Agent CLI.
+Install **Node.js 22/npm** and a **stable Rust toolchain with edition 2024 support** (`sccache` is optional; `scripts/cargo.mjs` uses it automatically when installed). Native build dependencies include a C/C++ toolchain and `pkg-config`. See the platform dependency steps in [the release workflow](.github/workflows/build-packages.yml). For local solving, install and sign in to at least one supported Agent CLI.
 
 ```bash
 git clone https://github.com/FishCodeTech/muteki.git

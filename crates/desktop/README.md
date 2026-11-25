@@ -52,7 +52,7 @@ files), and replaces `/Applications/Muteki.app`. Quit the installed App first.
 This does not publish a release. `Muteki --muteki-prepare-storage` performs only
 the storage preparation, without opening a window.
 
-Release profiles and zip archives require the pinned Developer ID Application identity (Team H53Q22J4T3). Local/debug bundles without zip may use ad-hoc; `--identity` / `MUTEKI_CODESIGN_IDENTITY` selects an explicit identity. It verifies the complete bundle. Signing does not notarize or publish the application. See [development instructions](../../docs/development.md).
+Local packages default to an available Developer ID / Apple Development identity or ad-hoc signing (`--adhoc`); `--identity` / `MUTEKI_CODESIGN_IDENTITY` selects an explicit identity, and `--require-release-sign` enforces the official release certificate. Signing does not notarize or publish the application. See [README](../../README.md#development).
 
 ## macOS Bundle `Info.plist` Keys
 

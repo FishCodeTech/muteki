@@ -1,10 +1,3 @@
 crates/server/src/chat/extension_chat/event_contract.rs:generic-api-key:647
 crates/server/src/runs/execution_guard/cronus.rs:curl-auth-header:881
 vendor/upstream-tcode/crates/protocol/src/tests.rs:generic-api-key:1113
-vendor/upstream-tcode/crates/traverse/src/wire.rs:generic-api-key:399
-vendor/upstream-tcode/crates/traverse/src/wire.rs:generic-api-key:407
-vendor/upstream-tcode/crates/traverse/tests/preview.rs:generic-api-key:329
-vendor/upstream-tcode/crates/traverse/tests/preview.rs:generic-api-key:345
-vendor/upstream-tcode/crates/traverse/tests/transport.rs:generic-api-key:640
-vendor/upstream-tcode/crates/ui/src/pairing.rs:generic-api-key:277
-vendor/upstream-tcode/crates/ui/src/remote/mod.rs:generic-api-key:1584

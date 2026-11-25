@@ -84,11 +84,22 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$password" "$keychain" >/dev/null
           security list-keychains -d user -s "$keychain"
           echo "available=true" >> "$GITHUB_OUTPUT"
-      - name: Install Linux native dependencies
+      - name: Ensure Linux native build tools and fast linker
         if: runner.os == 'Linux'
+        shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends build-essential pkg-config cmake libssl-dev
+          set -euo pipefail
+          pkgs=()
+          command -v cc >/dev/null || pkgs+=(build-essential)
+          command -v pkg-config >/dev/null || pkgs+=(pkg-config)
+          command -v ld.lld >/dev/null || pkgs+=(lld)
+          if (( ${#pkgs[@]} > 0 )); then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends "${pkgs[@]}"
+          fi
+          if command -v ld.lld >/dev/null; then
+            echo "RUSTFLAGS=-C link-arg=-fuse-ld=lld" >> "$GITHUB_ENV"
+          fi
       - uses: dtolnay/rust-toolchain@stable
       - name: Record Rust version
         id: rust
@@ -101,24 +112,54 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             .cache/target
-          key: rust-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.version }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml') }}
-          restore-keys: rust-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.version }}-
+          key: rust-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.version }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml') }}
+          restore-keys: rust-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.version }}-
       - uses: actions/setup-node@v7.1.0
         with:
           node-version: "22"
           cache: npm
           cache-dependency-path: apps/frontend/package-lock.json
-      - run: npm --prefix apps/frontend ci --no-audit --no-fund
-      - run: npm --prefix apps/frontend run build
-      - name: Build native Rust release
+      - uses: actions/cache@v6.1.0
+        with:
+          path: apps/frontend/.next/cache
+          key: nextjs-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('apps/frontend/package-lock.json') }}-${{ hashFiles('apps/frontend/app/**', 'apps/frontend/components/**', 'apps/frontend/lib/**', 'packages/muteki-ui/src/**') }}
+          restore-keys: |
+            nextjs-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('apps/frontend/package-lock.json') }}-
+            nextjs-${{ runner.os }}-${{ runner.arch }}-
+      - name: Build frontend and native Rust release in parallel
         env:
           SIGNED_DESKTOP: ${{ steps.signing.outputs.available }}
+          NODE_OPTIONS: --max-old-space-size=2048
         shell: bash
         run: |
+          set -euo pipefail
+          logs="$RUNNER_TEMP/build-logs"
+          mkdir -p "$logs"
+          (
+            npm --prefix apps/frontend ci --no-audit --no-fund
+            npm --prefix apps/frontend run build
+          ) >"$logs/frontend.log" 2>&1 &
+          fe_pid=$!
+
           if [[ "$RUNNER_OS" == macOS && "$SIGNED_DESKTOP" == true ]]; then
-            cargo build --locked --workspace --release
+            cargo build --locked --workspace --release >"$logs/rust.log" 2>&1 &
           else
-            cargo build --locked -p muteki-server --release
+            cargo build --locked -p muteki-server --release >"$logs/rust.log" 2>&1 &
+          fi
+          rust_pid=$!
+
+          fe_rc=0
+          wait "$fe_pid" || fe_rc=$?
+          echo "=== Frontend build (exit=$fe_rc) ==="
+          cat "$logs/frontend.log"
+
+          rust_rc=0
+          wait "$rust_pid" || rust_rc=$?
+          echo "=== Rust release build (exit=$rust_rc) ==="
+          cat "$logs/rust.log"
+
+          if [[ "$fe_rc" -ne 0 || "$rust_rc" -ne 0 ]]; then
+            exit 1
           fi
       - name: Package standalone Web release
         run: node scripts/package-web.mjs --skip-build
@@ -128,7 +169,7 @@ jobs:
       - name: Package and verify macOS desktop app
         if: runner.os == 'macOS' && startsWith(github.ref, 'refs/tags/v') && steps.signing.outputs.available == 'true'
         run: |
-          node scripts/package-macos.mjs --skip-build --zip
+          node scripts/package-macos.mjs --skip-build --zip --require-release-sign
           codesign --verify --deep --strict dist/Muteki.app
       - name: Build and start the Linux Web container
         if: runner.os == 'Linux'
@@ -144,6 +185,16 @@ jobs:
             [[ -f "$asset" ]] || continue
             (cd "$(dirname "$asset")" && shasum -a 256 "$(basename "$asset")") > "$asset.sha256"
           done
+      - name: Prune non-reusable workspace binaries before cache save
+        shell: bash
+        run: |
+          rm -rf .cache/target/release/incremental \
+            .cache/target/release/muteki-server* \
+            .cache/target/release/muteki-desktop* \
+            .cache/target/release/deps/muteki_server* \
+            .cache/target/release/deps/muteki_desktop* \
+            .cache/target/release/.fingerprint/muteki-server-* \
+            .cache/target/release/.fingerprint/muteki-desktop-*
       - uses: actions/upload-artifact@v7.0.2
         if: inputs.upload_packages
         with:

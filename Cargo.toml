@@ -1,7 +1,7 @@
 [workspace]
 members = ["crates/server", "crates/desktop"]
 default-members = ["crates/server"]
-exclude = ["vendor/upstream-tcode", "vendor/upstream-nsh", "vendor/tcode", "crates/ui", "crates/web"]
+exclude = ["vendor/upstream-tcode", "vendor/upstream-nsh"]
 resolver = "3"
 
 [profile.dev]
@@ -12,7 +12,7 @@ debug = 0
 incremental = true
 [profile.release]
 opt-level = 3
-lto = "thin"
+lto = "off"
 strip = "debuginfo"
 
 [profile.local]
