@@ -99,12 +99,12 @@ tsecbench 托管模式下+deepseek-flash，排名13
 | [FishCodeTech/muteki](https://github.com/FishCodeTech/muteki) | 公开源码、公开 Release 和用户 Issue；对外分享、Star 和反馈使用此地址 |
 | [AtomGit](https://atomgit.com/FishCodeTech/muteki) | 项目镜像；同步情况以镜像实际内容为准 |
 
-当前公开版本为 [v0.5.0](https://github.com/FishCodeTech/muteki/releases/tag/v0.5.0)。主应用已从 v0.4.7 使用的 Python/FastAPI 与 Electron 迁移到本仓库的 Rust 服务、Next.js 前端和 macOS 原生壳。
+当前公开版本为 [v0.5.1](https://github.com/FishCodeTech/muteki/releases/tag/v0.5.1)。主应用已从 v0.4.7 使用的 Python/FastAPI 与 Electron 迁移到本仓库的 Rust 服务、Next.js 前端和 macOS 原生壳。
 
 已有的 v0.4.7 托管 Web 安装可以直接使用稳定命令升级。更新器会校验兼容桥和当前平台的原生发布包，全部通过后才切换安装：
 
 ```bash
-muteki upgrade v0.5.0
+muteki upgrade v0.5.1
 ```
 
 ## Rust 开发版快速开始

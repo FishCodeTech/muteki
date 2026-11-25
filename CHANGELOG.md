@@ -2,6 +2,19 @@
 
 All notable public release changes are tracked here.
 
+## 0.5.1 - 2026-11-25
+
+### Fixed
+
+- Removed the native updater's empty `.update.lock` when rolling back to Python v0.4.x. The Python updater acquires this lock by creating the file, so a file left by the Rust updater blocked the next `muteki upgrade` command.
+- Kept the native updater's advisory locking for native installations and checked that a concurrent update cannot claim a legacy lock file.
+- Isolated the release upgrade verifier's command directory and made it check the rollback result before the second upgrade.
+
+### Upgrade
+
+- Managed v0.4.7 Web installations can run `muteki upgrade v0.5.1` directly. The original data root remains available after migration and rollback.
+- The release workflow exercises the official v0.4.7 package through direct upgrade, data import, rollback, repeat upgrade and managed Web startup.
+
 ## 0.5.0 - 2026-11-25
 
 ### Changed
@@ -16,7 +29,7 @@ All notable public release changes are tracked here.
 - Existing managed v0.4.7 Web installations can run `muteki upgrade v0.5.0`.
 - The released v0.4.7 updater downloads a small compatibility bridge, verifies the selected native archive by size and SHA-256, and switches only after the native command starts successfully.
 - Before switching, the bridge imports v0.4.7 configuration and history into an isolated Rust state directory while retaining the original data root for rollback.
-- The release workflow initializes the official v0.4.7 service, imports a sentinel record, performs the direct upgrade, starts the managed v0.5.0 Web service from migrated state, rolls back and repeats the upgrade.
+- The release workflow initializes the official v0.4.7 service, imports a sentinel record, performs the direct upgrade and starts the managed v0.5.0 Web service from migrated state. A later rollback and repeat-upgrade check exposed the lock mismatch fixed in v0.5.1.
 - Existing task data, credentials and installation metadata remain under the managed installation data root.
 - The v0.4.7 Docker Compose layout is not migrated by the managed Web command. Deploy the v0.5.0 Compose file with versioned `muteki-web` and `muteki-worker` images after draining active Workers.
 

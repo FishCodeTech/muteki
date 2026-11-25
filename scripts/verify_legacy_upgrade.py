@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the released Python 0.4.7 updater through a native 0.5.0 installation."""
+"""Run the released Python 0.4.7 updater through a native installation."""
 
 from __future__ import annotations
 
@@ -142,6 +142,7 @@ def verify_native_web(
     state: Path,
     work: Path,
     env: dict[str, str],
+    version: str,
 ) -> None:
     with socket.socket() as api_probe, socket.socket() as ui_probe:
         api_probe.bind(("127.0.0.1", 0))
@@ -172,7 +173,7 @@ def verify_native_web(
                     with urllib.request.urlopen(f"http://127.0.0.1:{ui_port}/api/health") as response:
                         payload = json.loads(response.read())
                     expected_identity = hashlib.sha256(str(state.resolve()).encode()).hexdigest()
-                    if payload.get("version") == "0.5.0" and payload.get("storage_identity") == expected_identity:
+                    if payload.get("version") == version and payload.get("storage_identity") == expected_identity:
                         with urllib.request.urlopen(f"http://127.0.0.1:{ui_port}/") as response:
                             verified = b"Muteki" in response.read()
                         if verified:
@@ -195,7 +196,7 @@ def verify_native_web(
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--version", default="0.5.0")
+    parser.add_argument("--version", default="0.5.1")
     parser.add_argument("--assets", type=Path, required=True)
     args = parser.parse_args()
 
@@ -281,6 +282,7 @@ def main() -> int:
                 raise RuntimeError(f"无法建立正式 v0.4.7 托管安装：{legacy_install}")
             launcher_environment = os.environ.copy()
             launcher_environment["MUTEKI_INSTALL_ROOT"] = str(install)
+            launcher_environment["MUTEKI_BIN_DIR"] = str(bin_dir)
             subprocess.run(
                 ["uv", "sync", "--frozen", "--no-dev"],
                 cwd=legacy_source,
@@ -338,15 +340,13 @@ def main() -> int:
                 ).fetchone()
             if imported is None or json.loads(imported[0]).get("label") != "Legacy upgrade probe":
                 raise RuntimeError("v0.4.7 配置没有导入 Rust 状态库")
-            subprocess.run(
-                [str(bin_dir / "muteki"), "rollback"],
+            rollback = run_json(
+                [str(bin_dir / "muteki"), "rollback", "--json"],
                 cwd=work,
                 env=launcher_environment,
-                check=True,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
             )
+            if rollback.get("status") != "rolled_back" or rollback.get("current_version") != "0.4.7":
+                raise RuntimeError(f"原生更新器没有回滚到 v0.4.7：{rollback}")
             rolled_back = run_json(
                 [str(bin_dir / "muteki"), "version", "--json"],
                 cwd=work,
@@ -368,7 +368,7 @@ def main() -> int:
             )
             if repeated.get("status") != "installed" or repeated.get("current_version") != version:
                 raise RuntimeError(f"回滚后的重复升级没有安装 {version}：{repeated}")
-            verify_native_web(bin_dir / "muteki", install, native_state, work, launcher_environment)
+            verify_native_web(bin_dir / "muteki", install, native_state, work, launcher_environment, version)
             print(
                 json.dumps(
                     {
