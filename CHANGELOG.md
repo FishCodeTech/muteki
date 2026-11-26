@@ -2,6 +2,27 @@
 
 All notable public release changes are tracked here.
 
+## 0.5.3 - 2026-11-27
+
+### Changed
+
+- Replaced the Web workbench SVG/OG-generated favicon and PWA icons with the daylight rendition of the native macOS app icon (`apps/frontend/public/{favicon.ico,favicon.svg,apple-touch-icon.png,icon-192.png,icon-512.png,manifest.json}`, `/brand/icon.png`, `/brand/manifest.webmanifest`, `apps/frontend/lib/brand.ts`).
+- Streamlined `README.md` and `README_CN.md` to point full user documentation, workspace guides, benchmarks, and runtime configuration to [muteki.codes](https://muteki.codes/), removed the legacy `docs/` user manuals from the repository, and added the `muteki.codes` website sync checklist and `repository_dispatch` notification step to `.github/workflows/release-app.yml`.
+
+### Fixed
+
+- Compacted the single-Pi CTF transcript layout (`apps/frontend/components/CtfPiChat.tsx`) using responsive min/max height bounds (`min-h-[min(200px,60vh)] max-h-[60vh]`) and hid empty finished/bound local Pi transcript wrappers (`apps/frontend/components/Conversation.tsx`).
+- Preserved custom Pi model IDs containing slashes (such as OpenRouter-style `org/model` identifiers) when an explicit provider is configured (`vendor/upstream-tcode/crates/agent/src/pi.rs`), and normalized whitespace when comparing requested vs. reported Worker probe model IDs (`crates/server/src/runs/container_exec.rs`).
+
+### Upgrade
+
+- Existing managed Web installations (`v0.4.7` / `v0.5.0` / `v0.5.1` / `v0.5.2`) can run `muteki upgrade v0.5.3` directly.
+- Docker Compose deployments: drain active Workers, then switch `MUTEKI_WEB_IMAGE` and `MUTEKI_WORKER_IMAGE` to `v0.5.3` (`ghcr.io/fishcodetech/muteki-web:v0.5.3` and `ghcr.io/fishcodetech/muteki-worker:v0.5.3`).
+
+### Validation
+
+- Passed PR checks (`Frontend and API contracts`, `Rust server check`), local macOS `0.5.3` desktop build and signing, and public release workflows validating native macOS arm64 / Linux amd64 / Linux arm64 Web archives, signed macOS desktop zip, multi-architecture Web and Worker container images, and direct `v0.4.7` → `v0.5.3` upgrade/rollback.
+
 ## 0.5.2 - 2026-11-26
 
 ### Added

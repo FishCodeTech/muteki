@@ -22,8 +22,9 @@ export function CtfPiChat({ threadId }: { threadId: string }) {
     finally { setBusy(false); }
   };
   if (!conversation.view) return <p role="status">{conversation.error || "正在读取 Pi 会话…"}</p>;
-  return <div className="flex h-[60vh] min-h-[280px] flex-col" aria-label="Pi 会话记录">
+  return <div className="flex flex-col" aria-label="Pi 会话记录">
     <ConversationStreamTimeline stream={conversation.stream} streamThreadId={threadId} threadId={threadId}
+      className="min-h-[min(200px,60vh)] max-h-[60vh] [&_.cx-chat-viewport]:flex [&_.cx-chat-viewport]:flex-auto [&_.cx-chat-viewport]:flex-col [&_.cx-chat-stream]:relative [&_.cx-chat-stream]:flex-auto [&_.cx-timeline]:pb-3"
       view={conversation.view} running={Boolean(conversation.view.state.running_turn_id)}
       connected={conversation.connected} streamStatus={conversation.streamStatus} busy={busy}
       contentError={conversation.error} contentLoading={conversation.loading}

@@ -587,10 +587,12 @@ impl PiActor {
 
     async fn initialize(&mut self) -> Result<(), AgentError> {
         if let Some(model) = self.requested_model.clone() {
-            let (provider, model_id) = if let Some((provider, model_id)) = model.split_once('/') {
+            let (provider, model_id) = if let Some(provider) = &self.model_provider {
+                let prefix = format!("{provider}/");
+                let model_id = model.strip_prefix(&prefix).unwrap_or(&model);
+                (provider.clone(), model_id.to_owned())
+            } else if let Some((provider, model_id)) = model.split_once('/') {
                 (provider.to_owned(), model_id.to_owned())
-            } else if let Some(provider) = &self.model_provider {
-                (provider.clone(), model.to_owned())
             } else {
                 send_json(
                     &mut self.stdin,

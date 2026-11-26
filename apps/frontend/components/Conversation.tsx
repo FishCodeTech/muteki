@@ -937,6 +937,8 @@ function LocalPiChatThread({
 
   const lastMessage = messages[messages.length - 1];
   const waitingForFirstAgentItem = !deck.chatThreadId && running && (!lastMessage || lastMessage.role === "human");
+  const showEmptyState = !hasContent && !deck.finished && !deck.chatThreadId;
+  if (!hasContent && !waitingForFirstAgentItem && !showEmptyState) return null;
 
   return (
     <div
@@ -948,7 +950,7 @@ function LocalPiChatThread({
       }}
     >
       <div className="coord-wrap flex flex-col gap-3 py-4">
-        {!hasContent && !deck.finished && !deck.chatThreadId && (
+        {showEmptyState && (
           <div className="coord-empty">{t("coord.empty")}</div>
         )}
         {messages.map((m, idx) => {

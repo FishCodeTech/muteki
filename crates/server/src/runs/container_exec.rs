@@ -4048,8 +4048,11 @@ pub(super) fn cli_prompt_result(
     identity_source: Option<&str>,
     reply: &str,
 ) -> Result<Value, RuntimeError> {
-    if let (Some(expected), Some(actual)) = (requested.filter(|model| !model.is_empty()), reported)
+    if let (Some(requested_id), Some(reported_id)) =
+        (requested.filter(|model| !model.is_empty()), reported)
     {
+        let expected = requested_id.trim();
+        let actual = reported_id.trim();
         let matches = expected == actual
             || actual
                 .split_once('/')
@@ -4061,7 +4064,7 @@ pub(super) fn cli_prompt_result(
         if !matches {
             return Err(RuntimeError::new(
                 "model.fallback",
-                format!("请求 {expected}，CLI 报告由 {actual} 应答"),
+                format!("请求的模型为 {requested_id:?}，CLI 报告的模型为 {reported_id:?}"),
             ));
         }
     }

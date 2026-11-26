@@ -12,13 +12,13 @@
   "orientation": "any",
   "icons": [
     {
-      "src": "/icon-192.png",
+      "src": "/icon-192.png?v=daylight-1",
       "sizes": "192x192",
       "type": "image/png",
       "purpose": "any maskable"
     },
     {
-      "src": "/icon-512.png",
+      "src": "/icon-512.png?v=daylight-1",
       "sizes": "512x512",
       "type": "image/png",
       "purpose": "any maskable"
@@ -30,14 +30,14 @@
       "short_name": "新对话",
       "description": "直接开始一个新的 Agent 对话",
       "url": "/chat",
-      "icons": [{ "src": "/icon-192.png", "sizes": "192x192" }]
+      "icons": [{ "src": "/icon-192.png?v=daylight-1", "sizes": "192x192" }]
     },
     {
       "name": "单项任务",
       "short_name": "任务",
       "description": "打开单项安全任务面板",
       "url": "/ctf",
-      "icons": [{ "src": "/icon-192.png", "sizes": "192x192" }]
+      "icons": [{ "src": "/icon-192.png?v=daylight-1", "sizes": "192x192" }]
     }
   ],
   "categories": ["productivity", "developer"],

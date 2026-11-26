@@ -3297,7 +3297,7 @@ checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
 
 [[package]]
 name = "muteki-desktop"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -3322,7 +3322,7 @@ dependencies = [
 
 [[package]]
 name = "muteki-server"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "agent 0.1.0",
  "agent 0.1.0 (git+https://github.com/Tryanks/tcode?rev=ee22483c402f5f05350e60ac513d33ee9347df26)",
