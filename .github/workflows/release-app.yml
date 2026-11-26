@@ -207,3 +207,35 @@ jobs:
           mapfile -d '' assets < <(find packages -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.sha256' -o -name 'release-manifest.json' \) -print0)
           test "${#assets[@]}" -gt 0
           gh release upload "$RELEASE_TAG" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --clobber
+      - name: Record muteki.codes website sync checklist and notify
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+          RELEASE_SHA: ${{ needs.prepare.outputs.ref }}
+          WEBSITE_SYNC_TOKEN: ${{ secrets.WEBSITE_SYNC_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
+          ## muteki.codes / muteki-website Sync Checklist (${RELEASE_TAG})
+
+          - [ ] Bump \`package.json\` \`version\` and \`lib/site.ts\` \`RELEASE_VERSION\` to \`${RELEASE_VERSION}\`
+          - [ ] Update bilingual install/upgrade/runtime docs (\`content/{zh,en}/getting-started/{quick-start,installation,desktop-vs-web}.md\`, \`content/{zh,en}/runtime/{runner-images,operations-and-data}.md\`)
+          - [ ] Sync bilingual \`content/{zh,en}/getting-started/changelog.md\` with \`FishCodeTech/muteki/CHANGELOG.md\`
+          - [ ] Add/update bilingual feature docs (\`content/{zh,en}/\`, \`lib/docs-nav.ts\`, screenshots) and \`lib/home-content.ts\` for any new capabilities in \`${RELEASE_TAG}\`
+          - [ ] Run \`npm run check:release && npm run typecheck && npm run build && npm run check\` in \`muteki-website\`, push to \`jiayuqi7813/muteki-website\`, and verify \`https://muteki.codes/\`
+          EOF
+          if [[ -n "${WEBSITE_SYNC_TOKEN:-}" ]]; then
+            if GH_TOKEN="$WEBSITE_SYNC_TOKEN" gh api repos/jiayuqi7813/muteki-website/dispatches \
+              -f event_type=muteki-release \
+              -f "client_payload[tag]=$RELEASE_TAG" \
+              -f "client_payload[version]=$RELEASE_VERSION" \
+              -f "client_payload[sha]=$RELEASE_SHA" \
+              -f "client_payload[repository]=$GITHUB_REPOSITORY"; then
+              echo "Dispatched muteki-release event to jiayuqi7813/muteki-website for $RELEASE_TAG."
+            else
+              echo "::warning::Failed to dispatch muteki-release event to jiayuqi7813/muteki-website; complete the website sync manually."
+            fi
+          else
+            echo "WEBSITE_SYNC_TOKEN secret is not set; follow the muteki.codes sync checklist in the step summary."
+          fi
